@@ -98,25 +98,40 @@ pub struct Products {
 
 impl Products {
     pub fn load(data: &[u8]) -> Products {
-        let mut rows: Vec<(&[u8], &[u8])> = Vec::new();
+        // One pass: number the distinct categories in order of appearance (there
+        // are few, and consecutive products often share one), remember each
+        // product's number; then rank the names and renumber.
+        let mut names: Vec<&[u8]> = vec![b"unknown"];
+        let mut seen: HashMap<&[u8], u32> = HashMap::new();
+        seen.insert(b"unknown", 0);
+        let mut rows: Vec<(&[u8], u32)> = Vec::with_capacity(data.len() / 12);
+        let (mut last_name, mut last_id): (&[u8], u32) = (b"unknown", 0);
         for_each_line(data, 0, data.len(), |line| {
             if let Some([id, cat]) = split::<2>(line) {
-                rows.push((id, cat));
+                if cat != last_name {
+                    last_name = cat;
+                    last_id = *seen.entry(cat).or_insert_with(|| {
+                        names.push(cat);
+                        names.len() as u32 - 1
+                    });
+                }
+                rows.push((id, last_id));
             }
         });
-        let mut names: Vec<&[u8]> = rows.iter().map(|r| r.1).collect();
-        names.push(b"unknown");
-        names.sort_unstable();
-        names.dedup();
-        let rank: HashMap<&[u8], u32> = names.iter().enumerate().map(|(i, n)| (*n, i as u32)).collect();
+        let mut order: Vec<u32> = (0..names.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| names[i as usize]);
+        let mut rank = vec![0u32; names.len()];
+        for (r, &i) in order.iter().enumerate() {
+            rank[i as usize] = r as u32;
+        }
         let mut index = IdIndex::new(b"p");
-        for (id, cat) in &rows {
-            index.insert(id, rank[cat]);
+        for &(id, cat) in &rows {
+            index.insert(id, rank[cat as usize]);
         }
         Products {
             index,
-            unknown: rank[&b"unknown"[..]],
-            categories: names.iter().map(|n| (*n).into()).collect(),
+            unknown: rank[0],
+            categories: order.iter().map(|&i| names[i as usize].into()).collect(),
         }
     }
 
