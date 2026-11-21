@@ -17,6 +17,9 @@ Everything below the horizontal rule predates this; where they disagree, this wi
 | **Candidate c3: trace-only parser, pass 2 routes events** | `69557e4` (tag `cand-c3`) | Full gate passed. 20M: 501 / 503 against 555 / 561; 60M: 1556 / 1557 against 1704 / 1710. |
 | **Candidate c4: c3 + merged pass 2, faster writer** | `864640b` (tag `cand-c4`) | Full gate passed. 20M: 490 / 492 against 560 / 562; 60M: 1522 / 1526 against 1704 / 1705. |
 | **Candidate c5: c4 + same-day check on the text, user table in cache-line buckets** | `4b2bdb3` (tag `cand-c5`) | Full gate passed. One interleaved run, scored / c4 / c5: 20M 561/564, 488/491, 488/489; 60M 1702/1705, 1520/1522, 1503/1509; a second 60M set (seed 77) 1671/1677 scored, 1438/1442 c5. Also identical to the plain implementation on four more large sets (`scripts/remote/moreseeds.sh`: a window holding 29 February 2028 at 5M and 20M, seed 31 at 20M, seed 77 at 60M) and to the Python reference on the leap-day seed at 200K. **The one to submit.** |
+| Officially scored, **0.63 s** (22 Nov, about 23:15 UTC on the 21st) | `42b0f35` on `main` (a squash of `dev`; same build inputs as c5) | The best scored so far. |
+| Candidate c6: c5 + user_daily in 512 KB files written during the session pass, writeback of each started at once | `bd38f17` (tag `cand-c6`) | Full gate passed. Program time as c5; the docker command at 60M 1637 ms against 1749. |
+| **Candidate c7: c6 + smaller output** (rows without revenue first, person indexes as runs, campaign_daily dictionary-encoded) | `01708cd` (tag `cand-c7`) | Full gate passed. Program time as c6 (20M 484/488, 60M 1498/1501); output 18.5 MB at 20M (c5: 25), 55 MB at 60M (c5: 72). **The one to submit.** |
 | Diagnostic image (fails on purpose, shows a log) | `2a2ea40` (branch `diag4`) | Not yet submitted. The single most informative submission: scorer CPU, clock under 512-bit code, huge pages, page-fault and memory costs, `/output` write speed, CPU-quota throttling. |
 
 "Full gate" = `scripts/cand.sh NAME`: on EC2, `fullcheck.sh` (fixtures, dev answer, 150
@@ -69,6 +72,33 @@ interleaved rounds (`scripts/abx.sh`).
   `keep.sh` (named binaries for A/B), `imgtime.sh` (container and docker times).
 * Beware: `remote.sh push` must not preserve file times (fixed), or cargo on EC2 skips
   files edited before its last build.
+
+### What the second official score says (read before optimising anything)
+
+0.85 s (scored build, 77 MB of output) and 0.63 s (c5, 25 MB) both fit
+
+    score = program time on our EC2 box + about 0.07 s + about 2.85 ms per MB of output
+
+to within 2% (561 ms and 488 ms of program). Two consequences:
+
+* The scorer's CPU is about as fast as our m6i (solving for a slower CPU makes the fixed
+  part negative). EC2 program times translate one to one.
+* Output bytes cost time after the program has ended. On EC2 the reason is visible
+  (`scripts/remote/tdcheck.sh`): when the container exits, Docker unmounts its overlay
+  root, the kernel then writes out everything dirty on that file system, and `/output`
+  is on it; the dirty page count is zero the moment `docker start -a` returns. 2.85 ms
+  per MB is a disk writing 350 MB/s.
+
+Hence c6 (the output leaves in small files while pass 3 is still running, and a helper
+thread calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` on each: on EC2 the gap between
+container exit and the docker command's return drops to its fixed 62 ms at any output
+size) and c7 (fewer bytes). Starting writeback from the worker threads themselves
+stalled a run once (journal commit), hence the helper thread. musl's allocator has one
+lock: an allocation per run-length run made eight threads queue for it (+200 ms).
+
+Not yet known: whether early writeback takes effect on the scorer (c6 should score
+about 0.57 if so). If c6 stays near 0.63, bytes are what counts there: next would be
+Huffman-coding the user_id dictionary (half the output) as GZIP pages.
 
 ### Evening of 21 November: what the search for something bigger found
 
