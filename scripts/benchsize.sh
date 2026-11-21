@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Parser micro-benchmark over region sizes: separates compute from memory effects.
 # Usage: benchsize.sh [DATASET]
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 name="${1:-dev}"
 for spec in "262144 400" "1048576 200" "4194304 60" "20000000 12"; do

@@ -2,7 +2,7 @@
 # Differential test on freshly generated seeds: fast binary vs the Python
 # reference (and the plain implementation). Small sets, so it is light on RAM.
 # Usage: seeds.sh EVENTS CLICKS SEED...
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 PY="$PROJ/.venv/bin/python"
 events="$1"; clicks="$2"; shift 2

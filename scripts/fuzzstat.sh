@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sanity-check what one fuzz dataset contains and how the binary routes its lines.
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions"
 d=/tmp/ss-fuzzstat; rm -rf "$d"; mkdir -p "$d"
 "$PROJ/.venv/bin/python" -I "$PROJ/tools/fuzz.py" "${1:-5}" "$d/data" "${2:-3000}"

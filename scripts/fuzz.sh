@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Differential fuzzing: adversarial datasets, binary (fast, scalar-only, plain)
 # against the Python reference. Usage: fuzz.sh FIRST_SEED COUNT [ROWS]
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 PY="$PROJ/.venv/bin/python"
 first="$1"; count="$2"; rows="${3:-4000}"

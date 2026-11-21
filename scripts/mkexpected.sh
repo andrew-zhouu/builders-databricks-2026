@@ -3,7 +3,7 @@
 # Usage: mkexpected.sh (py|slow) NAME...
 #   py   = the independent Python reference (small sets only)
 #   slow = the binary's plain implementation (--slow), for large sets
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 mode="$1"; shift
 for name in "$@"; do

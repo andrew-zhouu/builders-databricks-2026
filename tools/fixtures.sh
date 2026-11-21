@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a pipeline command on every official fixture and diff with tools/cmp.py.
 # Usage: fixtures.sh CMD...     (CMD gets DATA_DIR OUT_DIR appended, and as env vars)
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 FIX="$PROJ/official/starter-duckdb/x/starter-duckdb/fixtures"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

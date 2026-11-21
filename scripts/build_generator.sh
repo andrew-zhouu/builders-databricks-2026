@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the official generator (statically, musl + rust-lld) and make datasets.
 set -euo pipefail
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 cd "$PROJ"
 mkdir -p "$PROJ/.toolchain/bin" "$PROJ/data"
 if [ ! -x "$PROJ/.toolchain/bin/generate" ]; then
