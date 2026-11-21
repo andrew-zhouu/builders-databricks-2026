@@ -39,19 +39,26 @@ const MADV_HUGEPAGE: c_int = 14;
 pub static NOHUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static NORELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Zeroed, lazily committed memory. Never returned to the OS before exit.
-pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
+/// Zeroed, lazily committed memory, or `None` if the kernel refuses the mapping
+/// (possible for very large reservations under strict overcommit). Never
+/// returned to the OS before exit.
+pub fn try_map_anon(len: usize, huge: bool) -> Option<*mut u8> {
     let len = len.max(4096);
     let p = unsafe {
         mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
     };
     if p as isize == -1 {
-        panic!("mmap of {len} bytes failed");
+        return None;
     }
     if huge && !NOHUGE.load(std::sync::atomic::Ordering::Relaxed) {
         unsafe { madvise(p, len, MADV_HUGEPAGE) };
     }
-    p as *mut u8
+    Some(p as *mut u8)
+}
+
+/// As `try_map_anon`, for memory the program cannot run without.
+pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
+    try_map_anon(len, huge).unwrap_or_else(|| panic!("mmap of {len} bytes failed"))
 }
 
 /// Drop the fully covered pages of an anonymous range (their contents are lost).
