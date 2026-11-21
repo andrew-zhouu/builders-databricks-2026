@@ -113,7 +113,7 @@ pub struct Ctx {
     /// Per profiled section, summed over threads (SS_TIMING only): CPU
     /// nanoseconds, the four performance counters, input rows, kernel
     /// nanoseconds and page faults.
-    pub prof: [[std::sync::atomic::AtomicU64; 4 + prof::NCOUNTERS]; 12],
+    pub prof: [[std::sync::atomic::AtomicU64; 4 + prof::NCOUNTERS]; 14],
     /// Set when the data does not fit the fast path's packed layouts.
     pub bail: AtomicBool,
     out_dir: PathBuf,
@@ -299,9 +299,11 @@ pub const P_S_PEOPLE: usize = 8;
 pub const P_WRITE: usize = 9;
 pub const P_LINKS: usize = 10;
 pub const P_COMPRESS: usize = 11;
-const P_NAMES: [&str; 12] = [
+pub const P_D_GROUP: usize = 12;
+pub const P_D_READ: usize = 13;
+const P_NAMES: [&str; 14] = [
     "parse events", "parse clicks", "finalize", "dedup gather", "dedup scan", "dedup settle", "sessions gather",
-    "sessions sort", "sessions people", "write user_daily", "links", "resolve people",
+    "sessions sort", "sessions people", "write user_daily", "links", "resolve people", "dedup group", "dedup reread",
 ];
 
 const CHUNK: usize = 1 << 20;
