@@ -261,6 +261,72 @@ fn first_line(data: &[u8], start: usize) -> Option<usize> {
     find_newline(data, start.saturating_sub(1).min(data.len())).map(|i| i + 1)
 }
 
+// ------------------------------------------------------------------ input
+
+/// Read mode keeps this many bytes before a chunk (line-start detection and
+/// the fast paths' backward loads) ...
+const LOOKBACK: usize = 64;
+/// ... and at first this many after it, for the line that straddles its end.
+pub const TAIL: usize = 4096;
+
+/// A thread's private input buffer for read-mode I/O.
+pub struct Input {
+    buf: Vec<u8>,
+}
+
+/// The bytes one chunk works on: the lines starting in `[start, end)` of
+/// `data`, of which those starting before `fast_end` may use the SIMD paths
+/// (memory is readable for `MARGIN` bytes past them). `data` ends either at
+/// the end of the file or after a complete line.
+struct View<'a> {
+    data: &'a [u8],
+    start: usize,
+    end: usize,
+    fast_end: usize,
+}
+
+impl Input {
+    pub fn new() -> Input {
+        Input { buf: Vec::new() }
+    }
+
+    fn view<'a>(&'a mut self, ctx: &'a Ctx, ch: &Chunk) -> View<'a> {
+        let file = &ctx.files[ch.file as usize];
+        if !ctx.read_io {
+            // The whole file is mapped.
+            let data = file.slice();
+            let fast_end = if ctx.scalar_only { 0 } else { data.len().saturating_sub(MARGIN) };
+            return View { data, start: ch.start, end: ch.end, fast_end };
+        }
+        // Copy the chunk into a cache-sized private buffer: the kernel streams
+        // it in, and the parser then never waits on memory for its input.
+        let from = ch.start.saturating_sub(LOOKBACK);
+        let mut want = (ch.end + ctx.read_tail).min(file.len) - from;
+        loop {
+            if self.buf.len() < want + MARGIN {
+                self.buf.resize(want + MARGIN, 0);
+            }
+            let n = file.read_at(&mut self.buf[..want], from);
+            // Complete if the file ends here, or the line running over the
+            // chunk's end is terminated inside the buffer.
+            if n < want || from + n >= file.len || self.buf[ch.end - 1 - from..n].contains(&b'\n') {
+                self.buf[n..n + MARGIN].fill(0);
+                let fast_end = if ctx.scalar_only { 0 } else { n };
+                return View { data: &self.buf[..n], start: ch.start - from, end: ch.end - from, fast_end };
+            }
+            want = (want * 2).min(file.len - from);
+        }
+    }
+}
+
+/// Mapped input only: drop the chunk's page-table entries once it is parsed.
+#[inline(always)]
+fn release(ctx: &Ctx, ch: &Chunk) {
+    if !ctx.read_io {
+        ctx.files[ch.file as usize].release(ch.start, ch.end);
+    }
+}
+
 // ------------------------------------------------------------------ links
 
 #[inline(never)]
@@ -350,14 +416,12 @@ impl LinkRing {
     }
 }
 
-pub fn links_chunk(ctx: &Ctx, ch: &Chunk) {
-    let file = &ctx.files[ch.file as usize];
-    let data = file.slice();
+pub fn links_chunk(ctx: &Ctx, io: &mut Input, ch: &Chunk) {
+    let View { data, start, end, fast_end } = io.view(ctx, ch);
     let len = data.len();
-    if let Some(mut pos) = first_line(data, ch.start) {
-        let fast_end = if ctx.scalar_only { 0 } else { len.saturating_sub(MARGIN) };
+    if let Some(mut pos) = first_line(data, start) {
         let mut ring = LinkRing::new();
-        while pos < ch.end {
+        while pos < end {
             if pos < fast_end {
                 let used = unsafe { link_fast(ctx, &mut ring, data.as_ptr().add(pos)) };
                 if used != 0 {
@@ -371,7 +435,7 @@ pub fn links_chunk(ctx: &Ctx, ch: &Chunk) {
         }
         ring.drain(ctx);
     }
-    file.release(ch.start, ch.end);
+    release(ctx, ch);
 }
 
 // ------------------------------------------------------------------ events
@@ -593,14 +657,12 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
     used
 }
 
-pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, ch: &Chunk) {
-    let file = &ctx.files[ch.file as usize];
-    let data = file.slice();
+pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, io: &mut Input, ch: &Chunk) {
+    let View { data, start, end, fast_end } = io.view(ctx, ch);
     let len = data.len();
-    if let Some(mut pos) = first_line(data, ch.start) {
-        let fast_end = if ctx.scalar_only { 0 } else { len.saturating_sub(MARGIN) };
+    if let Some(mut pos) = first_line(data, start) {
         let mut ring = EventRing::new();
-        while pos < ch.end {
+        while pos < end {
             if (pos >= HEAD) & (pos < fast_end) {
                 if ctx.prefetch_ahead != 0 {
                     // The hardware streamer stops at page boundaries; reach past them.
@@ -620,7 +682,7 @@ pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, ch: &Chunk) {
         }
         ring.drain(ctx, d);
     }
-    file.release(ch.start, ch.end);
+    release(ctx, ch);
 }
 
 // ------------------------------------------------------------------ clicks
@@ -742,14 +804,12 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
     used
 }
 
-pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) {
-    let file = &ctx.files[ch.file as usize];
-    let data = file.slice();
+pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, io: &mut Input, ch: &Chunk) {
+    let View { data, start, end, fast_end } = io.view(ctx, ch);
     let len = data.len();
-    if let Some(mut pos) = first_line(data, ch.start) {
-        let fast_end = if ctx.scalar_only { 0 } else { len.saturating_sub(MARGIN) };
+    if let Some(mut pos) = first_line(data, start) {
         let mut ring = ClickRing::new();
-        while pos < ch.end {
+        while pos < end {
             if (pos >= HEAD) & (pos < fast_end) {
                 if ctx.prefetch_ahead != 0 {
                     unsafe {
@@ -768,5 +828,5 @@ pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) {
         }
         ring.drain(ctx, c);
     }
-    file.release(ch.start, ch.end);
+    release(ctx, ch);
 }

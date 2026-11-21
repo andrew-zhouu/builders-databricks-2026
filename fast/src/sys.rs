@@ -63,26 +63,44 @@ pub fn zap(ptr: *mut u8, len: usize) {
     }
 }
 
-/// A read-only private mapping of a whole file. Empty files map to an empty slice.
+/// An input file: open for positioned reads, and (unless `map` is false) a
+/// read-only private mapping of the whole of it. Empty files map to an empty slice.
 pub struct FileMap {
     pub ptr: *const u8,
     pub len: usize,
+    file: File,
 }
 unsafe impl Send for FileMap {}
 unsafe impl Sync for FileMap {}
 
 impl FileMap {
-    pub fn open(path: &std::path::Path) -> std::io::Result<FileMap> {
+    pub fn open(path: &std::path::Path, map: bool) -> std::io::Result<FileMap> {
         let f = File::open(path)?;
         let len = f.metadata()?.len() as usize;
-        if len == 0 {
-            return Ok(FileMap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+        if len == 0 || !map {
+            return Ok(FileMap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len, file: f });
         }
         let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(FileMap { ptr: p as *const u8, len })
+        Ok(FileMap { ptr: p as *const u8, len, file: f })
+    }
+
+    /// Fill `buf` from byte `offset` of the file; returns the bytes read
+    /// (short only at end of file).
+    pub fn read_at(&self, buf: &mut [u8], offset: usize) -> usize {
+        use std::os::unix::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            match self.file.read_at(&mut buf[done..], (offset + done) as u64) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+        done
     }
 
     #[inline]
