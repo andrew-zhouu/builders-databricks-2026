@@ -307,6 +307,7 @@ pub fn write(path: &Path, rows: usize, columns: &[Column]) -> std::io::Result<()
     f.write_all(&t.b)?;
     f.write_all(&(t.b.len() as u32).to_le_bytes())?;
     f.write_all(b"PAR1")?;
+    crate::sys::start_writeback(f);
     Ok(())
 }
 

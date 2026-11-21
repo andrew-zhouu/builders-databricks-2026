@@ -7,6 +7,7 @@ use std::os::raw::{c_int, c_void};
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn sync_file_range(fd: c_int, pos: i64, len: i64, flags: std::os::raw::c_uint) -> c_int;
     pub fn _exit(code: c_int) -> !;
 }
 
@@ -24,6 +25,41 @@ pub fn thread_cpu_ns() -> u64 {
     let mut ts = Timespec { sec: 0, nsec: 0 };
     unsafe { clock_gettime(3, &mut ts) };
     ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+}
+
+/// Ask the kernel to start writing a finished output file's pages to disk
+/// now, without waiting for it. When a container exits, Docker unmounts its
+/// root, which makes the kernel write out everything still unwritten on that
+/// disk before the run counts as over: output written early costs nothing
+/// then.
+///
+/// Starting the writeback can itself wait (for the file system's journal), so
+/// a thread of its own does it: the caller only hands the file over. Nothing
+/// depends on it happening: a file whose turn never comes, or a file system
+/// that cannot do this, leaves the pages for the kernel to write later, as
+/// without this. SS_WRITEBACK=0 (experiment) leaves it out.
+pub fn start_writeback(f: File) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Mutex, OnceLock};
+    static QUEUE: OnceLock<Option<Mutex<Sender<File>>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        if std::env::var("SS_WRITEBACK").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let (tx, rx) = channel::<File>();
+        let run = move || {
+            const SYNC_FILE_RANGE_WRITE: std::os::raw::c_uint = 2;
+            for f in rx {
+                unsafe { sync_file_range(f.as_raw_fd(), 0, 0, SYNC_FILE_RANGE_WRITE) };
+            }
+        };
+        std::thread::Builder::new().name("writeback".into()).spawn(run).ok().map(|_| Mutex::new(tx))
+    });
+    if let Some(queue) = queue {
+        if let Ok(tx) = queue.lock() {
+            let _ = tx.send(f);
+        }
+    }
 }
 
 const PROT_READ: c_int = 1;

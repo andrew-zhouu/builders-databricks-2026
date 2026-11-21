@@ -51,6 +51,27 @@ pub struct Rows {
     pub cats: Vec<u32>,
 }
 
+impl Rows {
+    /// Roughly what the rows take in a file.
+    pub fn bytes(&self) -> usize {
+        self.ids.len() + 6 * self.n
+    }
+
+    /// Start over (after the rows were written), keeping the memory.
+    pub fn clear(&mut self) {
+        self.n = 0;
+        self.people = 0;
+        self.ids.clear();
+        self.id_idx.clear();
+        self.day.clear();
+        self.sessions.clear();
+        self.events.clear();
+        self.revenue.clear();
+        self.valid.clear();
+        self.cats.clear();
+    }
+}
+
 /// The length-prefixed bytes of a regular user key (see ids.rs: `u`, then the
 /// key's bytes), written into `out`; returns their total length (4 +
 /// characters). Bytes after it are junk.
