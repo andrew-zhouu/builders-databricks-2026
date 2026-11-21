@@ -51,6 +51,12 @@ pinned to 0-7, min / median):
 Reading: 2.1% fewer instructions, always. Fewer cycles on a quiet machine (5 to 8% at
 20M in the one quiet series), nothing measurable under load. Not promoted to `main`.
 
+In the container with the scorer's flags (`scripts/docker_ab.sh`, 20M, 5 interleaved
+rounds, load about 26, time to done min / median): default 1879 / 2254 ms; no huge
+pages 2432 / 3012; 4 threads 2505 / 2615; no input release and no parallel teardown
+1366 / 2036 with kernel time 1294 / 1301 ms against 1538 / 1981. The last one is an
+open lead, not yet a decision (see HANDOFF.md).
+
 A lesson about the method: single-thread cycle counts (`scripts/cyc.sh`) showed these
 changes as worth 4 to 5%, and they mostly evaporated at 8 threads on 4 cores. Changes
 have to be judged in the scorer's shape (`PIN=0-7`, 20M), and anything under about 5%
