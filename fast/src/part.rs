@@ -23,8 +23,21 @@ unsafe impl Send for BlockPool {}
 unsafe impl Sync for BlockPool {}
 
 impl BlockPool {
-    pub fn new(nblocks: usize) -> BlockPool {
-        BlockPool { base: map_anon(nblocks * BLOCK_BYTES, true), nblocks, next: AtomicUsize::new(0) }
+    /// Reserve `nblocks` blocks of address space. The reservation is generous
+    /// (worst-case input), so if the kernel refuses it, settle for less, down
+    /// to `floor` blocks.
+    pub fn new(nblocks: usize, floor: usize) -> BlockPool {
+        let mut n = nblocks;
+        loop {
+            if let Some(base) = crate::sys::try_map_anon(n * BLOCK_BYTES, true) {
+                return BlockPool { base, nblocks: n, next: AtomicUsize::new(0) };
+            }
+            if n <= floor {
+                break;
+            }
+            n = (n / 2).max(floor);
+        }
+        BlockPool { base: map_anon(floor * BLOCK_BYTES, true), nblocks: floor, next: AtomicUsize::new(0) }
     }
 
     #[inline(always)]

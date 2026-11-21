@@ -547,9 +547,12 @@ fn main() {
     // Event partitions: about 0.5 MB of records each, but never so many that a
     // thread's write-combining lines (64 bytes per partition) crowd its L2.
     let pd = (events_bytes / 2_400_000).next_power_of_two().clamp(1 << parse::MIN_PD_BITS, 2048);
-    let pool_blocks = (events_bytes * 5 / 2 + clicks_bytes * 2) / part::BLOCK_BYTES
-        + (pd + 3 * ps) * nthreads * 2
-        + 4096;
+    // Block pool: address space for the worst case (every line as short as a
+    // line can be); real data needs about a fifth of it. `pool_floor` is what
+    // to settle for if the kernel will not reserve that much.
+    let pool_slack = (pd + 3 * ps) * nthreads * 2 + 4096;
+    let pool_blocks = (events_bytes * 5 / 2 + clicks_bytes * 2) / part::BLOCK_BYTES + pool_slack;
+    let pool_floor = (events_bytes * 3 / 5 + clicks_bytes * 4 / 5) / part::BLOCK_BYTES + pool_slack;
 
     let t0 = ws - REACH_MS;
     let day0 = t0.div_euclid(DAY_MS);
@@ -587,7 +590,7 @@ fn main() {
         read_io,
         read_tail: std::env::var("READ_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(parse::TAIL),
         table: Table::new(cap),
-        pool: BlockPool::new(pool_blocks),
+        pool: BlockPool::new(pool_blocks, pool_floor),
         files,
         link_chunks,
         main_chunks,
