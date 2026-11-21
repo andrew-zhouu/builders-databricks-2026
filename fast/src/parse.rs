@@ -33,8 +33,15 @@ use crate::{Chunk, Ctx};
 
 pub const PERSON_BITS: u32 = 27;
 pub const TS_MASK: u64 = (1 << 31) - 1;
-pub const LOCAL_BITS: u32 = 12;
-pub const CAMPAIGN_BITS: u32 = 21;
+/// People per person partition, as bits of the person's number. 13 keeps the
+/// partition writers' buffers (64 bytes per partition and stream) and a
+/// partition's events both within the second-level cache at 60M events.
+pub const LOCAL_BITS: u32 = 13;
+/// A click's first word is `person_local | ts_rel_ms(31) | campaign`: the
+/// campaign gets the bits the other two leave.
+pub const CAMPAIGN_BITS: u32 = 33 - LOCAL_BITS;
+/// Where `person_local` starts in a click's first word.
+pub const CLICK_SHIFT: u32 = 31 + CAMPAIGN_BITS;
 /// Marks a cancellation among event and purchase records.
 pub const CANCEL: u64 = 1 << (31 + LOCAL_BITS);
 
@@ -1041,7 +1048,7 @@ pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
 
 #[inline(always)]
 fn click_words(person: u64, tc: u64) -> (usize, u64) {
-    ((person >> LOCAL_BITS) as usize, (person & ((1 << LOCAL_BITS) - 1)) << 52 | tc)
+    ((person >> LOCAL_BITS) as usize, (person & ((1 << LOCAL_BITS) - 1)) << CLICK_SHIFT | tc)
 }
 
 /// The literal rules for one click line.
