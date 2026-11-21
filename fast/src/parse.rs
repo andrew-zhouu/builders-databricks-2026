@@ -7,19 +7,23 @@
 //! the rules literally. Both paths emit the same records.
 //!
 //! Record layouts (64-bit words):
-//!   event   w0 = event_key(43) << 21 | ingest_rel_seconds(21)
+//!   event   w0 = event_key_remainder(<= 43) << 21 | ingest_rel_seconds(21)
 //!           w1 = valid(1) | purchase(1) | 0(4) | user_slot(27) | ts_rel_ms(31)
 //!           a valid purchase is followed by a second record: (price << 32 | category, 0)
 //!   click   w0 = person_local(12) | ts_rel_ms(31) | campaign(21)
 //!           w1 = click key (order-preserving, see ids.rs)
 //!
-//! 256-bit vectors only: on Cascade Lake even light 512-bit use lowers the
-//! core's frequency licence.
+//! An event key (49 bits) is multiplied by an odd constant modulo 2^49, a
+//! bijection; the top bits of the product choose the partition and only the
+//! rest is stored, so within a partition equal remainders mean equal IDs.
+//!
+//! Vector code is AVX2 only, and multiplies stay in 128-bit registers: wider
+//! or heavier instructions lower the core's frequency licence on Cascade Lake.
 
 use core::arch::x86_64::*;
 use std::sync::atomic::Ordering::Relaxed;
 
-use crate::ids::{event_key, EVENT_IRREGULAR};
+use crate::ids::{event_key, EVENT_IRREGULAR, EVENT_KEY_BITS};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
@@ -33,15 +37,19 @@ pub const SLOT_BITS: u32 = 27;
 pub const TS_MASK: u64 = (1 << 31) - 1;
 pub const LOCAL_BITS: u32 = 12;
 pub const CAMPAIGN_BITS: u32 = 21;
+/// Fewest event partitions: the remainder must fit in 64 - 21 bits.
+pub const MIN_PD_BITS: u32 = EVENT_KEY_BITS + INGEST_BITS - 64;
 
 /// Bytes that must be readable after a line start for the fast paths.
 const MARGIN: usize = 256;
 /// Lines this close to the file start use the scalar path (backward loads).
 const HEAD: usize = 16;
 
+/// Partition and stored remainder of an event key.
 #[inline(always)]
-pub fn event_hash(ek: u64) -> u64 {
-    ek.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+fn place(ctx: &Ctx, ek: u64) -> (usize, u64) {
+    let m = ek.wrapping_mul(0x9E37_79B9_7F4A_7C15) & ((1 << EVENT_KEY_BITS) - 1);
+    ((m >> ctx.rem_bits) as usize, m & ((1 << ctx.rem_bits) - 1))
 }
 
 // ------------------------------------------------------------------ dates
@@ -51,15 +59,17 @@ const BAD_DAY: i32 = i32::MIN;
 /// Day numbers for every valid date of three years around the window, indexed
 /// by `month * 32 + day`. Timestamps in other years go to the scalar parser.
 pub struct DateTab {
-    years: [u32; 3],
-    days: [[i32; 512]; 3],
+    /// ASCII of the three years (row 3 never matches).
+    years: [u32; 4],
+    /// Row for a year's last digit (3 = none).
+    row: [u8; 16],
+    days: [[i32; 512]; 4],
 }
 
 impl DateTab {
     pub fn new(ws: i64) -> DateTab {
         let (y, _, _) = civil_from_days(ws.div_euclid(DAY_MS));
-        // Unset years get distinct values no ASCII year can equal.
-        let mut t = DateTab { years: [0xFFFF_FF00, 0xFFFF_FF01, 0xFFFF_FF02], days: [[BAD_DAY; 512]; 3] };
+        let mut t = DateTab { years: [u32::MAX; 4], row: [3; 16], days: [[BAD_DAY; 512]; 4] };
         for k in 0..3 {
             let yy = y - 1 + k as i64;
             if !(0..=9999).contains(&yy) {
@@ -67,6 +77,7 @@ impl DateTab {
             }
             let s = format!("{yy:04}");
             t.years[k] = u32::from_le_bytes(s.as_bytes().try_into().unwrap());
+            t.row[(yy % 10) as usize] = k as u8;
             for m in 1..=12 {
                 for d in 1..=days_in_month(yy, m) {
                     t.days[k][(m * 32 + d) as usize] = days_from_civil(yy, m, d) as i32;
@@ -82,10 +93,8 @@ impl DateTab {
 #[inline(always)]
 unsafe fn datetime(dt: &DateTab, a: *const u8) -> (bool, bool, bool, i64) {
     let y = (a as *const u32).read_unaligned();
-    let e0 = y == dt.years[0];
-    let e1 = y == dt.years[1];
-    let e2 = y == dt.years[2];
-    let yi = e1 as usize + 2 * e2 as usize;
+    let row = *dt.row.get_unchecked((y >> 24 & 15) as usize) as usize;
+    let known = y == *dt.years.get_unchecked(row);
     let v = _mm_loadu_si128(a.add(4) as *const __m128i);
     // "-MM-DDTHH:MM:SS?" minus the expected separators / '0'
     let pattern = _mm_setr_epi8(
@@ -93,18 +102,38 @@ unsafe fn datetime(dt: &DateTab, a: *const u8) -> (bool, bool, bool, i64) {
     );
     let limit = _mm_setr_epi8(0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1);
     let t = _mm_sub_epi8(v, pattern);
-    let shape = _mm_cmple_epu8_mask(t, limit) == 0xFFFF;
+    let shape = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(t, limit), limit)) == 0xFFFF;
     let digits = _mm_shuffle_epi8(t, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
     // 16-bit lanes: month, day, hour, minute, second
     let pairs = _mm_maddubs_epi16(digits, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
-    let over = _mm_cmpgt_epi16_mask(pairs, _mm_setr_epi16(12, 31, 23, 59, 59, i16::MAX, i16::MAX, i16::MAX)) != 0;
-    // 32-bit lanes: month * 32 + day, hour * 3600 + minute * 60, second
+    let over = _mm_movemask_epi8(_mm_cmpgt_epi16(
+        pairs,
+        _mm_setr_epi16(12, 31, 23, 59, 59, i16::MAX, i16::MAX, i16::MAX),
+    )) != 0;
+    // 32-bit lanes: month * 32 + day, hour * 3600 + minute * 60, second, 0
     let q = _mm_madd_epi16(pairs, _mm_setr_epi16(32, 1, 3600, 60, 1, 0, 0, 0));
-    let di = _mm_cvtsi128_si32(q) as usize & 511;
-    let sod = (_mm_extract_epi32::<1>(q) + _mm_extract_epi32::<2>(q)) as i64;
-    let days = *dt.days.get_unchecked(yi).get_unchecked(di);
-    (shape, e0 | e1 | e2, !over & (days != BAD_DAY), days as i64 * 86_400 + sod)
+    // add the seconds into lane 1 so one move brings out (date index, second of day)
+    let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b11_11_10_11>(q));
+    let x = _mm_cvtsi128_si64(q) as u64;
+    let days = *dt.days.get_unchecked(row).get_unchecked(x as usize & 511);
+    (shape, known, !over & (days != BAD_DAY), days as i64 * 86_400 + (x >> 32) as i64)
 }
+
+const fn last_masks() -> [[u8; 16]; 17] {
+    let mut t = [[0u8; 16]; 17];
+    let mut n = 0;
+    while n <= 16 {
+        let mut i = 16 - n;
+        while i < 16 {
+            t[n][i] = 0xFF;
+            i += 1;
+        }
+        n += 1;
+    }
+    t
+}
+/// `LAST[n]`: the last `n` of 16 bytes set.
+static LAST: [[u8; 16]; 17] = last_masks();
 
 /// The value of the `n` (1 to 16) ASCII digits that end at `end`.
 /// Returns (all digits, value).
@@ -112,15 +141,15 @@ unsafe fn datetime(dt: &DateTab, a: *const u8) -> (bool, bool, bool, i64) {
 unsafe fn digits16(end: *const u8, n: usize) -> (bool, u64) {
     let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
     let t = _mm_sub_epi8(v, _mm_set1_epi8(48));
-    let lm = (0xFFFFu32 << (16 - n)) as u16;
-    let ok = _mm_cmplt_epu8_mask(t, _mm_set1_epi8(10));
-    let d = _mm_maskz_mov_epi8(lm, t);
+    let keep = _mm_loadu_si128(LAST.get_unchecked(n).as_ptr() as *const __m128i);
+    let isdigit = _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t);
+    let d = _mm_and_si128(t, keep);
     let a = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
     let b = _mm_madd_epi16(a, _mm_set1_epi32(0x0001_0064));
     let c = _mm_packus_epi32(b, b);
     let e = _mm_madd_epi16(c, _mm_set1_epi32(0x0001_2710));
     let x = _mm_cvtsi128_si64(e) as u64;
-    (ok & lm == lm, (x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32))
+    (_mm_testc_si128(isdigit, keep) != 0, (x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32))
 }
 
 /// A `ts` field of `n` bytes at `a`. Returns (cannot decide here, valid, epoch ms).
@@ -164,46 +193,36 @@ unsafe fn timestamp(dt: &DateTab, a: *const u8, n: usize) -> (bool, bool, i64) {
 
 // ------------------------------------------------------------------ ids
 
-/// Character codes of 16 bytes: 1-10 for digits, 11-36 for lower-case letters,
-/// 0 elsewhere; and the mask of bytes that have a code.
+const PEXT6: u64 = 0x5F5F_5F5F_5F5F_5F5F;
+
+/// For two 16-byte strings (low and high half of the result): which bytes are in `[0-9a-z]`.
 #[inline(always)]
-unsafe fn codes16(a: *const u8) -> (__m128i, u32) {
-    let v = _mm_loadu_si128(a as *const __m128i);
-    let d = _mm_sub_epi8(v, _mm_set1_epi8(0x30));
-    let isd = _mm_cmplt_epu8_mask(d, _mm_set1_epi8(10));
-    let l = _mm_sub_epi8(v, _mm_set1_epi8(0x61));
-    let isl = _mm_cmplt_epu8_mask(l, _mm_set1_epi8(26));
-    let c = _mm_maskz_add_epi8(isd, d, _mm_set1_epi8(1));
-    let c = _mm_mask_add_epi8(c, isl, l, _mm_set1_epi8(11));
-    (c, (isd | isl) as u32)
+unsafe fn alnum_bits(lo: *const u8, hi: *const u8) -> u32 {
+    let v = _mm256_inserti128_si256::<1>(
+        _mm256_castsi128_si256(_mm_loadu_si128(lo as *const __m128i)),
+        _mm_loadu_si128(hi as *const __m128i),
+    );
+    let d = _mm256_sub_epi8(v, _mm256_set1_epi8(0x30));
+    let l = _mm256_sub_epi8(v, _mm256_set1_epi8(0x61));
+    let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(25)), l);
+    _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) as u32
 }
 
-/// The 54-bit key of a regular ID of `n` bytes at `a` (see ids::key9).
-/// Returns (regular, key). `n` may be anything; only 1 to 9 can be regular.
+/// The 54-bit key of the `n` (1 to 9) regular characters at `a` (see ids::key9).
 #[inline(always)]
-unsafe fn key9_fast(a: *const u8, n: usize) -> (bool, u64) {
-    let (c, ok) = codes16(a);
-    let lm = (1u32 << (n & 15)).wrapping_sub(1);
-    let c = _mm_maskz_mov_epi8(lm as u16, c);
-    let p = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140));
-    let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_1000));
-    let x = _mm_cvtsi128_si64(q) as u64;
-    let c8 = _mm_extract_epi8::<8>(c) as u64;
-    let key = (x & 0xFFFF_FFFF) << 30 | (x >> 32) << 6 | c8;
-    ((n.wrapping_sub(1) < 9) & (ok & lm == lm), key)
+unsafe fn pack9(a: *const u8, n: usize) -> u64 {
+    let w = _bzhi_u64((a as *const u64).read_unaligned(), 8u32.wrapping_mul(n as u32));
+    let hi = _pext_u64(w.swap_bytes(), PEXT6);
+    let c8 = _pext_u64(*a.add(8) as u64, 0x5F) & 0u64.wrapping_sub((n == 9) as u64);
+    hi << 6 | c8
 }
 
-/// The 42-bit key of a regular event ID (see ids::event_key). Returns (regular, key).
+/// The 48-bit key of a regular event ID of `n` (1 to 9) bytes at `a` (see ids::event_key).
 #[inline(always)]
-unsafe fn event_key_fast(a: *const u8, n: usize) -> (bool, u64) {
-    let (c, ok) = codes16(a);
-    let lm = (1u32 << (n & 15)).wrapping_sub(1);
-    let c = _mm_srli_si128::<1>(_mm_maskz_mov_epi8(lm as u16, c));
-    let p = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0125));
-    let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_0559));
-    let x = _mm_cvtsi128_si64(q) as u64;
-    let key = (x & 0xFFFF_FFFF) * 1_874_161 + (x >> 32);
-    ((n.wrapping_sub(1) < 9) & (*a == b'e') & (ok & lm == lm), key)
+unsafe fn pack_event(a: *const u8, n: usize) -> u64 {
+    let w = (a.add(1) as *const u64).read_unaligned();
+    _pext_u64(_bzhi_u64(w, 8u32.wrapping_mul((n as u32).wrapping_sub(1))), PEXT6)
 }
 
 // ------------------------------------------------------------------ scanning
@@ -212,9 +231,12 @@ unsafe fn event_key_fast(a: *const u8, n: usize) -> (bool, u64) {
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     let v0 = _mm256_loadu_si256(p as *const __m256i);
     let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let (comma, nl, quote) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
-    let m = |c: __m256i| (_mm256_cmpeq_epi8_mask(v0, c) as u64) | (_mm256_cmpeq_epi8_mask(v1, c) as u64) << 32;
-    (m(comma), m(nl), m(quote))
+    let m = |c: u8| {
+        let c = _mm256_set1_epi8(c as i8);
+        (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c)) as u32 as u64)
+            | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c)) as u32 as u64) << 32
+    };
+    (m(b','), m(b'\n'), m(b'"'))
 }
 
 /// Quote check for the fields ended by the delimiters in `d`, given the quote
@@ -238,7 +260,7 @@ fn first_line(data: &[u8], start: usize) -> Option<usize> {
 
 // ------------------------------------------------------------------ links
 
-#[inline]
+#[inline(never)]
 fn link_line(ctx: &Ctx, line: &[u8]) {
     if let Some([a, b]) = split::<2>(line) {
         if a.is_empty() || b.is_empty() {
@@ -256,9 +278,8 @@ fn link_line(ctx: &Ctx, line: &[u8]) {
 #[inline(always)]
 unsafe fn link_fast(ctx: &Ctx, p: *const u8) -> usize {
     let v = _mm256_loadu_si256(p as *const __m256i);
-    let cm = _mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(b',' as i8)) as u64;
-    let nm = _mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(b'\n' as i8)) as u64;
-    let qm = _mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(b'"' as i8)) as u64;
+    let m = |c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
+    let (cm, nm, qm) = (m(b','), m(b'\n'), m(b'"'));
     let nl = nm.trailing_zeros() as usize;
     let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
     let cmb = cm & below;
@@ -268,17 +289,17 @@ unsafe fn link_fast(ctx: &Ctx, p: *const u8) -> usize {
         return 0;
     }
     let (f0, f1) = ((f & 1) as usize, (f >> 1 & 1) as usize);
-    let (n0, n1) = (c0 - 2 * f0, nl - c0 - 1 - 2 * f1);
+    let (a0, n0) = (p.add(f0), c0 - 2 * f0);
+    let (a1, n1) = (p.add(c0 + 1 + f1), nl - c0 - 1 - 2 * f1);
     if (n0 == 0) | (n1 == 0) {
         return nl + 1;
     }
-    let (r0, k0) = key9_fast(p.add(f0), n0);
-    let (r1, k1) = key9_fast(p.add(c0 + 1 + f1), n1);
-    if !(r0 & r1) {
+    let need = _bzhi_u32(0xFFFF, n0 as u32) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
+    if (n0 > 9) | (n1 > 9) | (alnum_bits(a0, a1) & need != need) {
         return 0;
     }
-    let sa = ctx.table.insert(k0);
-    let sb = ctx.table.insert(k1);
+    let sa = ctx.table.insert(pack9(a0, n0));
+    let sb = ctx.table.insert(pack9(a1, n1));
     if sa != sb {
         // Roots may be irregular IDs inserted by the scalar path: full comparison.
         ctx.table.union(sa, sb, |x, y| ctx.users.less(x, y));
@@ -385,8 +406,8 @@ fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
         Some(k) => k,
         None => EVENT_IRREGULAR | ctx.event_dict.intern(f[0]),
     };
-    let w0 = ek << INGEST_BITS | ingest_field(ctx, ingest.div_euclid(1000));
-    let part = (event_hash(ek) >> 40) as usize & ctx.pd_mask;
+    let (part, rem) = place(ctx, ek);
+    let w0 = rem << INGEST_BITS | ingest_field(ctx, ingest.div_euclid(1000));
 
     let mut valid = !f[1].is_empty() && !f[5].is_empty();
     let mut ts = 0i64;
@@ -465,25 +486,26 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
 
     let q = |f: u64, i: u32| (f >> i & 1) as usize;
     let (q0, q1, q2) = (q(fa, 0), q(fa, 1), q(fa, 2));
-    let (q3, q4, q5, q6) = (q(fb, 0), q(fb, 1), q(fb, 2), q(fb, 3));
+    let (q3, q4, q5) = (q(fb, 0), q(fb, 1), q(fb, 2));
     let (a0, n0) = (p.add(q0), c0 - 2 * q0);
     let (a1, n1) = (p.add(c0 + 1 + q1), c1 - c0 - 1 - 2 * q1);
     let (a2, n2) = (p.add(c1 + 1 + q2), c2 - c1 - 1 - 2 * q2);
     let (a3, n3) = (p2.add(q3), c3 - 2 * q3);
     let (a4, n4) = (p2.add(c3 + 1 + q4), c4 - c3 - 1 - 2 * q4);
-    let (a5, n5) = (p2.add(c4 + 1 + q5), c5 - c4 - 1 - 2 * q5);
-    let (a6, n6) = (p2.add(c5 + 1 + q6), nl - c5 - 1 - 2 * q6);
+    let n5 = c5 - c4 - 1 - 2 * q5;
     let used = c2 + 1 + nl + 1;
 
+    // IDs: `e` + up to 8 regular characters, and up to 9 regular characters
+    // (or an empty user_id, which only makes the event invalid).
+    let need = _bzhi_u32(0xFFFF, (n0 as u32).wrapping_sub(1)) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
+    let ids_ok = (n0.wrapping_sub(1) < 9) & (*a0 == b'e') & (n1 <= 9) & (alnum_bits(a0.add(1), a1) & need == need);
     let dt = &ctx.dates;
-    let (ek_ok, ek) = event_key_fast(a0, n0);
-    let (uk_ok, uk) = key9_fast(a1, n1);
     let (ts_unsure, ts_valid, ts) = timestamp(dt, a2, n2);
     let (i_shape, i_known, i_cal, ingest_s) = datetime(dt, a3);
     let ingest_ok = (n3 == 20) & i_shape & i_known & i_cal & (*a3.add(19) == b'Z');
     // Scalar path: an empty or irregular event_id, an irregular user_id, a
     // timestamp this path cannot decide, an ingest_ts that is not plain F1.
-    if !ek_ok | !(uk_ok | (n1 == 0)) | ts_unsure | !ingest_ok {
+    if !ids_ok | ts_unsure | !ingest_ok {
         return 0;
     }
 
@@ -497,14 +519,16 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
         & (ts >= ctx.ws)
         & (ts < ctx.we)
         & (ingest_s * 1000 - ts <= DAY_MS);
-    let w0 = ek << INGEST_BITS | ingest_field(ctx, ingest_s);
-    let part = (event_hash(ek) >> 40) as usize & ctx.pd_mask;
+    let (part, rem) = place(ctx, pack_event(a0, n0));
+    let w0 = rem << INGEST_BITS | ingest_field(ctx, ingest_s);
     let mut extra = 0u64;
     let mut w1 = VALID | (ts.wrapping_sub(ctx.t0) as u64 & TS_MASK);
     if purchase {
-        match parse_price(std::slice::from_raw_parts(a6, n6)) {
+        let q6 = q(fb, 3);
+        let price = std::slice::from_raw_parts(p2.add(c5 + 1 + q6), nl - c5 - 1 - 2 * q6);
+        match parse_price(price) {
             Some(price) => {
-                let cat = ctx.products.category(std::slice::from_raw_parts(a5, n5)) as u64;
+                let cat = ctx.products.category(std::slice::from_raw_parts(p2.add(c4 + 1 + q5), n5)) as u64;
                 extra = (price as u64) << 32 | cat;
                 w1 |= PURCHASE;
             }
@@ -512,7 +536,7 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
         }
     }
     if valid {
-        ring.push(ctx, d, PendingEvent { w0, w1, key: uk, extra, part: part as u32 });
+        ring.push(ctx, d, PendingEvent { w0, w1, key: pack9(a1, n1), extra, part: part as u32 });
     } else {
         d.push2(&ctx.pool, part, w0, 0);
     }
@@ -545,12 +569,6 @@ pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, ch: &Chunk) {
 
 // ------------------------------------------------------------------ clicks
 
-#[inline(always)]
-fn click_record(person: u64, ts_rel: u64, campaign: u64) -> (usize, u64) {
-    let local = person & ((1 << LOCAL_BITS) - 1);
-    ((person >> LOCAL_BITS) as usize, local << 52 | ts_rel << CAMPAIGN_BITS | campaign)
-}
-
 /// The literal rules for one click line.
 #[inline(never)]
 fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
@@ -568,8 +586,9 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
     };
     let slot = ctx.table.insert(ctx.users.key(f[1]));
     let person = ctx.table.person(slot) as u64;
-    let (part, w0) = click_record(person, (ts - ctx.t0) as u64, campaign as u64);
-    c.push2(&ctx.pool, part, w0, ctx.clicks.key(f[0]));
+    let local = person & ((1 << LOCAL_BITS) - 1);
+    let w0 = local << 52 | ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64;
+    c.push2(&ctx.pool, (person >> LOCAL_BITS) as usize, w0, ctx.clicks.key(f[0]));
 }
 
 /// A click on its way through the two lookups: key -> slot -> person.
@@ -578,7 +597,7 @@ struct PendingClick {
     /// ts_rel << CAMPAIGN_BITS | campaign
     tc: u64,
     click: u64,
-    /// The user key, then (second stage) the slot. 0 = empty.
+    /// The user key, then (second stage) the slot + 1. 0 = empty.
     user: u64,
 }
 
@@ -649,10 +668,10 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
     if (n0 == 0) | (n1 == 0) {
         return used;
     }
-    let (ck_ok, ck) = key9_fast(a0, n0);
-    let (uk_ok, uk) = key9_fast(a1, n1);
+    let need = _bzhi_u32(0xFFFF, n0 as u32) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
+    let ids_ok = (n0 <= 9) & (n1 <= 9) & (alnum_bits(a0, a1) & need == need);
     let (ts_unsure, ts_valid, ts) = timestamp(&ctx.dates, a3, n3);
-    if !ck_ok | !uk_ok | ts_unsure {
+    if !ids_ok | ts_unsure {
         return 0;
     }
     // `c_<n>` without a leading zero goes straight to the table.
@@ -669,7 +688,7 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
     };
     if (campaign != ABSENT) & ts_valid & (ts >= ctx.t0) & (ts < ctx.we) {
         let tc = ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64;
-        ring.step(ctx, c, PendingClick { tc, click: ck, user: uk });
+        ring.step(ctx, c, PendingClick { tc, click: pack9(a0, n0), user: pack9(a1, n1) });
     }
     used
 }

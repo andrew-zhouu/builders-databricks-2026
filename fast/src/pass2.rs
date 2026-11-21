@@ -6,7 +6,7 @@
 //! event survive. `w0 = key << 21 | ingest`, so comparing `w0` of two copies of
 //! one event compares their ingest times.
 
-use crate::parse::{event_hash, INGEST_BITS, LOCAL_BITS, PURCHASE, SLOT_BITS, TS_MASK};
+use crate::parse::{INGEST_BITS, LOCAL_BITS, PURCHASE, SLOT_BITS, TS_MASK};
 use crate::part::PartWriter;
 use crate::Ctx;
 
@@ -61,6 +61,7 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter,
     sc.dead.clear();
     sc.dead.resize(n, 0);
     let mask = tsize - 1;
+    let shift = 64 - tsize.trailing_zeros();
     let tab = &mut sc.tab[..];
     let dead = &mut sc.dead[..];
 
@@ -68,8 +69,9 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter,
     while i < n {
         let w0 = recs[2 * i];
         let w1 = recs[2 * i + 1];
+        // The stored remainder identifies the event within this partition.
         let ek = w0 >> INGEST_BITS;
-        let mut slot = (event_hash(ek) >> 8) as usize & mask;
+        let mut slot = (ek.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift) as usize;
         loop {
             let e = tab[slot];
             if e == 0 {

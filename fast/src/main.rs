@@ -80,8 +80,9 @@ pub struct Ctx {
     next_main: AtomicUsize,
     next_d: AtomicUsize,
     next_s: AtomicUsize,
+    /// Event partitions (a power of two) and the bits of an event key stored within one.
     pub pd: usize,
-    pub pd_mask: usize,
+    pub rem_bits: u32,
     pub ps: usize,
     d: Vec<Shared<PartWriter>>,
     c: Vec<Shared<PartWriter>>,
@@ -223,6 +224,53 @@ fn worker(ctx: &Ctx, tid: usize) {
     ctx.sync("sessions built, user_daily written");
 }
 
+/// `--bench`: best-of-N thread CPU time per line for each parser on a small
+/// region of the largest file of its kind. Small and repeated so that the
+/// minimum is meaningful even on a busy machine.
+fn bench(ctx: &Ctx) {
+    sys::NORELEASE.store(true, Relaxed);
+    for ch in &ctx.link_chunks {
+        parse::links_chunk(ctx, ch);
+    }
+    ctx.table.compress(0, ctx.table.cap);
+    let region: usize = std::env::var("BENCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 19);
+    let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+    for kind in [FileKind::Events, FileKind::Clicks, FileKind::Links] {
+        let chunks = if kind == FileKind::Links { &ctx.link_chunks } else { &ctx.main_chunks };
+        let Some(file) = chunks
+            .iter()
+            .filter(|c| c.kind == kind)
+            .map(|c| c.file)
+            .max_by_key(|&f| ctx.files[f as usize].len)
+        else {
+            continue;
+        };
+        let data = ctx.files[file as usize].slice();
+        let end = region.min(data.len());
+        let lines = data[..end].iter().filter(|&&c| c == b'\n').count().max(1);
+        let ch = Chunk { file, kind, start: 0, end };
+        let mut best = u64::MAX;
+        let mut free: Vec<u32> = Vec::new();
+        for _ in 0..iters {
+            let nparts = if kind == FileKind::Events { ctx.pd } else { ctx.ps };
+            let mut w = PartWriter::new(nparts);
+            w.free = std::mem::take(&mut free);
+            let t = sys::thread_cpu_ns();
+            match kind {
+                FileKind::Events => parse::events_chunk(ctx, &mut w, &ch),
+                FileKind::Clicks => parse::clicks_chunk(ctx, &mut w, &ch),
+                FileKind::Links => parse::links_chunk(ctx, &ch),
+            }
+            best = best.min(sys::thread_cpu_ns() - t);
+            w.finalize(&ctx.pool);
+            free = w.all_blocks().to_vec();
+            free.extend_from_slice(&w.free);
+        }
+        let name = ["events", "clicks", "links"][kind as usize];
+        eprintln!("bench {name}: {:.1} ns/line ({lines} lines, {} bytes/line)", best as f64 / lines as f64, end / lines);
+    }
+}
+
 fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
     let n = rows.key.len();
     if n == 0 && tid != 0 {
@@ -310,6 +358,7 @@ fn main() {
     let t_start = Instant::now();
     let all_args: Vec<String> = std::env::args().collect();
     let force_slow = all_args.iter().any(|a| a == "--slow") || std::env::var("SLOW").is_ok();
+    let force_bench = all_args.iter().any(|a| a == "--bench");
     let args: Vec<String> = all_args.into_iter().filter(|a| !a.starts_with("--")).collect();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data_dir = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| env("DATA_DIR", "/data")));
@@ -368,7 +417,7 @@ fn main() {
     let est_ids = links_bytes / 16 + events_bytes / 2200 + clicks_bytes / 1500 + 2048;
     let cap = (est_ids * 2).next_multiple_of(1 << parse::LOCAL_BITS);
     let ps = cap >> parse::LOCAL_BITS;
-    let pd = (events_bytes / 1_800_000).next_power_of_two().clamp(1, 4096);
+    let pd = (events_bytes / 1_800_000).next_power_of_two().clamp(1 << parse::MIN_PD_BITS, 4096);
     let pool_blocks = (events_bytes * 5 / 2 + clicks_bytes * 2) / part::BLOCK_BYTES
         + (pd + 3 * ps) * nthreads * 2
         + 4096;
@@ -415,7 +464,7 @@ fn main() {
         next_d: AtomicUsize::new(0),
         next_s: AtomicUsize::new(0),
         pd,
-        pd_mask: pd - 1,
+        rem_bits: ids::EVENT_KEY_BITS - pd.trailing_zeros(),
         ps,
         d: (0..nthreads).map(|_| Shared::new(PartWriter::new(pd))).collect(),
         c: (0..nthreads).map(|_| Shared::new(PartWriter::new(ps))).collect(),
@@ -444,6 +493,10 @@ fn main() {
         );
     }
 
+    if force_bench {
+        bench(&ctx);
+        unsafe { sys::_exit(0) }
+    }
     std::thread::scope(|scope| {
         for tid in 1..nthreads {
             let ctx = &ctx;

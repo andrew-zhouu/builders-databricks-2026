@@ -1,35 +1,42 @@
 //! Exact integer keys for IDs.
 //!
-//! An ID of 1 to 9 characters from `[0-9a-z]` ("regular") packs into 54 bits,
-//! 6 bits per character, left-aligned, so the integer order of two keys is the
-//! byte-wise order of the IDs. Every other ID ("irregular": upper case, spaces,
-//! longer, ...) is interned in a dictionary and keyed by its index with the top
-//! bit set. The mapping is injective either way, so equal keys mean equal IDs.
+//! A character of `[0-9a-z]` has a 6-bit code: bits 0-4 and bit 6 of its ASCII
+//! byte (`pext(byte, 0x5F)`), so digits are 16-25 and letters 33-58. The code is
+//! never 0, is injective, and keeps byte order.
+//!
+//! An ID of 1 to 9 such characters ("regular") packs into 54 bits, 6 per
+//! character, left-aligned, so the integer order of two keys is the byte-wise
+//! order of the IDs. Every other ID ("irregular": upper case, spaces, longer,
+//! ...) is interned in a dictionary and keyed by its index with the top bit set.
+//! The mapping is injective either way, so equal keys mean equal IDs.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub const IRREGULAR: u64 = 1 << 63;
-/// Event keys are 43 bits: 42 for `e` + up to 8 regular characters in base 37
-/// (0 = no character), or this flag plus a dictionary index.
-pub const EVENT_IRREGULAR: u64 = 1 << 42;
+/// Event keys are 49 bits: 48 for `e` + up to 8 regular characters (6 bits
+/// each, first character lowest), or this flag plus a dictionary index.
+pub const EVENT_IRREGULAR: u64 = 1 << 48;
+pub const EVENT_KEY_BITS: u32 = 49;
 
 const fn build_codes() -> [u8; 256] {
     let mut t = [0u8; 256];
-    let mut c = b'0';
-    while c <= b'9' {
-        t[c as usize] = c - b'0' + 1;
-        c += 1;
-    }
-    let mut c = b'a';
-    while c <= b'z' {
-        t[c as usize] = c - b'a' + 11;
+    let mut c = 0usize;
+    while c < 256 {
+        let b = c as u8;
+        if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'z') {
+            t[c] = (b & 0x1F) | ((b & 0x40) >> 1);
+        }
         c += 1;
     }
     t
 }
 pub static CODE: [u8; 256] = build_codes();
-static DECODE: &[u8; 37] = b"\x000123456789abcdefghijklmnopqrstuvwxyz";
+
+#[inline(always)]
+fn decode(code: u64) -> u8 {
+    ((code & 0x1F) | ((code & 0x20) << 1) | 0x20) as u8
+}
 
 /// The 54-bit order-preserving key of a regular ID, or `None`.
 #[inline]
@@ -53,15 +60,15 @@ pub fn key9(b: &[u8]) -> Option<u64> {
 
 pub fn key9_decode(k: u64, out: &mut Vec<u8>) {
     for i in 0..9 {
-        let v = ((k >> (6 * (8 - i))) & 63) as usize;
+        let v = (k >> (6 * (8 - i))) & 63;
         if v == 0 {
             break;
         }
-        out.push(DECODE[v]);
+        out.push(decode(v));
     }
 }
 
-/// The 42-bit key of a regular event ID (`e` then up to 8 of `[0-9a-z]`), or `None`.
+/// The 48-bit key of a regular event ID (`e` then up to 8 of `[0-9a-z]`), or `None`.
 #[inline]
 pub fn event_key(b: &[u8]) -> Option<u64> {
     let n = b.len();
@@ -70,17 +77,12 @@ pub fn event_key(b: &[u8]) -> Option<u64> {
     }
     let mut k = 0u64;
     let mut i = 1;
-    while i < 9 {
-        let v = if i < n {
-            let v = CODE[b[i] as usize] as u64;
-            if v == 0 {
-                return None;
-            }
-            v
-        } else {
-            0
-        };
-        k = k * 37 + v;
+    while i < n {
+        let v = CODE[b[i] as usize] as u64;
+        if v == 0 {
+            return None;
+        }
+        k |= v << (6 * (i - 1));
         i += 1;
     }
     Some(k)
