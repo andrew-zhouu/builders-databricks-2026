@@ -32,11 +32,19 @@ pub struct Rows {
     pub cat: Vec<u32>,
 }
 
+// Offsets of the four radix histograms inside `Scratch::h`.
+const H1: usize = 2048;
+const H2: usize = H1 + 1024;
+const H3: usize = H2 + 1024;
+
 pub struct Scratch {
     /// Event timestamps grouped by person; `start[l]..start[l + 1]` is person `l`.
     ts: Vec<u32>,
     start: Vec<u32>,
-    cursor: Vec<u32>,
+    /// Radix sort buffers and histograms.
+    a: Vec<u64>,
+    b: Vec<u64>,
+    h: Vec<u32>,
     pu: Vec<u64>,
     cl: Vec<u64>,
     tmp: Vec<u64>,
@@ -56,7 +64,9 @@ impl Scratch {
         Scratch {
             ts: Vec::new(),
             start: vec![0; LOCALS + 1],
-            cursor: vec![0; LOCALS],
+            a: Vec::new(),
+            b: Vec::new(),
+            h: vec![0; H3 + LOCALS],
             pu: Vec::new(),
             cl: Vec::new(),
             tmp: Vec::new(),
@@ -86,61 +96,87 @@ fn pairs(v: &mut [u64]) -> &mut [[u64; 2]] {
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut [u64; 2], v.len() / 2) }
 }
 
+/// Turn bucket counts into start offsets; returns the total.
 #[inline(always)]
-fn sort_ts(v: &mut [u32]) {
-    let n = v.len();
-    if n <= 24 {
-        for i in 1..n {
-            let x = v[i];
-            let mut j = i;
-            while j > 0 && v[j - 1] > x {
-                v[j] = v[j - 1];
-                j -= 1;
-            }
-            v[j] = x;
-        }
-    } else {
-        v.sort_unstable();
+fn prefix(h: &mut [u32]) -> u32 {
+    let mut total = 0u32;
+    for c in h.iter_mut() {
+        let n = *c;
+        *c = total;
+        total += n;
+    }
+    total
+}
+
+/// One stable LSD pass: scatter `src` into `dst` by `(w >> shift) & mask`.
+#[inline(always)]
+unsafe fn scatter(src: &[u64], dst: *mut u64, cursor: &mut [u32], shift: u32, mask: u64) {
+    for &w in src {
+        let c = cursor.get_unchecked_mut(((w >> shift) & mask) as usize);
+        *dst.add(*c as usize) = w;
+        *c += 1;
     }
 }
 
 pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     let t0 = ctx.now();
-    // Counting sort of the events by person: histogram, prefix sums, scatter.
-    sc.start.iter_mut().for_each(|c| *c = 0);
-    for t in 0..ctx.nthreads {
-        let start = &mut sc.start[..];
-        ctx.s(t).for_each_run(&ctx.pool, p, |run| {
-            for &w in run {
-                unsafe { *start.get_unchecked_mut((w >> 31) as usize + 1) += 1 };
-            }
-        });
-    }
-    let mut total = 0u32;
-    for l in 0..LOCALS {
-        let count = sc.start[l + 1];
-        sc.start[l] = total;
-        sc.cursor[l] = total;
-        total += count;
-    }
-    sc.start[LOCALS] = total;
-    if total == 0 {
-        return;
-    }
-    sc.ts.clear();
-    sc.ts.reserve(total as usize);
-    unsafe { sc.ts.set_len(total as usize) };
-    for t in 0..ctx.nthreads {
-        let (ts, cursor) = (sc.ts.as_mut_ptr(), &mut sc.cursor[..]);
-        ctx.s(t).for_each_run(&ctx.pool, p, |run| {
-            for &w in run {
-                unsafe {
-                    let c = cursor.get_unchecked_mut((w >> 31) as usize);
-                    *ts.add(*c as usize) = (w & TS_MASK) as u32;
-                    *c += 1;
+    // LSD radix sort of the partition's events, `person(12) | ts(31)`: three
+    // passes on the timestamp (11 + 10 + 10 bits), then a last one by person
+    // that keeps only the timestamps. Histograms are taken while gathering.
+    sc.h.iter_mut().for_each(|c| *c = 0);
+    sc.a.clear();
+    {
+        let (h0, rest) = sc.h.split_at_mut(H1);
+        let (h1, rest) = rest.split_at_mut(H2 - H1);
+        let (h2, h3) = rest.split_at_mut(H3 - H2);
+        let a = &mut sc.a;
+        for t in 0..ctx.nthreads {
+            let s = ctx.s(t);
+            a.reserve(s.part_words(p));
+            s.for_each_run(&ctx.pool, p, |run| {
+                for &w in run {
+                    unsafe {
+                        *h0.get_unchecked_mut((w & 0x7FF) as usize) += 1;
+                        *h1.get_unchecked_mut((w >> 11 & 0x3FF) as usize) += 1;
+                        *h2.get_unchecked_mut((w >> 21 & 0x3FF) as usize) += 1;
+                        *h3.get_unchecked_mut((w >> 31) as usize) += 1;
+                    }
                 }
+                a.extend_from_slice(run);
+            });
+        }
+        let total = a.len();
+        if total == 0 {
+            return;
+        }
+        prefix(h0);
+        prefix(h1);
+        prefix(h2);
+        // Person boundaries come from the last histogram.
+        let mut at = 0u32;
+        for l in 0..LOCALS {
+            sc.start[l] = at;
+            at += h3[l];
+            h3[l] = sc.start[l];
+        }
+        sc.start[LOCALS] = at;
+        sc.b.clear();
+        sc.b.reserve(total);
+        sc.ts.clear();
+        sc.ts.reserve(total);
+        unsafe {
+            sc.b.set_len(total);
+            sc.ts.set_len(total);
+            scatter(a, sc.b.as_mut_ptr(), h0, 0, 0x7FF);
+            scatter(&sc.b, a.as_mut_ptr(), h1, 11, 0x3FF);
+            scatter(a, sc.b.as_mut_ptr(), h2, 21, 0x3FF);
+            let ts = sc.ts.as_mut_ptr();
+            for &w in &sc.b {
+                let c = h3.get_unchecked_mut((w >> 31) as usize);
+                *ts.add(*c as usize) = (w & TS_MASK) as u32;
+                *c += 1;
             }
-        });
+        }
     }
     sc.pu.clear();
     sc.cl.clear();
@@ -150,7 +186,7 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     }
     let t0 = ctx.charge(crate::P_S_GATHER, t0);
 
-    let mut ts = std::mem::take(&mut sc.ts);
+    let ts = std::mem::take(&mut sc.ts);
     let mut pu = std::mem::take(&mut sc.pu);
     let mut cl = std::mem::take(&mut sc.cl);
     {
@@ -165,8 +201,7 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
             if from == to {
                 continue;
             }
-            let events = &mut ts[from..to];
-            sort_ts(events);
+            let events = &ts[from..to];
             let local = local as u64;
             let mut pj = pi;
             while pj < pu.len() && pu[pj][0] >> 31 == local {
