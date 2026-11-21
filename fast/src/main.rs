@@ -440,10 +440,18 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .min(64);
 
+    let mark = |what: &str| {
+        if timing {
+            eprintln!("[{:8.2} ms]   setup: {what}", t_start.elapsed().as_secs_f64() * 1e3);
+        }
+    };
+    mark("start");
     let (ws, we) = lookup::manifest(&std::fs::read(data_dir.join("manifest.json")).expect("manifest.json"))
         .expect("manifest window");
     let products = Products::load(&std::fs::read(data_dir.join("products.csv")).unwrap_or_default());
+    mark("products loaded");
     let campaigns = Campaigns::load(&std::fs::read(data_dir.join("campaigns.csv")).unwrap_or_default());
+    mark("campaigns loaded");
 
     let mut files: Vec<FileMap> = Vec::new();
     let mut link_chunks: Vec<Chunk> = Vec::new();
@@ -475,6 +483,7 @@ fn main() {
     }
     let (events_bytes, clicks_bytes, links_bytes) =
         (bytes[FileKind::Events as usize], bytes[FileKind::Clicks as usize], bytes[FileKind::Links as usize]);
+    mark("files mapped");
 
     // Sizes. The user table holds every distinct user ID; aim for a load of at most ~0.5.
     let est_ids = links_bytes / 16 + events_bytes / 2200 + clicks_bytes / 1500 + 2048;

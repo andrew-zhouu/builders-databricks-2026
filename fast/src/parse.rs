@@ -152,43 +152,46 @@ unsafe fn digits16(end: *const u8, n: usize) -> (bool, u64) {
     (_mm_testc_si128(isdigit, keep) != 0, (x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32))
 }
 
-/// A `ts` field of `n` bytes at `a`. Returns (cannot decide here, valid, epoch ms).
+/// A `ts` field of `n` bytes at `a`. Returns (decided here, valid, epoch ms).
+/// Only the form the length allows is parsed.
 #[inline(always)]
 unsafe fn timestamp(dt: &DateTab, a: *const u8, n: usize) -> (bool, bool, i64) {
-    let (shape, known, cal, secs) = datetime(dt, a);
-    let is20 = n == 20;
-    let is25 = n == 25;
-    let isdt = is20 | is25;
-    let isnum = n.wrapping_sub(1) < 16;
-    let (digits, value) = digits16(a.add(n), (n.wrapping_sub(1) & 15) + 1);
-    let mut suffix = *a.add(19) == b'Z';
-    let mut off = 0i64;
-    if is25 {
-        let s = *a.add(19);
-        let h1 = (*a.add(20)).wrapping_sub(b'0') as i64;
-        let h2 = (*a.add(21)).wrapping_sub(b'0') as i64;
-        let m1 = (*a.add(23)).wrapping_sub(b'0') as i64;
-        let m2 = (*a.add(24)).wrapping_sub(b'0') as i64;
-        let (oh, om) = (h1 * 10 + h2, m1 * 10 + m2);
-        suffix = ((s == b'+') | (s == b'-'))
-            & (h1 <= 9)
-            & (h2 <= 9)
-            & (m1 <= 9)
-            & (m2 <= 9)
-            & (*a.add(22) == b':')
-            & (oh <= 23)
-            & (om <= 59);
-        off = (oh * 60 + om) * 60_000;
-        if s == b'-' {
-            off = -off;
-        }
+    if n.wrapping_sub(1) < 16 {
+        // F3: digits only. Anything else of this length is simply invalid.
+        let (digits, value) = digits16(a.add(n), n);
+        return (true, digits, value as i64);
     }
-    // A 20- or 25-byte field that is not shaped like a date may still be all
-    // digits (F3), and longer digit strings need 64-bit care: scalar path.
-    let unsure = (isdt & (!shape | !known)) | (!isdt & !isnum & (n != 0));
-    let valid = (isdt & shape & known & cal & suffix) | (isnum & digits);
-    let ms = if isdt { secs * 1000 - off } else { value as i64 };
-    (unsure, valid, ms)
+    if (n == 20) | (n == 25) {
+        // F1 / F2. A field of these lengths that is not shaped like a date may
+        // still be all digits (F3), and an unknown year needs the full
+        // calendar: both go to the scalar path.
+        let (shape, known, cal, secs) = datetime(dt, a);
+        let mut suffix = *a.add(19) == b'Z';
+        let mut off = 0i64;
+        if n == 25 {
+            let s = *a.add(19);
+            let h1 = (*a.add(20)).wrapping_sub(b'0') as i64;
+            let h2 = (*a.add(21)).wrapping_sub(b'0') as i64;
+            let m1 = (*a.add(23)).wrapping_sub(b'0') as i64;
+            let m2 = (*a.add(24)).wrapping_sub(b'0') as i64;
+            let (oh, om) = (h1 * 10 + h2, m1 * 10 + m2);
+            suffix = ((s == b'+') | (s == b'-'))
+                & (h1 <= 9)
+                & (h2 <= 9)
+                & (m1 <= 9)
+                & (m2 <= 9)
+                & (*a.add(22) == b':')
+                & (oh <= 23)
+                & (om <= 59);
+            off = (oh * 60 + om) * 60_000;
+            if s == b'-' {
+                off = -off;
+            }
+        }
+        return (shape & known, cal & suffix, secs * 1000 - off);
+    }
+    // Empty is invalid; longer digit strings need 64-bit care: scalar path.
+    (n == 0, false, 0)
 }
 
 // ------------------------------------------------------------------ ids
@@ -534,15 +537,20 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
 
     // IDs: `e` + up to 8 regular characters, and up to 9 regular characters
     // (or an empty user_id, which only makes the event invalid).
+    // Anything else goes to the scalar path: an empty or irregular event_id, an
+    // irregular user_id, an ingest_ts that is not plain F1, a timestamp this
+    // path cannot decide.
     let need = _bzhi_u32(0xFFFF, (n0 as u32).wrapping_sub(1)) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
-    let ids_ok = (n0.wrapping_sub(1) < 9) & (*a0 == b'e') & (n1 <= 9) & (alnum_bits(a0.add(1), a1) & need == need);
+    if (n0.wrapping_sub(1) >= 9) | (*a0 != b'e') | (n1 > 9) | (alnum_bits(a0.add(1), a1) & need != need) {
+        return 0;
+    }
     let dt = &ctx.dates;
-    let (ts_unsure, ts_valid, ts) = timestamp(dt, a2, n2);
     let (i_shape, i_known, i_cal, ingest_s) = datetime(dt, a3);
-    let ingest_ok = (n3 == 20) & i_shape & i_known & i_cal & (*a3.add(19) == b'Z');
-    // Scalar path: an empty or irregular event_id, an irregular user_id, a
-    // timestamp this path cannot decide, an ingest_ts that is not plain F1.
-    if !ids_ok | ts_unsure | !ingest_ok {
+    if !((n3 == 20) & i_shape & i_known & i_cal & (*a3.add(19) == b'Z')) {
+        return 0;
+    }
+    let (ts_decided, ts_valid, ts) = timestamp(dt, a2, n2);
+    if !ts_decided {
         return 0;
     }
 
@@ -703,9 +711,11 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
         return used;
     }
     let need = _bzhi_u32(0xFFFF, n0 as u32) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
-    let ids_ok = (n0 <= 9) & (n1 <= 9) & (alnum_bits(a0, a1) & need == need);
-    let (ts_unsure, ts_valid, ts) = timestamp(&ctx.dates, a3, n3);
-    if !ids_ok | ts_unsure {
+    if (n0 > 9) | (n1 > 9) | (alnum_bits(a0, a1) & need != need) {
+        return 0;
+    }
+    let (ts_decided, ts_valid, ts) = timestamp(&ctx.dates, a3, n3);
+    if !ts_decided {
         return 0;
     }
     // `c_<n>` without a leading zero goes straight to the table.
