@@ -17,4 +17,6 @@ COPY --from=build /sessions /sessions
 # The scorer runs as uid 1000 with a read-only root; everything is written to
 # $OUTPUT_DIR (default /output). No arguments: DATA_DIR/OUTPUT_DIR/NCPU come from the environment.
 USER 1000:1000
+# Diagnostic image: reports the environment and exits 1 on purpose. Never submit this for a score.
+ENV SS_DIAG=1
 CMD ["/sessions"]
