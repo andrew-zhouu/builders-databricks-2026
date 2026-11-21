@@ -62,14 +62,12 @@ pub fn raw_len(key: u64) -> usize {
 pub fn event_hash(b: &[u8]) -> u64 {
     let n = b.len();
     if n <= 9 {
-        // The usual shape, a letter and up to 8 more bytes: the bytes after the
-        // first are the hash input (IDs that differ only in their first byte
-        // share a hash, which is allowed).
+        // The usual shape, a letter and up to 8 more bytes.
         let mut w = [0u8; 8];
         if n > 1 {
             w[..n - 1].copy_from_slice(&b[1..]);
         }
-        return mix9(u64::from_le_bytes(w));
+        return hash9(if n > 0 { b[0] } else { 0 }, u64::from_le_bytes(w));
     }
     let mut buf = [0u8; 16];
     let head = n.min(16);
@@ -86,10 +84,15 @@ pub fn event_hash(b: &[u8]) -> u64 {
     h
 }
 
-/// The hash of an ID of at most 9 bytes: `x` holds its bytes after the first,
-/// little-endian and zero-padded.
+/// The hash of an ID of at most 9 bytes: its first byte, and the bytes after
+/// it little-endian and zero-padded.
 #[inline(always)]
-pub fn mix9(x: u64) -> u64 {
+pub fn hash9(first: u8, rest: u64) -> u64 {
+    mix9(rest ^ (first as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93))
+}
+
+#[inline(always)]
+fn mix9(x: u64) -> u64 {
     // One multiplication: its high half is well mixed, and folding that into
     // the low half is enough for a partition number (from the top) and a
     // fingerprint (from the bottom) that say different things.
