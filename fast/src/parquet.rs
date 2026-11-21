@@ -38,12 +38,57 @@ pub struct Column<'a> {
 /// padded with zeros).
 pub fn pack_indices(values: impl Iterator<Item = u32>, count: usize, width: u32) -> Vec<u8> {
     let width = width.clamp(1, 32);
-    let groups = count.div_ceil(8);
-    let mut out = Vec::with_capacity(groups * width as usize + 16);
+    let mut out = Vec::with_capacity(count.div_ceil(8) * width as usize + 16);
     out.push(width as u8);
-    let mut run = Thrift { b: Vec::with_capacity(8) };
-    run.varint((groups as u64) << 1 | 1);
-    out.extend_from_slice(&run.b);
+    packed_run(&mut out, values, count, width);
+    out
+}
+
+/// Append one run-length run of the RLE / bit-packed hybrid to a page body:
+/// `count` times `value`, for values of `width` bits. (Nothing for no values.)
+#[inline(always)]
+pub fn rle_run(out: &mut Vec<u8>, value: u32, count: usize, width: u32) {
+    if count == 0 {
+        return;
+    }
+    // This runs once per person: straight into `out`, with no buffer of its
+    // own (every thread would queue up at the allocator) and no call to copy
+    // a byte or two. A run takes at most 10 + 4 bytes.
+    out.reserve(16);
+    unsafe {
+        let mut at = out.as_mut_ptr().add(out.len());
+        let mut v = (count as u64) << 1;
+        while v >= 0x80 {
+            *at = v as u8 | 0x80;
+            at = at.add(1);
+            v >>= 7;
+        }
+        *at = v as u8;
+        (at.add(1) as *mut u32).write_unaligned(value);
+        at = at.add(1 + (width.clamp(1, 32) as usize).div_ceil(8));
+        out.set_len(at.offset_from(out.as_ptr()) as usize);
+    }
+}
+
+#[inline]
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Append one bit-packed run of the hybrid to a page body: `count` values of
+/// `width` bits (1 to 32), the last group of eight padded with zeros. It must
+/// be the page's last run unless `count` is a multiple of eight. (Nothing for
+/// no values.)
+pub fn packed_run(out: &mut Vec<u8>, values: impl Iterator<Item = u32>, count: usize, width: u32) {
+    if count == 0 {
+        return;
+    }
+    let groups = count.div_ceil(8);
+    varint(out, (groups as u64) << 1 | 1);
     let start = out.len();
     let bytes = groups * width as usize;
     // Room for whole-word writes past the end.
@@ -66,7 +111,6 @@ pub fn pack_indices(values: impl Iterator<Item = u32>, count: usize, width: u32)
         (at as *mut u64).write_unaligned(acc);
     }
     out.truncate(start + bytes);
-    out
 }
 
 /// The number of bits that hold every index below `n`.
