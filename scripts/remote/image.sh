@@ -14,7 +14,8 @@ ST="$PROJ/official/starter-duckdb/x/starter-duckdb"
 tag="shopping-sessions:$(basename "$src")"
 W="$PROJ/out/image-$(basename "$src")"; rm -rf "$W"; mkdir -p "$W"
 cache=""; [ "$mode" = gate ] && cache="--no-cache"
-(cd "$src" && docker buildx build $cache --platform linux/amd64 --load -t "$tag" .) > "$W/build.log" 2>&1 || { echo "BUILD FAILED"; tail -15 "$W/build.log"; exit 1; }
+# (This machine is x86-64 and has no buildx: the classic builder makes the same image.)
+(cd "$src" && docker build $cache -t "$tag" .) > "$W/build.log" 2>&1 || { echo "BUILD FAILED"; tail -15 "$W/build.log"; exit 1; }
 echo "built $tag: $(docker image inspect "$tag" --format '{{.Size}} bytes, env {{json .Config.Env}}, cmd {{json .Config.Cmd}}, user {{.Config.User}}')"
 run() { # run DATA OUT -> exit code; log in OUT.log
   IMAGE="$tag" CPUS=8 MEM=24g PLATFORM=linux/amd64 sh "$ST/scripts/docker_run.sh" "$1" "$2" > "$2.log" 2>&1
