@@ -315,6 +315,8 @@ fn main() {
     let data_dir = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| env("DATA_DIR", "/data")));
     let out_dir = PathBuf::from(args.get(2).cloned().unwrap_or_else(|| env("OUTPUT_DIR", "/output")));
     let timing = std::env::var("TIMING").is_ok();
+    sys::NOHUGE.store(std::env::var("NOHUGE").is_ok(), Relaxed);
+    sys::NORELEASE.store(std::env::var("NORELEASE").is_ok(), Relaxed);
     if force_slow {
         slow::run(&data_dir, &out_dir);
         unsafe { sys::_exit(0) }

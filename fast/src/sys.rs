@@ -18,6 +18,11 @@ const MAP_NORESERVE: c_int = 0x4000;
 const MADV_DONTNEED: c_int = 4;
 const MADV_HUGEPAGE: c_int = 14;
 
+/// Experiment switches (environment): NOHUGE = no MADV_HUGEPAGE,
+/// NORELEASE = keep parsed input mapped until exit.
+pub static NOHUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static NORELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Zeroed, lazily committed memory. Never returned to the OS before exit.
 pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
     let len = len.max(4096);
@@ -27,7 +32,7 @@ pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
     if p as isize == -1 {
         panic!("mmap of {len} bytes failed");
     }
-    if huge {
+    if huge && !NOHUGE.load(std::sync::atomic::Ordering::Relaxed) {
         unsafe { madvise(p, len, MADV_HUGEPAGE) };
     }
     p as *mut u8
@@ -63,6 +68,9 @@ impl FileMap {
     /// Drop the page-table entries of fully covered pages in `[start, end)`; the
     /// pages stay in the page cache. Spreads unmap work over the worker threads.
     pub fn release(&self, start: usize, end: usize) {
+        if NORELEASE.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let a = (start + 4095) & !4095;
         let b = end & !4095;
         if b > a {
