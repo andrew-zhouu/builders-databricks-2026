@@ -8,7 +8,7 @@
 //!
 //! Record layouts (64-bit words):
 //!   event   w0 = event_key_remainder(<= 43) << 21 | ingest_rel_seconds(21)
-//!           w1 = valid(1) | purchase(1) | 0(4) | user_slot(27) | ts_rel_ms(31)
+//!           w1 = valid(1) | purchase(1) | 0(4) | person(27) | ts_rel_ms(31)
 //!           a valid purchase is followed by a second record: (price << 32 | category, 0)
 //!   click   w0 = person_local(12) | ts_rel_ms(31) | campaign(21)
 //!           w1 = click key (order-preserving, see ids.rs)
@@ -33,7 +33,7 @@ pub const VALID: u64 = 1 << 63;
 pub const PURCHASE: u64 = 1 << 62;
 pub const INGEST_BITS: u32 = 21;
 pub const INGEST_MAX: i64 = (1 << INGEST_BITS) - 1;
-pub const SLOT_BITS: u32 = 27;
+pub const PERSON_BITS: u32 = 27;
 pub const TS_MASK: u64 = (1 << 31) - 1;
 pub const LOCAL_BITS: u32 = 12;
 pub const CAMPAIGN_BITS: u32 = 21;
@@ -276,7 +276,7 @@ fn link_line(ctx: &Ctx, line: &[u8]) {
 
 /// Returns the bytes consumed, or 0 if the line needs the scalar path.
 #[inline(always)]
-unsafe fn link_fast(ctx: &Ctx, p: *const u8) -> usize {
+unsafe fn link_fast(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
     let v = _mm256_loadu_si256(p as *const __m256i);
     let m = |c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
     let (cm, nm, qm) = (m(b','), m(b'\n'), m(b'"'));
@@ -298,13 +298,48 @@ unsafe fn link_fast(ctx: &Ctx, p: *const u8) -> usize {
     if (n0 > 9) | (n1 > 9) | (alnum_bits(a0, a1) & need != need) {
         return 0;
     }
-    let sa = ctx.table.insert(pack9(a0, n0));
-    let sb = ctx.table.insert(pack9(a1, n1));
-    if sa != sb {
-        // Roots may be irregular IDs inserted by the scalar path: full comparison.
-        ctx.table.union(sa, sb, |x, y| ctx.users.less(x, y));
-    }
+    ring.push(ctx, (pack9(a0, n0), pack9(a1, n1)));
     nl + 1
+}
+
+/// Links waiting for their two table slots (prefetched when queued).
+struct LinkRing {
+    buf: [(u64, u64); RING],
+    at: usize,
+}
+
+impl LinkRing {
+    fn new() -> LinkRing {
+        LinkRing { buf: [(0, 0); RING], at: 0 }
+    }
+
+    #[inline(always)]
+    fn apply(ctx: &Ctx, e: (u64, u64)) {
+        if e.0 != 0 {
+            let sa = ctx.table.insert(e.0);
+            let sb = ctx.table.insert(e.1);
+            if sa != sb {
+                // Roots may be irregular IDs inserted by the scalar path: full comparison.
+                ctx.table.union(sa, sb, |x, y| ctx.users.less(x, y));
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, ctx: &Ctx, e: (u64, u64)) {
+        ctx.table.prefetch(e.0);
+        ctx.table.prefetch(e.1);
+        let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, e);
+        self.at = (self.at + 1) & (RING - 1);
+        Self::apply(ctx, old);
+    }
+
+    fn drain(&mut self, ctx: &Ctx) {
+        for i in 0..RING {
+            let e = std::mem::replace(&mut self.buf[(self.at + i) & (RING - 1)], (0, 0));
+            Self::apply(ctx, e);
+        }
+    }
 }
 
 pub fn links_chunk(ctx: &Ctx, ch: &Chunk) {
@@ -313,9 +348,10 @@ pub fn links_chunk(ctx: &Ctx, ch: &Chunk) {
     let len = data.len();
     if let Some(mut pos) = first_line(data, ch.start) {
         let fast_end = if ctx.scalar_only { 0 } else { len.saturating_sub(MARGIN) };
+        let mut ring = LinkRing::new();
         while pos < ch.end {
             if pos < fast_end {
-                let used = unsafe { link_fast(ctx, data.as_ptr().add(pos)) };
+                let used = unsafe { link_fast(ctx, &mut ring, data.as_ptr().add(pos)) };
                 if used != 0 {
                     pos += used;
                     continue;
@@ -325,6 +361,7 @@ pub fn links_chunk(ctx: &Ctx, ch: &Chunk) {
             link_line(ctx, &data[pos..e]);
             pos = e + 1;
         }
+        ring.drain(ctx);
     }
     file.release(ch.start, ch.end);
 }
@@ -356,8 +393,8 @@ impl EventRing {
     #[inline(always)]
     fn emit(ctx: &Ctx, d: &mut PartWriter, e: &PendingEvent) {
         if e.key != 0 {
-            let slot = ctx.table.insert(e.key) as u64;
-            d.push2(&ctx.pool, e.part as usize, e.w0, e.w1 | slot << 31);
+            let person = ctx.table.person(ctx.table.insert(e.key)) as u64;
+            d.push2(&ctx.pool, e.part as usize, e.w0, e.w1 | person << 31);
             if e.w1 & PURCHASE != 0 {
                 d.push2(&ctx.pool, e.part as usize, e.extra, 0);
             }
@@ -437,8 +474,8 @@ fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
         d.push2(&ctx.pool, part, w0, 0);
         return;
     }
-    let slot = ctx.table.insert(ctx.users.key(f[1])) as u64;
-    let w1 = VALID | slot << 31 | (ts - ctx.t0) as u64;
+    let person = ctx.table.person(ctx.table.insert(ctx.users.key(f[1]))) as u64;
+    let w1 = VALID | person << 31 | (ts - ctx.t0) as u64;
     if purchase {
         let cat = ctx.products.category(f[5]) as u64;
         d.push2(&ctx.pool, part, w0, w1 | PURCHASE);
@@ -597,26 +634,24 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
     c.push2(&ctx.pool, (person >> LOCAL_BITS) as usize, w0, ctx.clicks.key(f[0]));
 }
 
-/// A click on its way through the two lookups: key -> slot -> person.
+/// A click waiting for its user-table slot (prefetched when queued).
 #[derive(Clone, Copy)]
 struct PendingClick {
     /// ts_rel << CAMPAIGN_BITS | campaign
     tc: u64,
     click: u64,
-    /// The user key, then (second stage) the slot + 1. 0 = empty.
+    /// The user key. 0 = empty.
     user: u64,
 }
 
 struct ClickRing {
-    a: [PendingClick; RING],
-    b: [PendingClick; RING],
+    buf: [PendingClick; RING],
     at: usize,
 }
 
 impl ClickRing {
     fn new() -> ClickRing {
-        let e = PendingClick { tc: 0, click: 0, user: 0 };
-        ClickRing { a: [e; RING], b: [e; RING], at: 0 }
+        ClickRing { buf: [PendingClick { tc: 0, click: 0, user: 0 }; RING], at: 0 }
     }
 
     #[inline(always)]
@@ -624,24 +659,17 @@ impl ClickRing {
         if new.user != 0 {
             ctx.table.prefetch(new.user);
         }
-        let i = self.at;
-        self.at = (i + 1) & (RING - 1);
-        let mut mid = std::mem::replace(unsafe { self.a.get_unchecked_mut(i) }, new);
-        if mid.user != 0 {
-            let slot = ctx.table.insert(mid.user);
-            ctx.table.prefetch_person(slot);
-            mid.user = slot as u64 + 1;
-        }
-        let old = std::mem::replace(unsafe { self.b.get_unchecked_mut(i) }, mid);
+        let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, new);
+        self.at = (self.at + 1) & (RING - 1);
         if old.user != 0 {
-            let person = ctx.table.person((old.user - 1) as u32) as u64;
+            let person = ctx.table.person(ctx.table.insert(old.user)) as u64;
             let local = person & ((1 << LOCAL_BITS) - 1);
             c.push2(&ctx.pool, (person >> LOCAL_BITS) as usize, local << 52 | old.tc, old.click);
         }
     }
 
     fn drain(&mut self, ctx: &Ctx, c: &mut PartWriter) {
-        for _ in 0..2 * RING {
+        for _ in 0..RING {
             self.step(ctx, c, PendingClick { tc: 0, click: 0, user: 0 });
         }
     }
