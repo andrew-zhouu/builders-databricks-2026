@@ -105,6 +105,17 @@ pub fn def_levels(valid: &[bool]) -> Vec<u8> {
     out
 }
 
+/// The same section when the bit-packed bytes already exist: returns only the
+/// 4-byte length and run header that go in front of `bits`.
+pub fn def_levels_header(bits: &[u8]) -> Vec<u8> {
+    let mut run = Thrift { b: Vec::with_capacity(8) };
+    run.varint((bits.len() as u64) << 1 | 1);
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&((run.b.len() + bits.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&run.b);
+    out
+}
+
 pub fn write(path: &Path, rows: usize, columns: &[Column]) -> std::io::Result<()> {
     let mut f = File::create(path)?;
     let mut offset = 4usize;

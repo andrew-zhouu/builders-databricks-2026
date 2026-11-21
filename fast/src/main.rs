@@ -63,6 +63,8 @@ pub struct Ctx {
     pub ndays: usize,
     pub nthreads: usize,
     pub products: Products,
+    /// Category names as Parquet PLAIN values (4-byte length + bytes), by index.
+    pub cat_recs: Vec<Vec<u8>>,
     pub campaigns: Campaigns,
     pub users: KeySpace,
     pub clicks: KeySpace,
@@ -324,40 +326,22 @@ fn bench(ctx: &Ctx) {
 }
 
 fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
-    let n = rows.key.len();
+    let n = rows.n;
     if n == 0 && tid != 0 {
         return;
     }
-    let mut ids: Vec<u8> = Vec::with_capacity(n * 14);
-    let mut tmp: Vec<u8> = Vec::with_capacity(64);
-    for &k in &rows.key {
-        tmp.clear();
-        ctx.users.bytes(k, &mut tmp);
-        ids.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
-        ids.extend_from_slice(&tmp);
-    }
-    let valid: Vec<bool> = rows.cat.iter().map(|&c| c != u32::MAX).collect();
-    let levels = parquet::def_levels(&valid);
-    let mut cats: Vec<u8> = Vec::new();
-    for &c in &rows.cat {
-        if c != u32::MAX {
-            let name = &ctx.products.categories[c as usize];
-            cats.extend_from_slice(&(name.len() as u32).to_le_bytes());
-            cats.extend_from_slice(name);
-        }
-    }
+    let levels = parquet::def_levels_header(&rows.valid);
+    let (ids, cats) = (&rows.ids, &rows.cats);
     let columns = [
-        Column { name: "user_id", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![&ids] },
+        Column { name: "user_id", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![ids] },
         Column { name: "day", ptype: parquet::INT32, kind: Kind::Date, optional: false, payload: vec![parquet::as_bytes(&rows.day)] },
         Column { name: "sessions", ptype: parquet::INT32, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&rows.sessions)] },
         Column { name: "events", ptype: parquet::INT32, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&rows.events)] },
         Column { name: "revenue_cents", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&rows.revenue)] },
-        Column { name: "top_category", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: true, payload: vec![&levels, &cats] },
+        Column { name: "top_category", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: true, payload: vec![&levels, &rows.valid, cats] },
     ];
     let path = ctx.out_dir.join("user_daily").join(format!("part-{tid:03}.parquet"));
     parquet::write(&path, n, &columns).expect("write user_daily");
-    std::mem::forget(columns);
-    std::mem::forget((ids, cats, levels, valid));
 }
 
 fn write_campaign_daily(ctx: &Ctx) {
@@ -481,7 +465,7 @@ fn main() {
     let fits = ws < we
         && we - t0 < (1i64 << 31)
         && parse::INGEST_MAX - (window_s + 86_400 + 2) >= 86_400
-        && cap < (1 << parse::SLOT_BITS)
+        && cap < (1 << parse::PERSON_BITS)
         && campaigns.ids.len() < (1 << parse::CAMPAIGN_BITS);
     if !fits {
         eprintln!("input does not fit the fast path: using the plain implementation");
@@ -498,6 +482,11 @@ fn main() {
         day_off: (t0 - day0 * DAY_MS) as u64,
         ndays: ((we - 1).div_euclid(DAY_MS) - day0 + 1) as usize,
         nthreads,
+        cat_recs: products
+            .categories
+            .iter()
+            .map(|name| [&(name.len() as u32).to_le_bytes()[..], name].concat())
+            .collect(),
         products,
         campaigns,
         users: KeySpace::new(),

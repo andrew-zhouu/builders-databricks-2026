@@ -20,16 +20,34 @@ pub struct CampCell {
     pub revenue: u64,
 }
 
-/// user_daily rows produced by one thread, column by column.
+/// user_daily rows produced by one thread, already in Parquet PLAIN layout
+/// column by column, so writing the file is just a handful of large writes.
 #[derive(Default)]
 pub struct Rows {
-    pub key: Vec<u64>,
+    pub n: usize,
+    /// user_id: 4-byte length + bytes per row.
+    pub ids: Vec<u8>,
     pub day: Vec<i32>,
     pub sessions: Vec<i32>,
     pub events: Vec<i32>,
     pub revenue: Vec<i64>,
-    /// Category index, `u32::MAX` for null.
-    pub cat: Vec<u32>,
+    /// top_category: one validity bit per row (LSB first), and the length-prefixed non-null values.
+    pub valid: Vec<u8>,
+    pub cats: Vec<u8>,
+}
+
+/// The length-prefixed bytes of a regular user key (see ids.rs), written into
+/// `out`; returns their total length (4 + characters). Bytes after it are junk.
+#[inline(always)]
+fn id_record(key: u64, out: &mut [u8; 16]) -> usize {
+    use core::arch::x86_64::_pdep_u64;
+    let n = 9 - (key.trailing_zeros() / 6) as usize;
+    // Codes of the first 8 characters back to ASCII: bits 0-4 and 6 from the code, bit 5 set.
+    let w = unsafe { _pdep_u64(key >> 6, 0x5F5F_5F5F_5F5F_5F5F) } | 0x2020_2020_2020_2020;
+    out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+    out[4..12].copy_from_slice(&w.to_be_bytes());
+    out[12] = ((key & 0x1F) | ((key & 0x20) << 1) | 0x20) as u8;
+    4 + n
 }
 
 // Offsets of the four radix histograms inside `Scratch::h`.
@@ -55,6 +73,10 @@ pub struct Scratch {
     tag: u32,
     cat_sum: Vec<u64>,
     touched: Vec<u32>,
+    /// The current person's user_id record: fixed 16 bytes when short, else `id_long`.
+    id_rec: [u8; 16],
+    id_len: usize,
+    id_long: Vec<u8>,
     pub rows: Rows,
     pub acc: Vec<CampCell>,
 }
@@ -77,6 +99,9 @@ impl Scratch {
             tag: 0,
             cat_sum: vec![0; ctx.products.categories.len()],
             touched: Vec::new(),
+            id_rec: [0; 16],
+            id_len: 0,
+            id_long: Vec::new(),
             rows: Rows::default(),
             acc: vec![CampCell::default(); ctx.campaigns.ids.len() * ctx.ndays],
         }
@@ -228,7 +253,18 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
 }
 
 fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u32], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
+    // The person's name, rendered once for all of their rows.
     let key = ctx.table.key(slot);
+    if key & crate::ids::IRREGULAR == 0 {
+        sc.id_len = id_record(key, &mut sc.id_rec);
+    } else {
+        let mut name = Vec::new();
+        ctx.users.bytes(key, &mut name);
+        sc.id_long.clear();
+        sc.id_long.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        sc.id_long.extend_from_slice(&name);
+        sc.id_len = usize::MAX;
+    }
     let ndays = ctx.ndays;
     let organic = ctx.campaigns.organic as usize;
     let n = ev.len();
@@ -258,7 +294,7 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u32], pu: &[[u64; 2]], c
         let day = ((start as u64 + ctx.day_off) / DAY_MS as u64) as u32;
         if day != cur_day {
             if cur_day != u32::MAX {
-                flush_day(ctx, sc, key, cur_day, d_sessions, d_events, d_revenue);
+                flush_day(ctx, sc, cur_day, d_sessions, d_events, d_revenue);
             }
             cur_day = day;
             d_sessions = 0;
@@ -331,14 +367,14 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u32], pu: &[[u64; 2]], c
         }
         k = m;
     }
-    flush_day(ctx, sc, key, cur_day, d_sessions, d_events, d_revenue);
+    flush_day(ctx, sc, cur_day, d_sessions, d_events, d_revenue);
     if big {
         assists_by_campaign(sc, cl, ndays);
     }
 }
 
 #[inline]
-fn flush_day(ctx: &Ctx, sc: &mut Scratch, key: u64, day: u32, sessions: i32, events: i32, revenue: i64) {
+fn flush_day(ctx: &Ctx, sc: &mut Scratch, day: u32, sessions: i32, events: i32, revenue: i64) {
     // Top category: highest summed price, ties to the smallest name (= smallest index).
     let mut best = u32::MAX;
     let mut best_sum = 0u64;
@@ -352,12 +388,29 @@ fn flush_day(ctx: &Ctx, sc: &mut Scratch, key: u64, day: u32, sessions: i32, eve
     }
     sc.touched.clear();
     let r = &mut sc.rows;
-    r.key.push(key);
+    if sc.id_len != usize::MAX {
+        // Copy a fixed 16 bytes and keep only the record's length.
+        r.ids.reserve(16);
+        unsafe {
+            let len = r.ids.len();
+            std::ptr::copy_nonoverlapping(sc.id_rec.as_ptr(), r.ids.as_mut_ptr().add(len), 16);
+            r.ids.set_len(len + sc.id_len);
+        }
+    } else {
+        r.ids.extend_from_slice(&sc.id_long);
+    }
     r.day.push((ctx.day0 + day as i64) as i32);
     r.sessions.push(sessions);
     r.events.push(events);
     r.revenue.push(revenue);
-    r.cat.push(best);
+    if r.n & 7 == 0 {
+        r.valid.push(0);
+    }
+    if best != u32::MAX {
+        *r.valid.last_mut().unwrap() |= 1 << (r.n & 7);
+        r.cats.extend_from_slice(&ctx.cat_recs[best as usize]);
+    }
+    r.n += 1;
 }
 
 /// Assists for a person with many sessions and clicks. A campaign assists a
