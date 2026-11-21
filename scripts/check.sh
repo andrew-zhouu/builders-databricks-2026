@@ -2,7 +2,7 @@
 # Correctness gate for the fast binary: all official fixtures, then the dev set
 # against the published answer. Usage: check.sh [extra dataset names...]
 # Extra datasets are compared with expected/<name> (made by the reference).
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 PY="$PROJ/.venv/bin/python"
 rc=0

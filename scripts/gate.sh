@@ -2,7 +2,7 @@
 # Full local gate before keeping a change: build, no 512-bit code in the binary,
 # fixtures + dev answer, generated seeds vs the Python reference, a fuzz batch.
 # Usage: gate.sh [FUZZ_COUNT]
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 S="$PROJ/scripts"
 bash "$S/build.sh" || exit 1
 BIN="$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions"

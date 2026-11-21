@@ -2,7 +2,7 @@
 # Scale check: generate NAME (seed/events/clicks) if missing, make the plain
 # implementation's answer once, then diff the fast binary against it.
 # Usage: scale.sh NAME SEED EVENTS CLICKS [NCPU]
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 name="$1"; seed="$2"; events="$3"; clicks="$4"; ncpu="${5:-8}"
 if [ ! -f "$PROJ/data/$name/manifest.json" ]; then

@@ -2,7 +2,7 @@
 # Install a project-local Rust toolchain (musl target, linked with rust-lld so no
 # system C compiler is needed) and a Python venv with the checker's libraries.
 set -euo pipefail
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 mkdir -p "$PROJ/.toolchain/bin"
 cd "$PROJ"
 

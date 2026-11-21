@@ -3,7 +3,7 @@
 # starter's scripts/docker_run.sh), then diff against an expected answer.
 # Usage: docker_run.sh DATASET EXPECTED_DIR [CPUS] [MEM]
 set -u
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 IMAGE="${IMAGE:-shopping-sessions:latest}"
 name="$1"; expected="$2"; CPUS="${3:-8}"; MEM="${4:-24g}"
 cd "$PROJ"

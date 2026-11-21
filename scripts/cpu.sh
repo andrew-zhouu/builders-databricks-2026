@@ -2,7 +2,7 @@
 # CPU-time benchmark (robust to a busy machine): runs the binary N times and
 # prints wall/user/sys per run plus the best of each.
 # Usage: [ENV=..] cpu.sh DATASET [NCPU] [RUNS]
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 name="${1:-dev}"; ncpu="${2:-8}"; runs="${3:-5}"
 out="/tmp/ss-cpu-$$"; log="/tmp/ss-cpu-$$.txt"; : >"$log"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Per-section thread-CPU profile (TIMING=1) of the fast binary on a dataset.
 # Usage: [ENV=..] prof.sh DATASET [NCPU]
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 name="${1:-dev}"; ncpu="${2:-8}"
 out="/tmp/ss-prof-$$"; rm -rf "$out"; mkdir -p "$out"

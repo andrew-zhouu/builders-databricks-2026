@@ -3,7 +3,7 @@
 # (memory-realistic). Variants are env assignments, e.g.:
 #   ab.sh dev "PREFETCH=0" "PREFETCH=512" "PREFETCH=1024"
 # Prints the best ns/line of each variant over ROUNDS interleaved rounds.
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 name="$1"; shift
 rounds="${ROUNDS:-5}"; bytes="${BENCH_BYTES:-20000000}"; iters="${BENCH_ITERS:-8}"

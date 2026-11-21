@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 # Peek at a generated dataset and the published dev answers.
-D=/home/andre/builders/databricks/data/${1:-dev}
-A=/home/andre/builders/databricks/official/dev-answer/x/dev-answer
+D=$PROJ/data/${1:-dev}
+A=$PROJ/official/dev-answer/x/dev-answer
 echo "--- events sample"; head -8 "$D/events/part-00000.csv"
 echo "--- clicks sample"; head -6 "$D/clicks/part-00001.csv"
 echo "--- links sample"; head -6 "$D/links/part-00000.csv"

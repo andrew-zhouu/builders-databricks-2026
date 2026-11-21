@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Time the fast binary on a dataset with phase breakdown.
 # Usage: timeit.sh DATASET [NCPU] [RUNS] [CPUSET]
-. /home/andre/builders/databricks/scripts/env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
 BIN="${BIN:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 name="${1:-dev}"; ncpu="${2:-8}"; runs="${3:-3}"; cpus="${4:-}"
 out="$PROJ/out/time-$name"
