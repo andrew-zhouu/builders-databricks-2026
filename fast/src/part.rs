@@ -127,8 +127,10 @@ impl PartWriter {
             self.log.push((p as u32, b));
             c = pool.ptr(b);
         }
-        let v = _mm512_load_si512(self.wc.get_unchecked(p).0.as_ptr() as *const _);
-        _mm512_stream_si512(c as *mut _, v);
+        // Two 256-bit halves: no 512-bit instructions anywhere (frequency licence).
+        let src = self.wc.get_unchecked(p).0.as_ptr() as *const __m256i;
+        _mm256_stream_si256(c as *mut __m256i, _mm256_load_si256(src));
+        _mm256_stream_si256((c as *mut __m256i).add(1), _mm256_load_si256(src.add(1)));
         *self.cur.get_unchecked_mut(p) = c.add(8);
         *self.lines.get_unchecked_mut(p) += 1;
     }
