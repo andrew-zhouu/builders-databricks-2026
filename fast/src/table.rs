@@ -26,13 +26,20 @@ pub struct Table {
     slots: *mut Slot,
     pub cap: usize,
     pub overflow: AtomicBool,
+    /// Linked IDs in the table once `compress` has run (diagnostics).
+    pub used: std::sync::atomic::AtomicUsize,
 }
 unsafe impl Send for Table {}
 unsafe impl Sync for Table {}
 
 impl Table {
     pub fn new(cap: usize) -> Table {
-        Table { slots: map_anon(cap * 16, true) as *mut Slot, cap, overflow: AtomicBool::new(false) }
+        Table {
+            slots: map_anon(cap * 16, true) as *mut Slot,
+            cap,
+            overflow: AtomicBool::new(false),
+            used: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     #[inline(always)]
@@ -137,12 +144,19 @@ impl Table {
         }
     }
 
+    /// Give the pages of slots `[from, to)` back to the kernel (teardown only).
+    pub fn zap(&self, from: usize, to: usize) {
+        crate::sys::zap(unsafe { self.slots.add(from) } as *mut u8, (to - from) * 16);
+    }
+
     /// Point every slot in `[from, to)` straight at its root. Run after all
     /// unions; ranges may be compressed by different threads at once. Parents
     /// are prefetched a few slots ahead of the walk.
     pub fn compress(&self, from: usize, to: usize) {
         const AHEAD: usize = 16;
+        let mut used = 0usize;
         for i in from..to {
+            used += (self.slot(i as u32).key.load(Relaxed) != 0) as usize;
             if i + AHEAD < to {
                 let p = self.slot((i + AHEAD) as u32).parent.load(Relaxed);
                 if p != 0 {
@@ -157,5 +171,6 @@ impl Table {
                 }
             }
         }
+        self.used.fetch_add(used, Relaxed);
     }
 }

@@ -42,7 +42,12 @@ impl BlockPool {
     }
 
     pub fn used_bytes(&self) -> usize {
-        self.next.load(Relaxed) * BLOCK_BYTES
+        self.next.load(Relaxed).min(self.nblocks) * BLOCK_BYTES
+    }
+
+    /// Give the pages of bytes `[from, to)` back to the kernel (teardown only).
+    pub fn zap(&self, from: usize, to: usize) {
+        crate::sys::zap(unsafe { self.base.add(from) }, to - from);
     }
 }
 

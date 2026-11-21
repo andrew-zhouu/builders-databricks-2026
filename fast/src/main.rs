@@ -74,6 +74,8 @@ pub struct Ctx {
     pub scalar_only: bool,
     /// Software prefetch distance in bytes for the event parser (0 = off).
     pub prefetch_ahead: usize,
+    /// Release the big memory regions from all threads before exiting.
+    zap: bool,
     pub table: Table,
     pub pool: BlockPool,
     pub files: Vec<FileMap>,
@@ -193,6 +195,14 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn worker(ctx: &Ctx, tid: usize) {
+    // Per-thread partition writers, built here so their memory is first touched
+    // by the thread that uses it and the allocations run in parallel.
+    unsafe {
+        *ctx.d[tid].0.get() = PartWriter::new(ctx.pd);
+        *ctx.c[tid].0.get() = PartWriter::new(ctx.ps);
+        *ctx.s[tid].0.get() = PartWriter::new(ctx.ps);
+        *ctx.psw[tid].0.get() = PartWriter::new(ctx.ps);
+    }
     // ---- links: insert both IDs, join them
     loop {
         let i = ctx.next_link.fetch_add(1, Relaxed);
@@ -274,8 +284,25 @@ fn worker(ctx: &Ctx, tid: usize) {
     write_user_daily(ctx, &sc.rows, tid);
     ctx.charge(P_WRITE, t);
     unsafe { *ctx.acc[tid].0.get() = std::mem::take(&mut sc.acc) };
-    std::mem::forget(sc);
     ctx.sync("sessions built, user_daily written");
+
+    // ---- teardown in parallel: at exit the kernel frees the address space on
+    // one thread, so give the big regions back from all of them first.
+    if tid == 0 {
+        write_campaign_daily(ctx);
+    }
+    if ctx.zap {
+        drop(sc);
+        let n = ctx.nthreads;
+        let share = |len: usize| (len / n * tid, if tid + 1 == n { len } else { len / n * (tid + 1) });
+        let (a, b) = share(ctx.pool.used_bytes());
+        ctx.pool.zap(a, b);
+        let (a, b) = share(ctx.table.cap);
+        ctx.table.zap(a, b);
+    } else {
+        std::mem::forget(sc);
+    }
+    ctx.sync("campaign_daily written, memory released");
 }
 
 /// `--bench`: best-of-N thread CPU time per line for each parser on a small
@@ -453,7 +480,9 @@ fn main() {
     let est_ids = links_bytes / 16 + events_bytes / 2200 + clicks_bytes / 1500 + 2048;
     let cap = (est_ids * 2).next_multiple_of(1 << parse::LOCAL_BITS);
     let ps = cap >> parse::LOCAL_BITS;
-    let pd = (events_bytes / 1_800_000).next_power_of_two().clamp(1 << parse::MIN_PD_BITS, 4096);
+    // Event partitions: about 0.5 MB of records each, but never so many that a
+    // thread's write-combining lines (64 bytes per partition) crowd its L2.
+    let pd = (events_bytes / 2_400_000).next_power_of_two().clamp(1 << parse::MIN_PD_BITS, 2048);
     let pool_blocks = (events_bytes * 5 / 2 + clicks_bytes * 2) / part::BLOCK_BYTES
         + (pd + 3 * ps) * nthreads * 2
         + 4096;
@@ -495,6 +524,7 @@ fn main() {
         dates: parse::DateTab::new(ws),
         scalar_only: std::env::var("SCALAR").is_ok(),
         prefetch_ahead: std::env::var("PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        zap: std::env::var("NOZAP").is_err(),
         table: Table::new(cap),
         pool: BlockPool::new(pool_blocks),
         files,
@@ -508,10 +538,10 @@ fn main() {
         pd,
         rem_bits: ids::EVENT_KEY_BITS - pd.trailing_zeros(),
         ps,
-        d: (0..nthreads).map(|_| Shared::new(PartWriter::new(pd))).collect(),
-        c: (0..nthreads).map(|_| Shared::new(PartWriter::new(ps))).collect(),
-        s: (0..nthreads).map(|_| Shared::new(PartWriter::new(ps))).collect(),
-        psw: (0..nthreads).map(|_| Shared::new(PartWriter::new(ps))).collect(),
+        d: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
+        c: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
+        s: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
+        psw: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         acc: (0..nthreads).map(|_| Shared::new(Vec::new())).collect(),
         barrier: Barrier::new(nthreads),
         prof: Default::default(),
@@ -553,7 +583,6 @@ fn main() {
         slow::run(&data_dir, &ctx.out_dir);
         unsafe { sys::_exit(0) }
     }
-    write_campaign_daily(&ctx);
     if timing {
         let total: u64 = ctx.prof.iter().map(|p| p.load(Relaxed)).sum();
         for (name, p) in P_NAMES.iter().zip(&ctx.prof) {
@@ -561,8 +590,10 @@ fn main() {
             eprintln!("    cpu {:8.2} ms {:5.1}%  {name}", ns as f64 / 1e6, 100.0 * ns as f64 / total.max(1) as f64);
         }
         eprintln!(
-            "[{:8.2} ms] done; pool used {} MB, irregular ids: users {}, events {}, clicks {}",
+            "[{:8.2} ms] done; table {} of {} slots used, pool used {} MB, irregular ids: users {}, events {}, clicks {}",
             t_start.elapsed().as_secs_f64() * 1e3,
+            ctx.table.used.load(Relaxed),
+            ctx.table.cap,
             ctx.pool.used_bytes() >> 20,
             ctx.users.dict.len(),
             ctx.event_dict.len(),
