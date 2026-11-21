@@ -1,6 +1,6 @@
 # Handoff: where the work stands
 
-Last updated 2026-11-21, late evening UTC. Deadline: 2026-11-22 16:00 UTC (11:00 ET).
+Last updated 2026-11-21, 22:45 UTC. Deadline: 2026-11-22 16:00 UTC (11:00 ET).
 
 ## Current state (read this first)
 
@@ -15,7 +15,8 @@ Everything below the horizontal rule predates this; where they disagree, this wi
 | Candidate c1: staged parser, old 77 MB output | `1c50711` (tag `cand-c1`) | Full gate passed. 20M: 523 / 527 ms against 560 / 563 scored. |
 | Candidate c2: c1 + dictionary-encoded output (25 MB) | `c4b7fcf` (tag `cand-c2`) | Full gate passed. |
 | **Candidate c3: trace-only parser, pass 2 routes events** | `69557e4` (tag `cand-c3`) | Full gate passed. 20M: 501 / 503 against 555 / 561; 60M: 1556 / 1557 against 1704 / 1710. |
-| Candidate c4: c3 + merged pass 2, faster writer | `864640b` | 20M: 490 / 492 against 560 / 562; 60M: 1522 / 1526 against 1704 / 1705. Gate started (`scripts/remote.sh log c4`); recommend it once that says `CANDIDATE-OK`. |
+| **Candidate c4: c3 + merged pass 2, faster writer** | `864640b` (tag `cand-c4`) | Full gate passed. 20M: 490 / 492 against 560 / 562; 60M: 1522 / 1526 against 1704 / 1705. |
+| **Candidate c5: c4 + same-day check on the text, user table in cache-line buckets** | `4b2bdb3` (tag `cand-c5`) | Full gate passed. 20M: 485 / 487 against 488 / 488 for c4; 60M: 1502 / 1504 against 1520 / 1528. **The one to submit.** |
 | Diagnostic image (fails on purpose, shows a log) | `2a2ea40` (branch `diag4`) | Not yet submitted. The single most informative submission: scorer CPU, clock under 512-bit code, huge pages, page-fault and memory costs, `/output` write speed, CPU-quota throttling. |
 
 "Full gate" = `scripts/cand.sh NAME`: on EC2, `fullcheck.sh` (fixtures, dev answer, 150
@@ -68,6 +69,48 @@ interleaved rounds (`scripts/abx.sh`).
   `keep.sh` (named binaries for A/B), `imgtime.sh` (container and docker times).
 * Beware: `remote.sh push` must not preserve file times (fixed), or cargo on EC2 skips
   files edited before its last build.
+
+### Evening of 21 November: what the search for something bigger found
+
+The leaderboard's best was 0.30 s against our 0.85 s. Read against the official page
+(the clock runs from container start to container exit; practice is about 20M events;
+**the final is 60M new events, median of 3, the ten fastest retimed 7 times on an idle
+machine**), that is a program about three times faster than c4 on this machine.
+Nothing found here closes a gap of that size:
+
+* The profile is flat. By instructions per event line (802 in all): decode 216, passes
+  2 and 3 together 173, split 155, emit 65, clicks 79, pair sort 24, links 10. No source
+  line of passes 2 and 3 takes more than 9; the parser's listing shows no waste beyond
+  a dozen constants rematerialised per line (16 registers).
+* What trusting the generator instead of the rules would save (no quote pairing, no ID
+  byte checks) is about 27 instructions per line, 3%: not worth giving up exactness.
+* Profile-guided optimisation (instrumented run on dev + 5M + 20M, `-C profile-use`):
+  488 / 490 against 489 / 492. Nothing. Not kept.
+* Sampling by instruction (`scripts/remote/hotip.sh`, `hotasm.sh`: the instructions
+  that hold up retirement, with their inlined source lines) found cache misses nobody
+  had asked for:
+  * user-table lookups that ran into the next cache line (home slot at the end of its
+    line, or a third probe). Fixed: probes start at a line boundary, four slots to a
+    line, one SIMD compare. 20M -0.6%, 60M -1.1%. A denser table is much worse (load
+    0.58: +6%), a sparser one no better.
+  * the per-session campaign counters (672 KB and 168 KB tables per thread). Deferring
+    the updates through a 16-entry ring with a prefetch: user time -1.4%, wall time
+    unchanged at both sizes. Not kept. Same for prefetching the start of the next 4 KB
+    block of a chain.
+* Kernel side (`scripts/remote/kprof.sh`): 12% of CPU time; page zeroing alone 7.4%,
+  the rest fault handling. All of it is first use of memory; traces are 335 MB of the
+  650 MB at 20M and cannot shrink (16 bytes carry the fingerprint, the line position,
+  the person and the time).
+* Considered and not started, with the reason:
+  * a splitter that works on 64-byte blocks of the whole input instead of two windows
+    per line: its quote logic costs as much per block as ours per line, and flattening
+    two position arrays eats the rest; perhaps -40 instructions (5%), a rewrite of the
+    parser's core;
+  * decoding event IDs to the generator's dense index (the scramble is a bijection, so
+    this is exact for any input) to place events directly and build sessions as
+    mergeable intervals before the person pass: perhaps -10% in all, more than a day
+    of work touching dedup, sessions and attribution at once. Too much risk for the
+    final run, which gives no score at all if it is wrong.
 
 ### Where the time goes now (20M, CPU ms of about 3760)
 
