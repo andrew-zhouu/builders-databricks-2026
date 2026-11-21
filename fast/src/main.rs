@@ -100,6 +100,8 @@ pub struct Ctx {
     next_main: AtomicUsize,
     next_d: AtomicUsize,
     next_s: AtomicUsize,
+    /// Person partitions, the ones with the most events first.
+    s_order: std::sync::OnceLock<Vec<u32>>,
     /// Trace partitions and person partitions.
     pub pd: usize,
     pub ps: usize,
@@ -416,13 +418,23 @@ fn worker(ctx: &Ctx, tid: usize) {
     ctx.sync("deduplicated");
 
     // ---- sessions, attribution, rows
+    // Largest first: a partition holding one of the few very busy people takes
+    // many times longer than the others, and must not be the one that
+    // everybody ends up waiting for.
+    let order = ctx.s_order.get_or_init(|| {
+        let mut sized: Vec<(u32, u32)> = (0..ctx.ps)
+            .map(|p| ((0..ctx.nthreads).map(|t| ctx.s(t).part_words(p)).sum::<usize>() as u32, p as u32))
+            .collect();
+        sized.sort_unstable_by(|a, b| b.cmp(a));
+        sized.into_iter().map(|(_, p)| p).collect()
+    });
     let mut sc = pass3::Scratch::new(ctx);
     loop {
-        let p = ctx.next_s.fetch_add(1, Relaxed);
-        if p >= ctx.ps {
+        let i = ctx.next_s.fetch_add(1, Relaxed);
+        if i >= ctx.ps {
             break;
         }
-        pass3::run(ctx, &mut sc, p);
+        pass3::run(ctx, &mut sc, order[i] as usize);
     }
     let t = ctx.now();
     write_user_daily(ctx, &sc.rows, tid);
@@ -612,7 +624,7 @@ fn main() {
     let out_dir = PathBuf::from(args.get(2).cloned().unwrap_or_else(|| env("OUTPUT_DIR", "/output")));
     let timing = std::env::var("SS_TIMING").is_ok();
     if std::env::var("SS_DIAG").is_ok() {
-        diag::run(&data_dir);
+        diag::run(&data_dir, &out_dir);
     }
     sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Relaxed);
     if force_slow {
@@ -748,6 +760,7 @@ fn main() {
         next_main: AtomicUsize::new(0),
         next_d: AtomicUsize::new(0),
         next_s: AtomicUsize::new(0),
+        s_order: std::sync::OnceLock::new(),
         pd,
         ps,
         k: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),

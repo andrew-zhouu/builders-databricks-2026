@@ -90,9 +90,11 @@ pub fn event_hash(b: &[u8]) -> u64 {
 /// little-endian and zero-padded.
 #[inline(always)]
 pub fn mix9(x: u64) -> u64 {
+    // One multiplication: its high half is well mixed, and folding that into
+    // the low half is enough for a partition number (from the top) and a
+    // fingerprint (from the bottom) that say different things.
     let a = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let b = (a ^ (a >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    b ^ (b >> 32)
+    a ^ (a >> 32)
 }
 
 /// The hash of an ID of `n <= 16` bytes whose bytes, zero-padded, are `lo` and `hi`.

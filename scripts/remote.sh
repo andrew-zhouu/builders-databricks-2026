@@ -21,7 +21,11 @@ case "$cmd" in
     f="$1"; shift
     "${SSH[@]}" "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && bash -s -- $*" < "$f" ;;
   push)
-    rsync -az --delete -e "ssh -i $REMOTE_KEY -o ControlPath=/tmp/ss-remote-%r@%h" \
+    # By checksum and without preserving times: a file that changed gets the
+    # time of the transfer, so cargo over there always sees it as newer than its
+    # last build (with preserved times, a file edited before a remote build but
+    # pushed after it would be taken for unchanged).
+    rsync -rlpzc --delete -e "ssh -i $REMOTE_KEY -o ControlPath=/tmp/ss-remote-%r@%h" \
       --exclude '/.git/' --exclude '/data/' --exclude '/out/' --exclude '/expected/' --exclude '/official/' \
       --exclude '/.toolchain/' --exclude '/.venv/' --exclude '/bin/' --exclude '/.local/' --exclude 'target/' \
       --exclude '/bench/prof-disasm.txt' --exclude '/bench/results/' --exclude '__pycache__/' \

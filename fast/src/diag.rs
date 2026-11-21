@@ -36,7 +36,8 @@ fn dir_summary(path: &std::path::Path) -> (usize, u64, u64) {
     (n, bytes, largest)
 }
 
-pub fn run(data_dir: &std::path::Path) -> ! {
+#[cfg_attr(not(feature = "probe"), allow(unused_variables))]
+pub fn run(data_dir: &std::path::Path, out_dir: &std::path::Path) -> ! {
     let all = |_: &str| true;
     // Measurements worth repeating at the end of the log, in case only one
     // end of it is shown.
@@ -109,6 +110,7 @@ pub fn run(data_dir: &std::path::Path) -> ! {
             .unwrap_or(8)
             .clamp(1, 64);
         crate::probe::run(data_dir, threads, &mut key);
+        crate::probe::output(out_dir, threads, &mut key);
     }
     eprintln!("== diag: probes");
     for line in &key {

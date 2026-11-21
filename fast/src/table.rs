@@ -35,7 +35,9 @@ unsafe impl Sync for Table {}
 impl Table {
     pub fn new(cap: usize) -> Table {
         Table {
-            slots: map_anon(cap * 16, true) as *mut Slot,
+            // One slot more than `cap`, never used and so always empty: a
+            // lookup may look one past a key's home slot without wrapping.
+            slots: map_anon((cap + 1) * 16, true) as *mut Slot,
             cap,
             overflow: AtomicBool::new(false),
             used: std::sync::atomic::AtomicUsize::new(0),
@@ -92,8 +94,11 @@ impl Table {
     #[inline(always)]
     pub fn person_at(&self, home: usize, key: u64) -> u32 {
         let slots = self.slots;
-        let mut slot = home as u32;
-        if unsafe { (*slots.add(home)).key.load(Relaxed) } != key {
+        // In its home slot or the next one, nine times in ten: choose between
+        // the two by arithmetic, so that only the tenth is a branch that
+        // cannot be predicted.
+        let mut slot = (home + (unsafe { (*slots.add(home)).key.load(Relaxed) } != key) as usize) as u32;
+        if unsafe { (*slots.add(slot as usize)).key.load(Relaxed) } != key {
             slot = self.insert_at(home, key);
         }
         let p = unsafe { (*slots.add(slot as usize)).parent.load(Relaxed) };
