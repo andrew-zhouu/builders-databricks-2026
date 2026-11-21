@@ -1,55 +1,62 @@
-//! Chunk parsers: links -> union-find, clicks -> person partitions,
-//! events -> event-id partitions (deduplicated in pass 2).
+//! Chunk parsers: links -> union-find; clicks and events -> person partitions.
 //!
 //! Every line is first tried on a SIMD fast path that only accepts lines it
 //! understands completely (field count, quoting, regular IDs, timestamp forms
 //! it can decide). Anything else goes to the scalar functions, which implement
 //! the rules literally. Both paths emit the same records.
 //!
-//! Record layouts (64-bit words):
-//!   event   w0 = event_key_remainder(<= 43) << 21 | ingest_rel_seconds(21)
-//!           w1 = valid(1) | purchase(1) | 0(4) | person(27) | ts_rel_ms(31)
-//!           a valid purchase is followed by a second record: (price << 32 | category, 0)
-//!   click   w0 = person_local(12) | ts_rel_ms(31) | campaign(21)
-//!           w1 = click key (order-preserving, see ids.rs)
+//! Dedup is by exception. An event that passes validation is written straight
+//! to its person's partition, as if no event ID were ever repeated. Every
+//! well-formed event line, valid or not, also leaves an 8-byte *trace* in a
+//! partition chosen by a hash of its event ID: a fingerprint of the ID and the
+//! position of the line in the input. Pass 2 looks only at the traces: where a
+//! fingerprint repeats it reads those lines again, applies the dedup rule
+//! exactly, and writes a cancellation for every valid copy that is not the
+//! kept one. Most event IDs are unique and cost nothing beyond their trace.
 //!
-//! An event key (49 bits) is multiplied by an odd constant modulo 2^49, a
-//! bijection; the top bits of the product choose the partition and only the
-//! rest is stored, so within a partition equal remainders mean equal IDs.
+//! Records (64-bit words):
+//!   trace     fingerprint << loc_bits | position of the line among all event files
+//!   event     [cancel(1) at bit 43] | person_local(12) | ts_rel_ms(31)
+//!   purchase  the event word, then price << 32 | category
+//!   click     person_local(12) | ts_rel_ms(31) | campaign(21), then the click key
 //!
 //! Vector code is AVX2 only, and multiplies stay in 128-bit registers: wider
 //! or heavier instructions lower the core's frequency licence on Cascade Lake.
 
 use core::arch::x86_64::*;
-use std::sync::atomic::Ordering::Relaxed;
 
-use crate::ids::{event_key, EVENT_IRREGULAR, EVENT_KEY_BITS};
+use crate::ids::{event_hash, mix16, raw_key_fast};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
 use crate::{Chunk, Ctx};
 
-pub const VALID: u64 = 1 << 63;
-pub const PURCHASE: u64 = 1 << 62;
-pub const INGEST_BITS: u32 = 21;
-pub const INGEST_MAX: i64 = (1 << INGEST_BITS) - 1;
 pub const PERSON_BITS: u32 = 27;
 pub const TS_MASK: u64 = (1 << 31) - 1;
 pub const LOCAL_BITS: u32 = 12;
 pub const CAMPAIGN_BITS: u32 = 21;
-/// Fewest event partitions: the remainder must fit in 64 - 21 bits.
-pub const MIN_PD_BITS: u32 = EVENT_KEY_BITS + INGEST_BITS - 64;
+/// Marks a cancellation among event and purchase records.
+pub const CANCEL: u64 = 1 << (31 + LOCAL_BITS);
 
 /// Bytes that must be readable after a line start for the fast paths.
 const MARGIN: usize = 256;
 /// Lines this close to the file start use the scalar path (backward loads).
 const HEAD: usize = 16;
 
-/// Partition and stored remainder of an event key.
+/// The per-thread writers an event can go to.
+pub struct EventOut<'a> {
+    /// Traces, partitioned by event-ID hash.
+    pub k: &'a mut PartWriter,
+    /// Events, partitioned by person.
+    pub s: &'a mut PartWriter,
+    /// Purchases, partitioned by person.
+    pub ps: &'a mut PartWriter,
+}
+
+/// The trace partition and the trace word (without the position) of an event-ID hash.
 #[inline(always)]
-fn place(ctx: &Ctx, ek: u64) -> (usize, u64) {
-    let m = ek.wrapping_mul(0x9E37_79B9_7F4A_7C15) & ((1 << EVENT_KEY_BITS) - 1);
-    ((m >> ctx.rem_bits) as usize, m & ((1 << ctx.rem_bits) - 1))
+pub fn trace_of(ctx: &Ctx, h: u64) -> (usize, u64) {
+    ((((h >> 32) * ctx.pd as u64) >> 32) as usize, (h & ctx.fp_mask) << ctx.loc_bits)
 }
 
 // ------------------------------------------------------------------ dates
@@ -64,12 +71,23 @@ pub struct DateTab {
     /// Row for a year's last digit (3 = none).
     row: [u8; 16],
     days: [[i32; 512]; 4],
+    /// `YYYY-MM-DD` (zero-padded to 16 bytes) of each UTC day from the first
+    /// day a click may fall on to the last day of the event window.
+    day_text: Vec<[u8; 16]>,
+    /// Epoch ms of the start of the first of those days.
+    first_day_ms: i64,
 }
 
 impl DateTab {
-    pub fn new(ws: i64) -> DateTab {
+    pub fn new(ws: i64, first_day: i64, ndays: usize) -> DateTab {
         let (y, _, _) = civil_from_days(ws.div_euclid(DAY_MS));
-        let mut t = DateTab { years: [u32::MAX; 4], row: [3; 16], days: [[BAD_DAY; 512]; 4] };
+        let mut t = DateTab {
+            years: [u32::MAX; 4],
+            row: [3; 16],
+            days: [[BAD_DAY; 512]; 4],
+            day_text: Vec::new(),
+            first_day_ms: first_day * DAY_MS,
+        };
         for k in 0..3 {
             let yy = y - 1 + k as i64;
             if !(0..=9999).contains(&yy) {
@@ -83,6 +101,16 @@ impl DateTab {
                     t.days[k][(m * 32 + d) as usize] = days_from_civil(yy, m, d) as i32;
                 }
             }
+        }
+        for d in 0..ndays as i64 + 1 {
+            let (y, m, dd) = civil_from_days(first_day + d);
+            let mut text = [0u8; 16];
+            // Years outside 0000-9999 cannot be written as F1: leave the text
+            // empty, so that no ingest date ever compares equal to it.
+            if (0..=9999).contains(&y) {
+                text[..10].copy_from_slice(format!("{y:04}-{m:02}-{dd:02}").as_bytes());
+            }
+            t.day_text.push(text);
         }
         t
     }
@@ -194,40 +222,6 @@ unsafe fn timestamp(dt: &DateTab, a: *const u8, n: usize) -> (bool, bool, i64) {
     (n == 0, false, 0)
 }
 
-// ------------------------------------------------------------------ ids
-
-const PEXT6: u64 = 0x5F5F_5F5F_5F5F_5F5F;
-
-/// For two 16-byte strings (low and high half of the result): which bytes are in `[0-9a-z]`.
-#[inline(always)]
-unsafe fn alnum_bits(lo: *const u8, hi: *const u8) -> u32 {
-    let v = _mm256_inserti128_si256::<1>(
-        _mm256_castsi128_si256(_mm_loadu_si128(lo as *const __m128i)),
-        _mm_loadu_si128(hi as *const __m128i),
-    );
-    let d = _mm256_sub_epi8(v, _mm256_set1_epi8(0x30));
-    let l = _mm256_sub_epi8(v, _mm256_set1_epi8(0x61));
-    let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
-    let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(25)), l);
-    _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) as u32
-}
-
-/// The 54-bit key of the `n` (1 to 9) regular characters at `a` (see ids::key9).
-#[inline(always)]
-unsafe fn pack9(a: *const u8, n: usize) -> u64 {
-    let w = _bzhi_u64((a as *const u64).read_unaligned(), 8u32.wrapping_mul(n as u32));
-    let hi = _pext_u64(w.swap_bytes(), PEXT6);
-    let c8 = _pext_u64(*a.add(8) as u64, 0x5F) & 0u64.wrapping_sub((n == 9) as u64);
-    hi << 6 | c8
-}
-
-/// The 48-bit key of a regular event ID of `n` (1 to 9) bytes at `a` (see ids::event_key).
-#[inline(always)]
-unsafe fn pack_event(a: *const u8, n: usize) -> u64 {
-    let w = (a.add(1) as *const u64).read_unaligned();
-    _pext_u64(_bzhi_u64(w, 8u32.wrapping_mul((n as u32).wrapping_sub(1))), PEXT6)
-}
-
 // ------------------------------------------------------------------ scanning
 
 #[inline(always)]
@@ -261,69 +255,21 @@ fn first_line(data: &[u8], start: usize) -> Option<usize> {
     find_newline(data, start.saturating_sub(1).min(data.len())).map(|i| i + 1)
 }
 
-// ------------------------------------------------------------------ input
-
-/// Read mode keeps this many bytes before a chunk (line-start detection and
-/// the fast paths' backward loads) ...
-const LOOKBACK: usize = 64;
-/// ... and at first this many after it, for the line that straddles its end.
-pub const TAIL: usize = 4096;
-
-/// A thread's private input buffer for read-mode I/O.
-pub struct Input {
-    buf: Vec<u8>,
-}
-
-/// The bytes one chunk works on: the lines starting in `[start, end)` of
-/// `data`, of which those starting before `fast_end` may use the SIMD paths
-/// (memory is readable for `MARGIN` bytes past them). `data` ends either at
-/// the end of the file or after a complete line.
-struct View<'a> {
-    data: &'a [u8],
-    start: usize,
-    end: usize,
-    fast_end: usize,
-}
-
-impl Input {
-    pub fn new() -> Input {
-        Input { buf: Vec::new() }
-    }
-
-    fn view<'a>(&'a mut self, ctx: &'a Ctx, ch: &Chunk) -> View<'a> {
-        let file = &ctx.files[ch.file as usize];
-        if !ctx.read_io {
-            // The whole file is mapped.
-            let data = file.slice();
-            let fast_end = if ctx.scalar_only { 0 } else { data.len().saturating_sub(MARGIN) };
-            return View { data, start: ch.start, end: ch.end, fast_end };
-        }
-        // Copy the chunk into a cache-sized private buffer: the kernel streams
-        // it in, and the parser then never waits on memory for its input.
-        let from = ch.start.saturating_sub(LOOKBACK);
-        let mut want = (ch.end + ctx.read_tail).min(file.len) - from;
-        loop {
-            if self.buf.len() < want + MARGIN {
-                self.buf.resize(want + MARGIN, 0);
-            }
-            let n = file.read_at(&mut self.buf[..want], from);
-            // Complete if the file ends here, or the line running over the
-            // chunk's end is terminated inside the buffer.
-            if n < want || from + n >= file.len || self.buf[ch.end - 1 - from..n].contains(&b'\n') {
-                self.buf[n..n + MARGIN].fill(0);
-                let fast_end = if ctx.scalar_only { 0 } else { n };
-                return View { data: &self.buf[..n], start: ch.start - from, end: ch.end - from, fast_end };
-            }
-            want = (want * 2).min(file.len - from);
-        }
-    }
-}
-
-/// Mapped input only: drop the chunk's page-table entries once it is parsed.
+/// Where the SIMD paths may run in a file of `len` bytes.
 #[inline(always)]
-fn release(ctx: &Ctx, ch: &Chunk) {
-    if !ctx.read_io {
-        ctx.files[ch.file as usize].release(ch.start, ch.end);
+fn fast_end(ctx: &Ctx, len: usize) -> usize {
+    if ctx.scalar_only {
+        0
+    } else {
+        len.saturating_sub(MARGIN)
+    }
+}
+
+#[inline(always)]
+fn prefetch_input(ctx: &Ctx, data: &[u8], pos: usize) {
+    if ctx.prefetch_ahead != 0 {
+        // The hardware streamer stops at page boundaries; reach past them.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + ctx.prefetch_ahead) as *const i8) };
     }
 }
 
@@ -363,13 +309,16 @@ unsafe fn link_fast(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
     if (n0 == 0) | (n1 == 0) {
         return nl + 1;
     }
-    let need = _bzhi_u32(0xFFFF, n0 as u32) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
-    if (n0 > 9) | (n1 > 9) | (alnum_bits(a0, a1) & need != need) {
+    let (r0, k0) = raw_key_fast(a0, n0, b'u');
+    let (r1, k1) = raw_key_fast(a1, n1, b'u');
+    if !(r0 & r1) {
         return 0;
     }
-    ring.push(ctx, (pack9(a0, n0), pack9(a1, n1)));
+    ring.push(ctx, (k0, k1));
     nl + 1
 }
+
+const RING: usize = 8;
 
 /// Links on their way into the union-find, two stages behind the parser so
 /// that each memory access has been prefetched: first the two home slots
@@ -416,13 +365,13 @@ impl LinkRing {
     }
 }
 
-pub fn links_chunk(ctx: &Ctx, io: &mut Input, ch: &Chunk) -> usize {
-    let View { data, start, end, fast_end } = io.view(ctx, ch);
-    let len = data.len();
+pub fn links_chunk(ctx: &Ctx, ch: &Chunk) -> usize {
+    let data = ctx.files[ch.file as usize].slice();
+    let (len, fast_end) = (data.len(), fast_end(ctx, data.len()));
     let mut lines = 0usize;
-    if let Some(mut pos) = first_line(data, start) {
+    if let Some(mut pos) = first_line(data, ch.start) {
         let mut ring = LinkRing::new();
-        while pos < end {
+        while pos < ch.end {
             lines += 1;
             if pos < fast_end {
                 let used = unsafe { link_fast(ctx, &mut ring, data.as_ptr().add(pos)) };
@@ -437,99 +386,39 @@ pub fn links_chunk(ctx: &Ctx, io: &mut Input, ch: &Chunk) -> usize {
         }
         ring.drain(ctx);
     }
-    release(ctx, ch);
     lines
 }
 
 // ------------------------------------------------------------------ events
 
-/// An event waiting for its user-table slot (prefetched when queued).
-#[derive(Clone, Copy)]
-struct PendingEvent {
-    w0: u64,
-    w1: u64,
-    key: u64,
-    extra: u64,
-    part: u32,
-    /// The key's home slot in the user table, computed once when queued.
-    home: u32,
+/// One well-formed event line, by the rules.
+pub struct Event<'a> {
+    pub id: &'a [u8],
+    /// Epoch ms.
+    pub ingest: i64,
+    /// Passed validation and is not late.
+    pub valid: bool,
+    pub user: &'a [u8],
+    /// Epoch ms; meaningful when valid.
+    pub ts: i64,
+    pub purchase: bool,
+    pub price: u32,
+    pub product: &'a [u8],
 }
 
-const RING: usize = 8;
-/// Largest prefetch distance (in rows) the rings can be set to.
-pub const RING_MAX: usize = 64;
-
-struct EventRing {
-    buf: [PendingEvent; RING_MAX],
-    at: usize,
-    mask: usize,
-}
-
-impl EventRing {
-    fn new(ctx: &Ctx) -> EventRing {
-        EventRing {
-            buf: [PendingEvent { w0: 0, w1: 0, key: 0, extra: 0, part: 0, home: 0 }; RING_MAX],
-            at: 0,
-            mask: ctx.ring_mask,
-        }
-    }
-
-    #[inline(always)]
-    fn emit(ctx: &Ctx, d: &mut PartWriter, e: &PendingEvent) {
-        if e.key != 0 {
-            let person = ctx.table.person(ctx.table.insert_at(e.home as usize, e.key)) as u64;
-            d.push2(&ctx.pool, e.part as usize, e.w0, e.w1 | person << 31);
-            if e.w1 & PURCHASE != 0 {
-                d.push2(&ctx.pool, e.part as usize, e.extra, 0);
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, ctx: &Ctx, d: &mut PartWriter, mut e: PendingEvent) {
-        e.home = ctx.table.prefetch_home(e.key) as u32;
-        let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, e);
-        self.at = (self.at + 1) & self.mask;
-        Self::emit(ctx, d, &old);
-    }
-
-    fn drain(&mut self, ctx: &Ctx, d: &mut PartWriter) {
-        for i in 0..=self.mask {
-            let e = self.buf[(self.at + i) & self.mask];
-            Self::emit(ctx, d, &e);
-            self.buf[(self.at + i) & self.mask].key = 0;
-        }
-    }
-}
-
-#[inline(always)]
-fn ingest_field(ctx: &Ctx, ingest_s: i64) -> u64 {
-    let rel = ingest_s - ctx.ingest_base_s;
-    if rel < 0 {
-        // Too far before the window to order exactly in 21 bits: leave the
-        // fast pipeline altogether (never happens with generated data).
-        ctx.bail.store(true, Relaxed);
-    }
-    rel.clamp(0, INGEST_MAX) as u64
-}
-
-/// The literal rules for one event line.
-#[inline(never)]
-fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
-    let Some(f) = split::<7>(line) else { return };
+/// The rules for one event line, literally. `None`: the line is dropped before
+/// dedup (malformed, or an empty event_id).
+pub fn parse_event<'a>(ctx: &Ctx, line: &'a [u8]) -> Option<Event<'a>> {
+    let f = split::<7>(line)?;
     if f[0].is_empty() {
-        return;
+        return None;
     }
     // ingest_ts is always a valid F1 timestamp by the rules; a line where it is
     // not cannot be ordered against its copies, so it is treated as malformed.
-    let Some(ingest) = parse_ts(f[3]) else { return };
-    let ek = match event_key(f[0]) {
-        Some(k) => k,
-        None => EVENT_IRREGULAR | ctx.event_dict.intern(f[0]),
-    };
-    let (part, rem) = place(ctx, ek);
-    let w0 = rem << INGEST_BITS | ingest_field(ctx, ingest.div_euclid(1000));
-
+    if f[3].len() != 20 {
+        return None;
+    }
+    let ingest = parse_ts(f[3])?;
     let mut valid = !f[1].is_empty() && !f[5].is_empty();
     let mut ts = 0i64;
     match parse_ts(f[2]) {
@@ -554,24 +443,108 @@ fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
     if valid && ingest - ts > DAY_MS {
         valid = false;
     }
-    if !valid {
-        d.push2(&ctx.pool, part, w0, 0);
-        return;
-    }
-    let person = ctx.table.person(ctx.table.insert(ctx.users.key(f[1]))) as u64;
-    let w1 = VALID | person << 31 | (ts - ctx.t0) as u64;
-    if purchase {
-        let cat = ctx.products().category(f[5]) as u64;
-        d.push2(&ctx.pool, part, w0, w1 | PURCHASE);
-        d.push2(&ctx.pool, part, (price as u64) << 32 | cat, 0);
-    } else {
-        d.push2(&ctx.pool, part, w0, w1);
+    Some(Event { id: f[0], ingest, valid, user: f[1], ts, purchase: purchase && valid, price, product: f[5] })
+}
+
+/// The event and purchase records of a valid event: (person partition, event word, purchase word).
+#[inline]
+pub fn event_records(ctx: &Ctx, e: &Event) -> (usize, u64, u64) {
+    let person = ctx.table.person(ctx.table.insert(ctx.users.key(e.user))) as u64;
+    let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | (e.ts - ctx.t0) as u64;
+    let extra = if e.purchase { (e.price as u64) << 32 | ctx.products().category(e.product) as u64 } else { 0 };
+    ((person >> LOCAL_BITS) as usize, rec, extra)
+}
+
+/// The scalar path for one event line that starts at input position `loc`.
+#[inline(never)]
+fn event_line(ctx: &Ctx, out: &mut EventOut, line: &[u8], loc: u64) {
+    let Some(e) = parse_event(ctx, line) else { return };
+    let (pk, trace) = trace_of(ctx, event_hash(e.id));
+    out.k.push1(&ctx.pool, pk, trace | loc);
+    if e.valid {
+        let (sp, rec, extra) = event_records(ctx, &e);
+        out.s.push1(&ctx.pool, sp, rec);
+        if e.purchase {
+            out.ps.push2(&ctx.pool, sp, rec, extra);
+        }
     }
 }
 
-/// Returns the bytes consumed, or 0 if the line needs the scalar path.
+const BATCH: usize = 32;
+
+/// Valid events waiting for their person: the user table is the one randomly
+/// accessed structure of the parser, so its slots are prefetched when an event
+/// is queued and read a batch later.
+struct EventBatch {
+    n: usize,
+    key: [u64; BATCH],
+    home: [u32; BATCH],
+    ts: [u32; BATCH],
+    /// `price << 32 | category` of a purchase, 0 otherwise (a price is at least 1).
+    extra: [u64; BATCH],
+}
+
+impl EventBatch {
+    fn new() -> EventBatch {
+        EventBatch { n: 0, key: [0; BATCH], home: [0; BATCH], ts: [0; BATCH], extra: [0; BATCH] }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, ctx: &Ctx, out: &mut EventOut, key: u64, ts: u32, extra: u64) {
+        let i = self.n;
+        unsafe {
+            *self.key.get_unchecked_mut(i) = key;
+            *self.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
+            *self.ts.get_unchecked_mut(i) = ts;
+            *self.extra.get_unchecked_mut(i) = extra;
+        }
+        self.n = i + 1;
+        if self.n == BATCH {
+            self.flush(ctx, out);
+        }
+    }
+
+    #[inline(never)]
+    fn flush(&mut self, ctx: &Ctx, out: &mut EventOut) {
+        for i in 0..self.n {
+            let person = ctx.table.person(ctx.table.insert_at(self.home[i] as usize, self.key[i])) as u64;
+            let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | self.ts[i] as u64;
+            let sp = (person >> LOCAL_BITS) as usize;
+            out.s.push1(&ctx.pool, sp, rec);
+            if self.extra[i] != 0 {
+                out.ps.push2(&ctx.pool, sp, rec, self.extra[i]);
+            }
+        }
+        self.n = 0;
+    }
+}
+
+/// What the SIMD path made of one event line.
+pub struct Decoded {
+    /// Bytes consumed; 0 if the line needs the scalar path.
+    pub used: usize,
+    /// The event_id; an empty one means the line is dropped.
+    pub id: (*const u8, usize),
+    /// Passed validation and is not late.
+    pub valid: bool,
+    /// The user's key (meaningful when valid).
+    pub user_key: u64,
+    /// Epoch ms (meaningful when valid).
+    pub ts: i64,
+    /// `price << 32 | category` of a valid purchase, else 0.
+    pub extra: u64,
+    /// Epoch seconds of ingest_ts; only computed when `FULL`.
+    pub ingest_s: i64,
+}
+
+const TO_SCALAR: Decoded = Decoded { used: 0, id: (std::ptr::null(), 0), valid: false, user_key: 0, ts: 0, extra: 0, ingest_s: 0 };
+
+/// Decode the event line at `p`, which must be at least `HEAD` bytes into its
+/// file and at least `MARGIN` bytes before its end. With `FULL`, ingest_ts is
+/// always parsed (pass 2 needs its value); without, only when the lateness
+/// rule cannot be decided from its date.
 #[inline(always)]
-unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *const u8) -> usize {
+pub unsafe fn decode_event<const FULL: bool>(ctx: &Ctx, p: *const u8) -> Decoded {
     // Window 1: event_id, user_id, ts and their three commas.
     let (cm, nm, qm) = masks64(p);
     let c0 = cm.trailing_zeros() as usize;
@@ -602,7 +575,7 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
     let (qbad, fb) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
     bad |= qbad;
     if bad != 0 {
-        return 0;
+        return TO_SCALAR;
     }
 
     let q = |f: u64, i: u32| (f >> i & 1) as usize;
@@ -616,91 +589,128 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
     let n5 = c5 - c4 - 1 - 2 * q5;
     let used = c2 + 1 + nl + 1;
 
-    // IDs: `e` + up to 8 regular characters, and up to 9 regular characters
-    // (or an empty user_id, which only makes the event invalid).
-    // Anything else goes to the scalar path: an empty or irregular event_id, an
-    // irregular user_id, an ingest_ts that is not plain F1, a timestamp this
-    // path cannot decide.
-    let need = _bzhi_u32(0xFFFF, (n0 as u32).wrapping_sub(1)) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
-    if (n0.wrapping_sub(1) >= 9) | (*a0 != b'e') | (n1 > 9) | (alnum_bits(a0.add(1), a1) & need != need) {
-        return 0;
+    // What sends the line to the scalar path: an event_id longer than 16
+    // bytes, an irregular user_id, an ingest_ts of the wrong length, a
+    // timestamp this path cannot decide.
+    let mut out = Decoded { used, id: (a0, n0), valid: false, user_key: 0, ts: 0, extra: 0, ingest_s: 0 };
+    if n0 == 0 {
+        return out; // no event_id: dropped
+    }
+    let (user_ok, user_key) = raw_key_fast(a1, n1, b'u');
+    if (n0 > 16) | !(user_ok | (n1 == 0)) | (n3 != 20) {
+        return TO_SCALAR;
     }
     let dt = &ctx.dates;
-    let (i_shape, i_known, i_cal, ingest_s) = datetime(dt, a3);
-    if !((n3 == 20) & i_shape & i_known & i_cal & (*a3.add(19) == b'Z')) {
-        return 0;
-    }
     let (ts_decided, ts_valid, ts) = timestamp(dt, a2, n2);
     if !ts_decided {
-        return 0;
+        return TO_SCALAR;
     }
 
     let w = (a4 as *const u64).read_unaligned();
     let purchase = (n4 == 8) & (w == u64::from_le_bytes(*b"purchase"));
     let view = (n4 == 4) & ((w as u32 == u32::from_le_bytes(*b"view")) | (w as u32 == u32::from_le_bytes(*b"cart")));
-    let mut valid = (n1 != 0)
-        & (n5 != 0)
-        & (purchase | view)
-        & ts_valid
-        & (ts >= ctx.ws)
-        & (ts < ctx.we)
-        & (ingest_s * 1000 - ts <= DAY_MS);
-    let (part, rem) = place(ctx, pack_event(a0, n0));
-    let w0 = rem << INGEST_BITS | ingest_field(ctx, ingest_s);
+    let mut valid = (n1 != 0) & (n5 != 0) & (purchase | view) & ts_valid & (ts >= ctx.ws) & (ts < ctx.we);
+    if FULL {
+        let (shape, known, cal, ingest_s) = datetime(dt, a3);
+        if !(shape & known & cal & (*a3.add(19) == b'Z')) {
+            return TO_SCALAR;
+        }
+        out.ingest_s = ingest_s;
+        valid &= ingest_s * 1000 - ts <= DAY_MS;
+    } else if valid {
+        // Late? ingest_ts is a valid F1 timestamp by the rules, and it almost
+        // always falls on the same UTC day as ts, which settles it without
+        // parsing it: on the same day the two are less than 24 hours apart.
+        let day = ((ts - dt.first_day_ms) as u64 / DAY_MS as u64) as usize;
+        let same = _mm_cmpeq_epi8(
+            _mm_loadu_si128(a3 as *const __m128i),
+            _mm_loadu_si128(dt.day_text.get_unchecked(day).as_ptr() as *const __m128i),
+        );
+        if (_mm_movemask_epi8(same) & 0x3FF != 0x3FF) | (*a3.add(19) != b'Z') {
+            let (shape, known, cal, ingest_s) = datetime(dt, a3);
+            if !(shape & known & cal & (*a3.add(19) == b'Z')) {
+                return TO_SCALAR;
+            }
+            valid = ingest_s * 1000 - ts <= DAY_MS;
+        }
+    }
     let mut extra = 0u64;
-    let mut w1 = VALID | (ts.wrapping_sub(ctx.t0) as u64 & TS_MASK);
-    if purchase {
+    if valid & purchase {
         let q6 = q(fb, 3);
         let price = std::slice::from_raw_parts(p2.add(c5 + 1 + q6), nl - c5 - 1 - 2 * q6);
         match parse_price(price) {
             Some(price) => {
                 let cat = ctx.products().category(std::slice::from_raw_parts(p2.add(c4 + 1 + q5), n5)) as u64;
                 extra = (price as u64) << 32 | cat;
-                w1 |= PURCHASE;
             }
             None => valid = false,
         }
     }
-    if valid {
-        ring.push(ctx, d, PendingEvent { w0, w1, key: pack9(a1, n1), extra, part: part as u32, home: 0 });
-    } else {
-        d.push2(&ctx.pool, part, w0, 0);
-    }
-    used
+    out.valid = valid;
+    out.user_key = user_key;
+    out.ts = ts;
+    out.extra = extra;
+    out
 }
 
-pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, io: &mut Input, ch: &Chunk) -> usize {
-    let View { data, start, end, fast_end } = io.view(ctx, ch);
-    let len = data.len();
+/// The parser's fast path for the event line at `p`, whose input position is
+/// `loc`. Returns the bytes consumed, or 0 if the line needs the scalar path.
+#[inline(always)]
+unsafe fn event_fast(ctx: &Ctx, out: &mut EventOut, batch: &mut EventBatch, p: *const u8, loc: u64) -> usize {
+    let d = decode_event::<false>(ctx, p);
+    let (a0, n0) = d.id;
+    if (d.used == 0) | (n0 == 0) {
+        return d.used;
+    }
+    // The trace: a hash of the event_id's bytes (ids::event_hash).
+    let lo = _bzhi_u64((a0 as *const u64).read_unaligned(), 8 * n0 as u32);
+    let hi = _bzhi_u64((a0.add(8) as *const u64).read_unaligned(), 8 * (n0 as u32).saturating_sub(8));
+    let (pk, trace) = trace_of(ctx, mix16(lo, hi, n0));
+    out.k.push1(&ctx.pool, pk, trace | loc);
+    if d.valid {
+        batch.add(ctx, out, d.user_key, (d.ts - ctx.t0) as u32, d.extra);
+    }
+    d.used
+}
+
+/// Whether the SIMD decoder may be used on the line at byte `pos` of a file of `len` bytes.
+#[inline(always)]
+pub fn can_decode(ctx: &Ctx, pos: usize, len: usize) -> bool {
+    (pos >= HEAD) & (pos < fast_end(ctx, len))
+}
+
+pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
+    let data = ctx.files[ch.file as usize].slice();
+    let (len, fast_end) = (data.len(), fast_end(ctx, data.len()));
+    let base = ctx.file_base[ch.file as usize];
     let mut lines = 0usize;
-    if let Some(mut pos) = first_line(data, start) {
-        let mut ring = EventRing::new(ctx);
-        while pos < end {
+    if let Some(mut pos) = first_line(data, ch.start) {
+        let mut batch = EventBatch::new();
+        while pos < ch.end {
             lines += 1;
             if (pos >= HEAD) & (pos < fast_end) {
-                if ctx.prefetch_ahead != 0 {
-                    // The hardware streamer stops at page boundaries; reach past them.
-                    unsafe {
-                        _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + ctx.prefetch_ahead) as *const i8)
-                    };
-                }
-                let used = unsafe { event_fast(ctx, d, &mut ring, data.as_ptr().add(pos)) };
+                prefetch_input(ctx, data, pos);
+                let used = unsafe { event_fast(ctx, out, &mut batch, data.as_ptr().add(pos), base + pos as u64) };
                 if used != 0 {
                     pos += used;
                     continue;
                 }
             }
             let e = find_newline(data, pos).unwrap_or(len);
-            event_line(ctx, d, &data[pos..e]);
+            event_line(ctx, out, &data[pos..e], base + pos as u64);
             pos = e + 1;
         }
-        ring.drain(ctx, d);
+        batch.flush(ctx, out);
     }
-    release(ctx, ch);
     lines
 }
 
 // ------------------------------------------------------------------ clicks
+
+#[inline(always)]
+fn click_words(person: u64, tc: u64) -> (usize, u64) {
+    ((person >> LOCAL_BITS) as usize, (person & ((1 << LOCAL_BITS) - 1)) << 52 | tc)
+}
 
 /// The literal rules for one click line.
 #[inline(never)]
@@ -717,58 +727,55 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
         Some(t) if t >= ctx.t0 && t < ctx.we => t,
         _ => return,
     };
-    let slot = ctx.table.insert(ctx.users.key(f[1]));
-    let person = ctx.table.person(slot) as u64;
-    let local = person & ((1 << LOCAL_BITS) - 1);
-    let w0 = local << 52 | ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64;
-    c.push2(&ctx.pool, (person >> LOCAL_BITS) as usize, w0, ctx.clicks.key(f[0]));
+    let person = ctx.table.person(ctx.table.insert(ctx.users.key(f[1]))) as u64;
+    let (part, w0) = click_words(person, ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64);
+    c.push2(&ctx.pool, part, w0, ctx.clicks.key(f[0]));
 }
 
-/// A click waiting for its user-table slot (prefetched when queued).
-#[derive(Clone, Copy)]
-struct PendingClick {
+/// Valid clicks waiting for their person (see `EventBatch`).
+struct ClickBatch {
+    n: usize,
+    user: [u64; BATCH],
+    home: [u32; BATCH],
     /// ts_rel << CAMPAIGN_BITS | campaign
-    tc: u64,
-    click: u64,
-    /// The user key. 0 = empty.
-    user: u64,
+    tc: [u64; BATCH],
+    click: [u64; BATCH],
 }
 
-struct ClickRing {
-    buf: [PendingClick; RING_MAX],
-    at: usize,
-    mask: usize,
-}
-
-impl ClickRing {
-    fn new(ctx: &Ctx) -> ClickRing {
-        ClickRing { buf: [PendingClick { tc: 0, click: 0, user: 0 }; RING_MAX], at: 0, mask: ctx.ring_mask }
+impl ClickBatch {
+    fn new() -> ClickBatch {
+        ClickBatch { n: 0, user: [0; BATCH], home: [0; BATCH], tc: [0; BATCH], click: [0; BATCH] }
     }
 
     #[inline(always)]
-    fn step(&mut self, ctx: &Ctx, c: &mut PartWriter, new: PendingClick) {
-        if new.user != 0 {
-            ctx.table.prefetch(new.user);
+    fn add(&mut self, ctx: &Ctx, c: &mut PartWriter, user: u64, tc: u64, click: u64) {
+        let i = self.n;
+        unsafe {
+            *self.user.get_unchecked_mut(i) = user;
+            *self.home.get_unchecked_mut(i) = ctx.table.prefetch_home(user) as u32;
+            *self.tc.get_unchecked_mut(i) = tc;
+            *self.click.get_unchecked_mut(i) = click;
         }
-        let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, new);
-        self.at = (self.at + 1) & self.mask;
-        if old.user != 0 {
-            let person = ctx.table.person(ctx.table.insert(old.user)) as u64;
-            let local = person & ((1 << LOCAL_BITS) - 1);
-            c.push2(&ctx.pool, (person >> LOCAL_BITS) as usize, local << 52 | old.tc, old.click);
+        self.n = i + 1;
+        if self.n == BATCH {
+            self.flush(ctx, c);
         }
     }
 
-    fn drain(&mut self, ctx: &Ctx, c: &mut PartWriter) {
-        for _ in 0..=self.mask {
-            self.step(ctx, c, PendingClick { tc: 0, click: 0, user: 0 });
+    #[inline(never)]
+    fn flush(&mut self, ctx: &Ctx, c: &mut PartWriter) {
+        for i in 0..self.n {
+            let person = ctx.table.person(ctx.table.insert_at(self.home[i] as usize, self.user[i])) as u64;
+            let (part, w0) = click_words(person, self.tc[i]);
+            c.push2(&ctx.pool, part, w0, self.click[i]);
         }
+        self.n = 0;
     }
 }
 
 /// Returns the bytes consumed, or 0 if the line needs the scalar path.
 #[inline(always)]
-unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *const u8) -> usize {
+unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, batch: &mut ClickBatch, p: *const u8) -> usize {
     let (cm, nm, qm) = masks64(p);
     let nl = nm.trailing_zeros() as usize;
     let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
@@ -793,8 +800,9 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
     if (n0 == 0) | (n1 == 0) {
         return used;
     }
-    let need = _bzhi_u32(0xFFFF, n0 as u32) | _bzhi_u32(0xFFFF, n1 as u32) << 16;
-    if (n0 > 9) | (n1 > 9) | (alnum_bits(a0, a1) & need != need) {
+    let (click_ok, click_key) = raw_key_fast(a0, n0, b'k');
+    let (user_ok, user_key) = raw_key_fast(a1, n1, b'u');
+    if !(click_ok & user_ok) {
         return 0;
     }
     let (ts_decided, ts_valid, ts) = timestamp(&ctx.dates, a3, n3);
@@ -814,27 +822,22 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
         ctx.campaigns().index.get(std::slice::from_raw_parts(a2, n2))
     };
     if (campaign != ABSENT) & ts_valid & (ts >= ctx.t0) & (ts < ctx.we) {
-        let tc = ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64;
-        ring.step(ctx, c, PendingClick { tc, click: pack9(a0, n0), user: pack9(a1, n1) });
+        batch.add(ctx, c, user_key, ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64, click_key);
     }
     used
 }
 
-pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, io: &mut Input, ch: &Chunk) -> usize {
-    let View { data, start, end, fast_end } = io.view(ctx, ch);
-    let len = data.len();
+pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
+    let data = ctx.files[ch.file as usize].slice();
+    let (len, fast_end) = (data.len(), fast_end(ctx, data.len()));
     let mut lines = 0usize;
-    if let Some(mut pos) = first_line(data, start) {
-        let mut ring = ClickRing::new(ctx);
-        while pos < end {
+    if let Some(mut pos) = first_line(data, ch.start) {
+        let mut batch = ClickBatch::new();
+        while pos < ch.end {
             lines += 1;
             if (pos >= HEAD) & (pos < fast_end) {
-                if ctx.prefetch_ahead != 0 {
-                    unsafe {
-                        _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + ctx.prefetch_ahead) as *const i8)
-                    };
-                }
-                let used = unsafe { click_fast(ctx, c, &mut ring, data.as_ptr().add(pos)) };
+                prefetch_input(ctx, data, pos);
+                let used = unsafe { click_fast(ctx, c, &mut batch, data.as_ptr().add(pos)) };
                 if used != 0 {
                     pos += used;
                     continue;
@@ -844,8 +847,7 @@ pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, io: &mut Input, ch: &Chunk) -
             click_line(ctx, c, &data[pos..e]);
             pos = e + 1;
         }
-        ring.drain(ctx, c);
+        batch.flush(ctx, c);
     }
-    release(ctx, ch);
     lines
 }

@@ -1,5 +1,5 @@
 //! Shopping Sessions: clean, link, sessionize and attribute click-stream CSVs
-//! into two daily Parquet tables. See DESIGN.md for the pipeline.
+//! into two daily Parquet tables. The README describes the pipeline.
 
 mod diag;
 mod ids;
@@ -21,10 +21,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Barrier;
 use std::time::Instant;
 
-use ids::{Dict, KeySpace};
+use ids::KeySpace;
 use lookup::{Campaigns, Products};
 use parquet::{Column, Kind};
 use part::{BlockPool, PartWriter};
+use pass2::Cancels;
 use pass3::CampCell;
 use sys::FileMap;
 use table::Table;
@@ -58,7 +59,6 @@ pub struct Ctx {
     pub ws: i64,
     pub we: i64,
     pub t0: i64,
-    pub ingest_base_s: i64,
     /// `day0` is the UTC day number of `t0`; `day_off` its offset into that day.
     pub day0: i64,
     pub day_off: u64,
@@ -70,26 +70,24 @@ pub struct Ctx {
     data_dir: PathBuf,
     pub users: KeySpace,
     pub clicks: KeySpace,
-    pub event_dict: Dict,
     pub dates: parse::DateTab,
     /// Debug switch: send every line through the scalar parsers.
     pub scalar_only: bool,
-    /// Software prefetch distance in bytes for the event parser (0 = off).
+    /// Software prefetch distance in bytes for the parsers' input (0 = off).
     pub prefetch_ahead: usize,
-    /// Rows between prefetching an event's user-table slot and using it, minus one.
-    pub ring_mask: usize,
-    /// Release the big memory regions from all threads before exiting.
+    /// Unmap the big memory regions from all threads before exiting.
     zap: bool,
-    /// Experiment switch: load products/campaigns before starting the threads.
-    eager_lookups: bool,
-    /// Input by `pread` into a private per-thread buffer instead of a mapping.
-    pub read_io: bool,
-    /// Read mode: bytes read past a chunk's end at first (test switch: a tiny
-    /// value forces the path that extends the read for an unfinished line).
-    pub read_tail: usize,
     pub table: Table,
     pub pool: BlockPool,
     pub files: Vec<FileMap>,
+    /// For an event file, the position of its first byte among all event
+    /// files laid end to end (a trace stores a line's position in that space).
+    pub file_base: Vec<u64>,
+    /// Event files in order of position: (base, file index).
+    event_files: Vec<(u64, u32)>,
+    /// Bits of a trace that hold the position; the rest hold the fingerprint.
+    pub loc_bits: u32,
+    pub fp_mask: u64,
     link_chunks: Vec<Chunk>,
     main_chunks: Vec<Chunk>,
     next_link: AtomicUsize,
@@ -97,18 +95,19 @@ pub struct Ctx {
     next_main: AtomicUsize,
     next_d: AtomicUsize,
     next_s: AtomicUsize,
-    /// Event partitions (a power of two) and the bits of an event key stored within one.
+    /// Trace partitions and person partitions.
     pub pd: usize,
-    pub rem_bits: u32,
     pub ps: usize,
-    d: Vec<Shared<PartWriter>>,
+    k: Vec<Shared<PartWriter>>,
     c: Vec<Shared<PartWriter>>,
     s: Vec<Shared<PartWriter>>,
     psw: Vec<Shared<PartWriter>>,
+    x: Vec<Shared<Cancels>>,
     acc: Vec<Shared<Vec<CampCell>>>,
     barrier: Barrier,
     /// Per profiled section, summed over threads (SS_TIMING only): CPU
-    /// nanoseconds, the four performance counters, and input rows.
+    /// nanoseconds, the four performance counters, input rows, kernel
+    /// nanoseconds and page faults.
     pub prof: [[std::sync::atomic::AtomicU64; 4 + prof::NCOUNTERS]; 12],
     /// Set when the data does not fit the fast path's packed layouts.
     pub bail: AtomicBool,
@@ -156,8 +155,8 @@ impl Ctx {
     // Writers are mutated only by their owning thread during the phase that
     // fills them, and only read (by anyone) after the barrier that follows.
     #[inline(always)]
-    pub fn d(&self, t: usize) -> &PartWriter {
-        unsafe { &*self.d[t].0.get() }
+    pub fn k(&self, t: usize) -> &PartWriter {
+        unsafe { &*self.k[t].0.get() }
     }
     #[inline(always)]
     pub fn c(&self, t: usize) -> &PartWriter {
@@ -170,6 +169,18 @@ impl Ctx {
     #[inline(always)]
     pub fn ps(&self, t: usize) -> &PartWriter {
         unsafe { &*self.psw[t].0.get() }
+    }
+    #[inline(always)]
+    pub fn x(&self, t: usize) -> &Cancels {
+        unsafe { &*self.x[t].0.get() }
+    }
+
+    /// The event file that holds trace position `loc`, and the offset in it.
+    #[inline]
+    pub fn locate(&self, loc: u64) -> (&[u8], usize) {
+        let at = self.event_files.partition_point(|f| f.0 <= loc) - 1;
+        let (base, file) = self.event_files[at];
+        (self.files[file as usize].slice(), (loc - base) as usize)
     }
 
     /// Profiling: this thread's CPU time and counters now (zeros when not timing).
@@ -224,7 +235,7 @@ impl Ctx {
     fn print_profile(&self) {
         let total: u64 = self.prof.iter().map(|p| p[0].load(Relaxed)).sum();
         eprintln!(
-            "    section            cpu ms     %   sys ms  faults      rows  instr/row cycles/row   IPC brmiss/row llcmiss/row"
+            "    section            cpu ms     %   sys ms  faults      rows ns/row  instr/row cycles/row   IPC brmiss/row llcmiss/row"
         );
         let mut sum = [0u64; 4 + prof::NCOUNTERS];
         for (name, p) in P_NAMES.iter().zip(&self.prof) {
@@ -238,10 +249,11 @@ impl Ctx {
             }
             let per = |x: u64| if rows > 0 { x as f64 / rows as f64 } else { 0.0 };
             eprintln!(
-                "    {name:16} {:8.2} {:5.1}% {:8.2} {faults:7} {rows:9} {:10.1} {:10.1} {:5.2} {:10.3} {:11.3}",
+                "    {name:16} {:8.2} {:5.1}% {:8.2} {faults:7} {rows:9} {:6.1} {:10.1} {:10.1} {:5.2} {:10.3} {:11.3}",
                 ns as f64 / 1e6,
                 100.0 * ns as f64 / total.max(1) as f64,
                 sys as f64 / 1e6,
+                per(ns),
                 per(instr),
                 per(cycles),
                 instr as f64 / cycles.max(1) as f64,
@@ -278,12 +290,11 @@ pub const P_WRITE: usize = 9;
 pub const P_LINKS: usize = 10;
 pub const P_COMPRESS: usize = 11;
 const P_NAMES: [&str; 12] = [
-    "parse events", "parse clicks", "finalize", "dedup gather", "dedup table", "dedup emit", "sessions gather",
+    "parse events", "parse clicks", "finalize", "dedup gather", "dedup scan", "dedup settle", "sessions gather",
     "sessions sort", "sessions people", "write user_daily", "links", "resolve people",
 ];
 
 const CHUNK: usize = 1 << 20;
-const READ_CHUNK: usize = 1 << 18;
 const LINK_CHUNK: usize = 1 << 18;
 const COMPRESS_STEP: usize = 1 << 16;
 
@@ -307,23 +318,22 @@ fn worker(ctx: &Ctx, tid: usize) {
     // Per-thread partition writers, built here so their memory is first touched
     // by the thread that uses it and the allocations run in parallel.
     unsafe {
-        *ctx.d[tid].0.get() = PartWriter::new(ctx.pd);
+        *ctx.k[tid].0.get() = PartWriter::new(ctx.pd);
         *ctx.c[tid].0.get() = PartWriter::new(ctx.ps);
         *ctx.s[tid].0.get() = PartWriter::new(ctx.ps);
         *ctx.psw[tid].0.get() = PartWriter::new(ctx.ps);
     }
-    if tid == 0 && !ctx.eager_lookups {
+    if tid == 0 {
         ctx.load_lookups();
     }
     // ---- links: insert both IDs, join them
-    let mut io = parse::Input::new();
     let mut t = ctx.now();
     loop {
         let i = ctx.next_link.fetch_add(1, Relaxed);
         if i >= ctx.link_chunks.len() {
             break;
         }
-        let lines = parse::links_chunk(ctx, &mut io, &ctx.link_chunks[i]);
+        let lines = parse::links_chunk(ctx, &ctx.link_chunks[i]);
         t = ctx.charge_rows(P_LINKS, t, lines);
     }
     ctx.sync("links parsed");
@@ -341,10 +351,12 @@ fn worker(ctx: &Ctx, tid: usize) {
     ctx.charge(P_COMPRESS, t);
     ctx.sync("people resolved");
 
-    // ---- parse clicks and events
+    // ---- parse clicks and events: straight to their person's partition, plus a trace per event
     {
-        let d = unsafe { &mut *ctx.d[tid].0.get() };
         let c = unsafe { &mut *ctx.c[tid].0.get() };
+        let mut out = unsafe {
+            parse::EventOut { k: &mut *ctx.k[tid].0.get(), s: &mut *ctx.s[tid].0.get(), ps: &mut *ctx.psw[tid].0.get() }
+        };
         let mut t = ctx.now();
         loop {
             let i = ctx.next_main.fetch_add(1, Relaxed);
@@ -354,16 +366,18 @@ fn worker(ctx: &Ctx, tid: usize) {
             let ch = &ctx.main_chunks[i];
             match ch.kind {
                 FileKind::Events => {
-                    let lines = parse::events_chunk(ctx, d, &mut io, ch);
+                    let lines = parse::events_chunk(ctx, &mut out, ch);
                     t = ctx.charge_rows(P_EVENTS, t, lines);
                 }
                 _ => {
-                    let lines = parse::clicks_chunk(ctx, c, &mut io, ch);
+                    let lines = parse::clicks_chunk(ctx, c, ch);
                     t = ctx.charge_rows(P_CLICKS, t, lines);
                 }
             }
         }
-        d.finalize(&ctx.pool);
+        out.k.finalize(&ctx.pool);
+        out.s.finalize(&ctx.pool);
+        out.ps.finalize(&ctx.pool);
         c.finalize(&ctx.pool);
         ctx.charge(P_FINALIZE, t);
     }
@@ -372,20 +386,18 @@ fn worker(ctx: &Ctx, tid: usize) {
         return;
     }
 
-    // ---- dedup, scatter survivors by person
+    // ---- dedup: settle the event IDs that occur more than once
     {
-        let s = unsafe { &mut *ctx.s[tid].0.get() };
-        let ps = unsafe { &mut *ctx.psw[tid].0.get() };
+        let x = unsafe { &mut *ctx.x[tid].0.get() };
         let mut sc = pass2::Scratch::default();
         loop {
             let p = ctx.next_d.fetch_add(1, Relaxed);
             if p >= ctx.pd {
                 break;
             }
-            pass2::run(ctx, &mut sc, s, ps, p);
+            pass2::run(ctx, &mut sc, x, p);
         }
-        s.finalize(&ctx.pool);
-        ps.finalize(&ctx.pool);
+        x.finish(ctx.ps);
         // Never free: unmapping costs time and the process is about to exit.
         std::mem::forget(sc);
     }
@@ -422,21 +434,23 @@ fn worker(ctx: &Ctx, tid: usize) {
         ctx.pool.zap(a, b);
         let (a, b) = share(ctx.table.cap);
         ctx.table.zap(a, b);
+        for (i, file) in ctx.files.iter().enumerate() {
+            if i % n == tid {
+                file.release(0, file.len);
+            }
+        }
     } else {
         std::mem::forget(sc);
     }
     ctx.sync("campaign_daily written, memory released");
 }
 
-/// `--bench`: best-of-N thread CPU time per line for each parser on a small
-/// region of the largest file of its kind. Small and repeated so that the
-/// minimum is meaningful even on a busy machine.
+/// `--bench`: the parsers alone on a small region of the largest file of each
+/// kind, repeated; reports the least disturbed repetition.
 fn bench(ctx: &Ctx) {
-    sys::NORELEASE.store(true, Relaxed);
     ctx.load_lookups();
-    let mut io = parse::Input::new();
     for ch in &ctx.link_chunks {
-        parse::links_chunk(ctx, &mut io, ch);
+        parse::links_chunk(ctx, ch);
     }
     ctx.table.compress(0, ctx.table.cap);
     let region: usize = std::env::var("SS_BENCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 19);
@@ -458,42 +472,49 @@ fn bench(ctx: &Ctx) {
         };
         let end = region.min(ctx.files[file as usize].len);
         let ch = Chunk { file, kind, start: 0, end };
-        // Keep the iteration with the fewest cycles (the least disturbed one);
-        // instruction and miss counts barely vary between iterations.
+        // Keep the repetition with the fewest cycles (or, without counters, the least time).
         let (mut best, mut lines) = ([u64::MAX; 1 + prof::NCOUNTERS], 1usize);
-        let mut free: Vec<u32> = Vec::new();
+        // Each writer gets its own blocks back, so repetitions do not grow the pool.
+        let mut free: [Vec<u32>; 4] = Default::default();
         for _ in 0..iters {
-            let nparts = if kind == FileKind::Events { ctx.pd } else { ctx.ps };
-            let mut w = PartWriter::new(nparts);
-            w.free = std::mem::take(&mut free);
+            let mut w = [PartWriter::new(ctx.pd), PartWriter::new(ctx.ps), PartWriter::new(ctx.ps), PartWriter::new(ctx.ps)];
+            for (x, f) in w.iter_mut().zip(free.iter_mut()) {
+                x.free = std::mem::take(f);
+            }
             let a = prof::snap();
-            let n = match kind {
-                FileKind::Events => parse::events_chunk(ctx, &mut w, &mut io, &ch),
-                FileKind::Clicks => parse::clicks_chunk(ctx, &mut w, &mut io, &ch),
-                FileKind::Links => parse::links_chunk(ctx, &mut io, &ch),
+            let n = {
+                let [k, s, ps, c] = &mut w;
+                match kind {
+                    FileKind::Events => parse::events_chunk(ctx, &mut parse::EventOut { k, s, ps }, &ch),
+                    FileKind::Clicks => parse::clicks_chunk(ctx, c, &ch),
+                    FileKind::Links => parse::links_chunk(ctx, &ch),
+                }
             };
             let b = prof::snap();
-            if b.c[0] - a.c[0] < best[1] || (best[1] == u64::MAX && b.c[0] == a.c[0] && b.ns - a.ns < best[0]) {
+            let better = if b.c[0] != a.c[0] { b.c[0] - a.c[0] < best[1] } else { b.ns - a.ns < best[0] };
+            if better {
                 best[0] = b.ns - a.ns;
                 for i in 0..prof::NCOUNTERS {
                     best[1 + i] = b.c[i] - a.c[i];
                 }
                 lines = n.max(1);
             }
-            w.finalize(&ctx.pool);
-            free = w.all_blocks().to_vec();
-            free.extend_from_slice(&w.free);
+            for (x, f) in w.iter_mut().zip(free.iter_mut()) {
+                x.finalize(&ctx.pool);
+                f.extend_from_slice(x.all_blocks());
+                f.extend_from_slice(&x.free);
+            }
         }
         let name = ["events", "clicks", "links"][kind as usize];
         let per = |x: u64| x as f64 / lines as f64;
         eprintln!(
-            "bench {name}: {:6.1} instr/line  {:6.1} cycles/line  IPC {:.2}  {:.3} brmiss/line  {:.3} llcmiss/line  {:5.1} ns/line  ({lines} lines)",
+            "bench {name}: {:5.1} ns/line  {:6.1} instr/line  {:6.1} cycles/line  IPC {:.2}  {:.3} brmiss/line  {:.3} llcmiss/line  ({lines} lines)",
+            per(best[0]),
             per(best[2]),
             per(best[1]),
             best[2] as f64 / best[1].max(1) as f64,
             per(best[3]),
             per(best[4]),
-            per(best[0]),
         );
     }
     prof::finish_thread();
@@ -579,7 +600,6 @@ fn main() {
         diag::run(&data_dir);
     }
     sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Relaxed);
-    sys::NORELEASE.store(std::env::var("SS_NORELEASE").is_ok(), Relaxed);
     if force_slow {
         slow::run(&data_dir, &out_dir);
         unsafe { sys::_exit(0) }
@@ -603,24 +623,26 @@ fn main() {
     // Test switch: tiny chunks put every kind of line on a chunk boundary.
     let chunk_override: Option<usize> =
         std::env::var("SS_CHUNK_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0);
-    // Input mode: IO=read copies each chunk into a private buffer that fits the
-    // L2 cache; the default maps the files.
-    let read_io = std::env::var("SS_IO").map_or(false, |v| v == "read");
-    let main_chunk = if read_io { READ_CHUNK } else { CHUNK };
     let mut files: Vec<FileMap> = Vec::new();
+    let mut file_base: Vec<u64> = Vec::new();
+    let mut event_files: Vec<(u64, u32)> = Vec::new();
     let mut link_chunks: Vec<Chunk> = Vec::new();
     let mut main_chunks: Vec<Chunk> = Vec::new();
     let mut bytes = [0usize; 3];
     for (kind, dir, step) in [
         (FileKind::Links, "links", chunk_override.unwrap_or(LINK_CHUNK)),
-        (FileKind::Clicks, "clicks", chunk_override.unwrap_or(main_chunk)),
-        (FileKind::Events, "events", chunk_override.unwrap_or(main_chunk)),
+        (FileKind::Clicks, "clicks", chunk_override.unwrap_or(CHUNK)),
+        (FileKind::Events, "events", chunk_override.unwrap_or(CHUNK)),
     ] {
         for path in list_csv(&data_dir.join(dir)) {
-            let map = FileMap::open(&path, !read_io).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let map = FileMap::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let len = map.len;
-            bytes[kind as usize] += len;
             let file = files.len() as u32;
+            file_base.push(bytes[kind as usize] as u64);
+            if kind == FileKind::Events && len > 0 {
+                event_files.push((bytes[kind as usize] as u64, file));
+            }
+            bytes[kind as usize] += len;
             files.push(map);
             let mut start = 0;
             while start < len {
@@ -639,15 +661,20 @@ fn main() {
         (bytes[FileKind::Events as usize], bytes[FileKind::Clicks as usize], bytes[FileKind::Links as usize]);
     mark("files mapped");
 
-    // Sizes. The user table holds every distinct user ID; aim for a load of at most ~0.5.
+    // Sizes. The user table holds every distinct user ID, at a load of at most about a half.
     let est_ids = links_bytes / 16 + events_bytes / 2200 + clicks_bytes / 1500 + 2048;
     // SS_TABLE_X8 (experiment): table slots per estimated ID, in eighths.
     let table_x8: usize = std::env::var("SS_TABLE_X8").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 8).unwrap_or(16);
     let cap = (est_ids * table_x8 / 8).next_multiple_of(1 << parse::LOCAL_BITS);
     let ps = cap >> parse::LOCAL_BITS;
-    // Event partitions: about 0.5 MB of records each, but never so many that a
-    // thread's write-combining lines (64 bytes per partition) crowd its L2.
-    let pd = (events_bytes / 2_400_000).next_power_of_two().clamp(1 << parse::MIN_PD_BITS, 2048);
+    // Trace partitions: about 30,000 traces each, so that the two bitmaps of
+    // pass 2 stay in the first-level cache; but never so many that a thread's
+    // write-combining lines (64 bytes per partition) crowd its L2.
+    let pd_bytes: usize = std::env::var("SS_PD_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(2_400_000);
+    let pd = (events_bytes / pd_bytes).next_power_of_two().clamp(1, 4096);
+    // A trace holds the position of its line among all event bytes; the rest
+    // of the word is the fingerprint of the event ID.
+    let loc_bits = (64 - (events_bytes.max(2) as u64 - 1).leading_zeros()).max(1);
     // Block pool: address space for the worst case (every line as short as a
     // line can be); real data needs about a fifth of it. `pool_floor` is what
     // to settle for if the kernel will not reserve that much.
@@ -657,48 +684,37 @@ fn main() {
 
     let t0 = ws - REACH_MS;
     let day0 = t0.div_euclid(DAY_MS);
-    let window_s = (we - ws) / 1000;
-    let ingest_base_s = ws.div_euclid(1000) - (parse::INGEST_MAX - (window_s + 86_400 + 2));
-    let fits = ws < we
-        && we - t0 < (1i64 << 31)
-        && parse::INGEST_MAX - (window_s + 86_400 + 2) >= 86_400
-        && cap < (1 << parse::PERSON_BITS);
+    let fits = ws < we && we - t0 < (1i64 << 31) && cap < (1 << parse::PERSON_BITS) && loc_bits <= 40;
     if !fits {
         eprintln!("input does not fit the fast path: using the plain implementation");
         slow::run(&data_dir, &out_dir);
         unsafe { sys::_exit(0) }
     }
+    let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1) as usize;
 
     let ctx = Ctx {
         ws,
         we,
         t0,
-        ingest_base_s,
         day0,
         day_off: (t0 - day0 * DAY_MS) as u64,
-        ndays: ((we - 1).div_euclid(DAY_MS) - day0 + 1) as usize,
+        ndays,
         nthreads,
         lookups: Shared::new(None),
         data_dir: data_dir.clone(),
-        users: KeySpace::new(),
-        clicks: KeySpace::new(),
-        event_dict: Dict::new(),
-        dates: parse::DateTab::new(ws),
+        users: KeySpace::new(b'u'),
+        clicks: KeySpace::new(b'k'),
+        dates: parse::DateTab::new(ws, day0, ndays),
         scalar_only: std::env::var("SS_SCALAR").is_ok(),
         prefetch_ahead: std::env::var("SS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
-        ring_mask: std::env::var("SS_RING")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| n.is_power_of_two() && *n <= parse::RING_MAX)
-            .unwrap_or(32)
-            - 1,
         zap: std::env::var("SS_NOZAP").is_err(),
-        eager_lookups: std::env::var("SS_EAGER_LOOKUPS").is_ok(),
-        read_io,
-        read_tail: std::env::var("SS_READ_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(parse::TAIL),
         table: Table::new(cap),
         pool: BlockPool::new(pool_blocks, pool_floor),
         files,
+        file_base,
+        event_files,
+        loc_bits,
+        fp_mask: u64::MAX >> loc_bits,
         link_chunks,
         main_chunks,
         next_link: AtomicUsize::new(0),
@@ -707,12 +723,12 @@ fn main() {
         next_d: AtomicUsize::new(0),
         next_s: AtomicUsize::new(0),
         pd,
-        rem_bits: ids::EVENT_KEY_BITS - pd.trailing_zeros(),
         ps,
-        d: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
+        k: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         c: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         s: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         psw: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
+        x: (0..nthreads).map(|_| Shared::new(Cancels::default())).collect(),
         acc: (0..nthreads).map(|_| Shared::new(Vec::new())).collect(),
         barrier: Barrier::new(nthreads),
         prof: Default::default(),
@@ -741,10 +757,6 @@ fn main() {
         bench(&ctx);
         unsafe { sys::_exit(0) }
     }
-    if ctx.eager_lookups {
-        ctx.load_lookups();
-        mark("lookups loaded");
-    }
     std::thread::scope(|scope| {
         for tid in 1..nthreads {
             let ctx = &ctx;
@@ -761,15 +773,16 @@ fn main() {
     if timing {
         ctx.print_profile();
         prof::write_samples();
+        let cancels: usize = (0..nthreads).map(|t| ctx.x(t).len()).sum();
         eprintln!(
-            "[{:8.2} ms] done; table {} of {} slots used, pool used {} MB, irregular ids: users {}, events {}, clicks {}",
+            "[{:8.2} ms] done; table {} of {} slots used, pool used {} MB, irregular ids: users {}, clicks {}; {} cancellations",
             t_start.elapsed().as_secs_f64() * 1e3,
             ctx.table.used.load(Relaxed),
             ctx.table.cap,
             ctx.pool.used_bytes() >> 20,
             ctx.users.dict.len(),
-            ctx.event_dict.len(),
-            ctx.clicks.dict.len()
+            ctx.clicks.dict.len(),
+            cancels
         );
     }
     // Skip destructors and unmapping: the kernel reclaims everything at exit.

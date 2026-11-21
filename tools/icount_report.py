@@ -105,8 +105,21 @@ def main():
             per = f"  {c / lines_in[0]:7.1f} /event line"
         print(f"  {c:12,} {100 * c / total:5.1f}%  {f:34s}{per}")
     print("\n-- hottest source lines")
-    for (f, base, line), c in by_line.most_common(45):
+    for (f, base, line), c in by_line.most_common(int(os.environ.get("TOP_LINES", "45"))):
         print(f"  {c:12,} {100 * c / total:5.1f}%  {base}:{line:<5d} {f}")
+    # With SRC_LINES=file.rs: that file's lines in order, each with its share.
+    want = os.environ.get("SRC_LINES")
+    if want:
+        per_line = collections.Counter()
+        for (f, base, line), c in by_line.items():
+            if base == want:
+                per_line[line] += c
+        print(f"\n-- {want}, line by line (samples; share of all)")
+        text = open(os.path.join(src_dir, want)).read().split("\n")
+        for line in sorted(per_line):
+            c = per_line[line]
+            if c * 500 >= total:
+                print(f"  {c:8,} {100 * c / total:5.1f}%  {line:5d}: {text[line - 1].strip()[:110]}")
 
 
 def demangle(sym):

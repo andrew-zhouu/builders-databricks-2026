@@ -34,10 +34,8 @@ const MAP_NORESERVE: c_int = 0x4000;
 const MADV_DONTNEED: c_int = 4;
 const MADV_HUGEPAGE: c_int = 14;
 
-/// Experiment switches (environment): NOHUGE = no MADV_HUGEPAGE,
-/// NORELEASE = keep parsed input mapped until exit.
+/// Experiment switch (environment): SS_NOHUGE = no MADV_HUGEPAGE.
 pub static NOHUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub static NORELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Zeroed, lazily committed memory, or `None` if the kernel refuses the mapping
 /// (possible for very large reservations under strict overcommit). Never
@@ -70,44 +68,28 @@ pub fn zap(ptr: *mut u8, len: usize) {
     }
 }
 
-/// An input file: open for positioned reads, and (unless `map` is false) a
-/// read-only private mapping of the whole of it. Empty files map to an empty slice.
+/// A read-only private mapping of a whole input file. Empty files map to an
+/// empty slice. The mapping stays for the life of the process: pass 2 reads
+/// lines again through it.
 pub struct FileMap {
     pub ptr: *const u8,
     pub len: usize,
-    file: File,
 }
 unsafe impl Send for FileMap {}
 unsafe impl Sync for FileMap {}
 
 impl FileMap {
-    pub fn open(path: &std::path::Path, map: bool) -> std::io::Result<FileMap> {
+    pub fn open(path: &std::path::Path) -> std::io::Result<FileMap> {
         let f = File::open(path)?;
         let len = f.metadata()?.len() as usize;
-        if len == 0 || !map {
-            return Ok(FileMap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len, file: f });
+        if len == 0 {
+            return Ok(FileMap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len });
         }
         let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(FileMap { ptr: p as *const u8, len, file: f })
-    }
-
-    /// Fill `buf` from byte `offset` of the file; returns the bytes read
-    /// (short only at end of file).
-    pub fn read_at(&self, buf: &mut [u8], offset: usize) -> usize {
-        use std::os::unix::fs::FileExt;
-        let mut done = 0;
-        while done < buf.len() {
-            match self.file.read_at(&mut buf[done..], (offset + done) as u64) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => panic!("read failed: {e}"),
-            }
-        }
-        done
+        Ok(FileMap { ptr: p as *const u8, len })
     }
 
     #[inline]
@@ -116,11 +98,9 @@ impl FileMap {
     }
 
     /// Drop the page-table entries of fully covered pages in `[start, end)`; the
-    /// pages stay in the page cache. Spreads unmap work over the worker threads.
+    /// pages stay in the page cache. Used at the end, to spread the unmapping
+    /// over the worker threads.
     pub fn release(&self, start: usize, end: usize) {
-        if NORELEASE.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
         let a = (start + 4095) & !4095;
         let b = end & !4095;
         if b > a {

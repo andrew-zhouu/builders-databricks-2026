@@ -1,91 +1,92 @@
-//! Exact integer keys for IDs.
+//! Exact integer keys for user and click IDs, and fingerprints for event IDs.
 //!
-//! A character of `[0-9a-z]` has a 6-bit code: bits 0-4 and bit 6 of its ASCII
-//! byte (`pext(byte, 0x5F)`), so digits are 16-25 and letters 33-58. The code is
-//! never 0, is injective, and keeps byte order.
+//! **User and click IDs.** An ID is *regular* when it is its usual prefix
+//! letter (`u` or `k`) followed by 1 to 8 bytes that are all ASCII and not NUL.
+//! Its key is those bytes as a big-endian integer, zero-padded on the right:
+//! injective (a shorter ID never equals a longer one because no byte is zero),
+//! never 0, top bit clear, and ordered exactly like the IDs byte-wise. Every
+//! other ID (other first letter, longer, non-ASCII, ...) is interned in a
+//! dictionary and keyed by its index with the top bit set. Equal keys mean
+//! equal IDs either way.
 //!
-//! An ID of 1 to 9 such characters ("regular") packs into 54 bits, 6 per
-//! character, left-aligned, so the integer order of two keys is the byte-wise
-//! order of the IDs. Every other ID ("irregular": upper case, spaces, longer,
-//! ...) is interned in a dictionary and keyed by its index with the top bit set.
-//! The mapping is injective either way, so equal keys mean equal IDs.
+//! **Event IDs** are only ever compared for equality, and candidates for
+//! equality are confirmed by reading the IDs again from the input, so an event
+//! ID needs no exact key: `event_hash` is an ordinary 64-bit hash of its bytes.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub const IRREGULAR: u64 = 1 << 63;
-/// Event keys are 49 bits: 48 for `e` + up to 8 regular characters (6 bits
-/// each, first character lowest), or this flag plus a dictionary index.
-pub const EVENT_IRREGULAR: u64 = 1 << 48;
-pub const EVENT_KEY_BITS: u32 = 49;
+const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+const LOW_BITS: u64 = 0x0101_0101_0101_0101;
 
-const fn build_codes() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut c = 0usize;
-    while c < 256 {
-        let b = c as u8;
-        if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'z') {
-            t[c] = (b & 0x1F) | ((b & 0x40) >> 1);
-        }
-        c += 1;
+/// The key of a regular ID with prefix `prefix`, or `None`.
+#[inline]
+pub fn raw_key(b: &[u8], prefix: u8) -> Option<u64> {
+    let n = b.len();
+    if !(2..=9).contains(&n) || b[0] != prefix {
+        return None;
     }
-    t
+    let mut w = [0u8; 8];
+    w[..n - 1].copy_from_slice(&b[1..]);
+    if b[1..].iter().any(|&c| c == 0 || c >= 0x80) {
+        return None;
+    }
+    Some(u64::from_be_bytes(w))
 }
-pub static CODE: [u8; 256] = build_codes();
+
+/// As `raw_key`, for `n` bytes at `a` with at least 9 readable bytes.
+/// Returns (regular, key); the key is meaningless when not regular.
+#[inline(always)]
+pub unsafe fn raw_key_fast(a: *const u8, n: usize, prefix: u8) -> (bool, u64) {
+    use core::arch::x86_64::_bzhi_u64;
+    // payload = bytes 1..n, little-endian in `w`, zero above them
+    let w = _bzhi_u64((a.add(1) as *const u64).read_unaligned(), 8u32.wrapping_mul((n as u32).wrapping_sub(1)));
+    // bytes beyond the payload read as non-zero for the "no NUL inside" test
+    let fill = !_bzhi_u64(u64::MAX, 8u32.wrapping_mul((n as u32).wrapping_sub(1)));
+    let v = w | fill;
+    let has_zero = v.wrapping_sub(LOW_BITS) & !v & HIGH_BITS;
+    let ok = (n.wrapping_sub(2) < 8) & (*a == prefix) & ((w & HIGH_BITS) | has_zero == 0);
+    (ok, w.swap_bytes())
+}
+
+/// The length of a regular ID's payload (1 to 8) from its key.
+#[inline(always)]
+pub fn raw_len(key: u64) -> usize {
+    8 - (key.trailing_zeros() / 8) as usize
+}
+
+/// A 64-bit hash of an event ID. Not exact: equal hashes are confirmed by
+/// comparing the IDs themselves.
+#[inline]
+pub fn event_hash(b: &[u8]) -> u64 {
+    let n = b.len();
+    let mut buf = [0u8; 16];
+    let head = n.min(16);
+    buf[..head].copy_from_slice(&b[..head]);
+    let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(buf[8..].try_into().unwrap());
+    let mut h = mix16(lo, hi, n);
+    // Longer IDs (never on the fast path): fold in the rest, 8 bytes at a time.
+    for chunk in b[head..].chunks(8) {
+        let mut w = [0u8; 8];
+        w[..chunk.len()].copy_from_slice(chunk);
+        h = finish((h ^ u64::from_le_bytes(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    }
+    h
+}
+
+/// The hash of an ID of `n <= 16` bytes whose bytes, zero-padded, are `lo` and `hi`.
+#[inline(always)]
+pub fn mix16(lo: u64, hi: u64, n: usize) -> u64 {
+    finish((lo ^ hi.rotate_left(29) ^ (n as u64) << 56).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ hi)
+}
 
 #[inline(always)]
-fn decode(code: u64) -> u8 {
-    ((code & 0x1F) | ((code & 0x20) << 1) | 0x20) as u8
-}
-
-/// The 54-bit order-preserving key of a regular ID, or `None`.
-#[inline]
-pub fn key9(b: &[u8]) -> Option<u64> {
-    let n = b.len();
-    if n == 0 || n > 9 {
-        return None;
-    }
-    let mut k = 0u64;
-    let mut i = 0;
-    while i < n {
-        let v = CODE[b[i] as usize] as u64;
-        if v == 0 {
-            return None;
-        }
-        k |= v << (6 * (8 - i));
-        i += 1;
-    }
-    Some(k)
-}
-
-pub fn key9_decode(k: u64, out: &mut Vec<u8>) {
-    for i in 0..9 {
-        let v = (k >> (6 * (8 - i))) & 63;
-        if v == 0 {
-            break;
-        }
-        out.push(decode(v));
-    }
-}
-
-/// The 48-bit key of a regular event ID (`e` then up to 8 of `[0-9a-z]`), or `None`.
-#[inline]
-pub fn event_key(b: &[u8]) -> Option<u64> {
-    let n = b.len();
-    if n == 0 || n > 9 || b[0] != b'e' {
-        return None;
-    }
-    let mut k = 0u64;
-    let mut i = 1;
-    while i < n {
-        let v = CODE[b[i] as usize] as u64;
-        if v == 0 {
-            return None;
-        }
-        k |= v << (6 * (i - 1));
-        i += 1;
-    }
-    Some(k)
+fn finish(mut h: u64) -> u64 {
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^ (h >> 32)
 }
 
 /// Interns irregular IDs. Rare by construction, so one lock is fine.
@@ -118,19 +119,20 @@ impl Dict {
     }
 }
 
-/// Keys for user IDs and click IDs: regular 54-bit keys or interned.
+/// Keys for one kind of ID (users: prefix `u`; clicks: prefix `k`).
 pub struct KeySpace {
+    pub prefix: u8,
     pub dict: Dict,
 }
 
 impl KeySpace {
-    pub fn new() -> Self {
-        KeySpace { dict: Dict::new() }
+    pub fn new(prefix: u8) -> Self {
+        KeySpace { prefix, dict: Dict::new() }
     }
 
     #[inline]
     pub fn key(&self, b: &[u8]) -> u64 {
-        match key9(b) {
+        match raw_key(b, self.prefix) {
             Some(k) => k,
             None => IRREGULAR | self.dict.intern(b),
         }
@@ -138,7 +140,8 @@ impl KeySpace {
 
     pub fn bytes(&self, k: u64, out: &mut Vec<u8>) {
         if k & IRREGULAR == 0 {
-            key9_decode(k, out);
+            out.push(self.prefix);
+            out.extend_from_slice(&k.to_be_bytes()[..raw_len(k)]);
         } else {
             out.extend_from_slice(&self.dict.get(k & !IRREGULAR));
         }

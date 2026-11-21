@@ -4,6 +4,7 @@
 /expected/
 /official/
 /.toolchain/
+/.local/
 /.venv/
 /bench/results/
 /bench/prof-disasm.txt
