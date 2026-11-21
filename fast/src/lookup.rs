@@ -6,7 +6,7 @@ use crate::util::{for_each_line, parse_ts, split};
 
 /// IDs of the form `<prefix><n>` with no leading zero and `n` below this go to a
 /// direct-indexed table; everything else to a hash map.
-const DIRECT_LIMIT: usize = 1 << 22;
+pub const DIRECT_LIMIT: usize = 1 << 22;
 
 #[inline]
 fn canonical(b: &[u8], prefix: &[u8]) -> Option<usize> {

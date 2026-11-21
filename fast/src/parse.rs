@@ -1,53 +1,378 @@
 //! Chunk parsers: links -> union-find, clicks -> person partitions,
 //! events -> event-id partitions (deduplicated in pass 2).
 //!
+//! Every line is first tried on a SIMD fast path that only accepts lines it
+//! understands completely (field count, quoting, regular IDs, timestamp forms
+//! it can decide). Anything else goes to the scalar functions, which implement
+//! the rules literally. Both paths emit the same records.
+//!
 //! Record layouts (64-bit words):
 //!   event   w0 = event_key(43) << 21 | ingest_rel_seconds(21)
-//!           w1 = valid(1) | purchase(1) | 0(4) | person(27) | ts_rel_ms(31)
+//!           w1 = valid(1) | purchase(1) | 0(4) | user_slot(27) | ts_rel_ms(31)
 //!           a valid purchase is followed by a second record: (price << 32 | category, 0)
 //!   click   w0 = person_local(12) | ts_rel_ms(31) | campaign(21)
 //!           w1 = click key (order-preserving, see ids.rs)
+//!
+//! 256-bit vectors only: on Cascade Lake even light 512-bit use lowers the
+//! core's frequency licence.
 
+use core::arch::x86_64::*;
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::ids::{event_key, EVENT_IRREGULAR};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
-use crate::util::{for_each_line, parse_price, parse_ts, split, DAY_MS};
+use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
 use crate::{Chunk, Ctx};
 
 pub const VALID: u64 = 1 << 63;
 pub const PURCHASE: u64 = 1 << 62;
 pub const INGEST_BITS: u32 = 21;
 pub const INGEST_MAX: i64 = (1 << INGEST_BITS) - 1;
-pub const PERSON_BITS: u32 = 27;
+pub const SLOT_BITS: u32 = 27;
 pub const TS_MASK: u64 = (1 << 31) - 1;
 pub const LOCAL_BITS: u32 = 12;
 pub const CAMPAIGN_BITS: u32 = 21;
+
+/// Bytes that must be readable after a line start for the fast paths.
+const MARGIN: usize = 256;
+/// Lines this close to the file start use the scalar path (backward loads).
+const HEAD: usize = 16;
 
 #[inline(always)]
 pub fn event_hash(ek: u64) -> u64 {
     ek.wrapping_mul(0xD6E8_FEB8_6659_FD93)
 }
 
-pub fn links_chunk(ctx: &Ctx, ch: &Chunk) {
-    let file = &ctx.files[ch.file as usize];
-    for_each_line(file.slice(), ch.start, ch.end, |line| {
-        if let Some([a, b]) = split::<2>(line) {
-            if a.is_empty() || b.is_empty() {
-                return;
+// ------------------------------------------------------------------ dates
+
+const BAD_DAY: i32 = i32::MIN;
+
+/// Day numbers for every valid date of three years around the window, indexed
+/// by `month * 32 + day`. Timestamps in other years go to the scalar parser.
+pub struct DateTab {
+    years: [u32; 3],
+    days: [[i32; 512]; 3],
+}
+
+impl DateTab {
+    pub fn new(ws: i64) -> DateTab {
+        let (y, _, _) = civil_from_days(ws.div_euclid(DAY_MS));
+        // Unset years get distinct values no ASCII year can equal.
+        let mut t = DateTab { years: [0xFFFF_FF00, 0xFFFF_FF01, 0xFFFF_FF02], days: [[BAD_DAY; 512]; 3] };
+        for k in 0..3 {
+            let yy = y - 1 + k as i64;
+            if !(0..=9999).contains(&yy) {
+                continue;
             }
-            let sa = ctx.table.insert(ctx.users.key(a));
-            let sb = ctx.table.insert(ctx.users.key(b));
-            if sa != sb {
-                ctx.table.union(sa, sb, |x, y| ctx.users.less(x, y));
+            let s = format!("{yy:04}");
+            t.years[k] = u32::from_le_bytes(s.as_bytes().try_into().unwrap());
+            for m in 1..=12 {
+                for d in 1..=days_in_month(yy, m) {
+                    t.days[k][(m * 32 + d) as usize] = days_from_civil(yy, m, d) as i32;
+                }
             }
         }
-    });
+        t
+    }
+}
+
+/// Parses `YYYY-MM-DDTHH:MM:SS` at `a` (19 bytes; byte 19 is not looked at).
+/// Returns (shape ok, year in table, calendar and clock values valid, epoch seconds).
+#[inline(always)]
+unsafe fn datetime(dt: &DateTab, a: *const u8) -> (bool, bool, bool, i64) {
+    let y = (a as *const u32).read_unaligned();
+    let e0 = y == dt.years[0];
+    let e1 = y == dt.years[1];
+    let e2 = y == dt.years[2];
+    let yi = e1 as usize + 2 * e2 as usize;
+    let v = _mm_loadu_si128(a.add(4) as *const __m128i);
+    // "-MM-DDTHH:MM:SS?" minus the expected separators / '0'
+    let pattern = _mm_setr_epi8(
+        b'-' as i8, 48, 48, b'-' as i8, 48, 48, b'T' as i8, 48, 48, b':' as i8, 48, 48, b':' as i8, 48, 48, 0,
+    );
+    let limit = _mm_setr_epi8(0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1);
+    let t = _mm_sub_epi8(v, pattern);
+    let shape = _mm_cmple_epu8_mask(t, limit) == 0xFFFF;
+    let digits = _mm_shuffle_epi8(t, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
+    // 16-bit lanes: month, day, hour, minute, second
+    let pairs = _mm_maddubs_epi16(digits, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
+    let over = _mm_cmpgt_epi16_mask(pairs, _mm_setr_epi16(12, 31, 23, 59, 59, i16::MAX, i16::MAX, i16::MAX)) != 0;
+    // 32-bit lanes: month * 32 + day, hour * 3600 + minute * 60, second
+    let q = _mm_madd_epi16(pairs, _mm_setr_epi16(32, 1, 3600, 60, 1, 0, 0, 0));
+    let di = _mm_cvtsi128_si32(q) as usize & 511;
+    let sod = (_mm_extract_epi32::<1>(q) + _mm_extract_epi32::<2>(q)) as i64;
+    let days = *dt.days.get_unchecked(yi).get_unchecked(di);
+    (shape, e0 | e1 | e2, !over & (days != BAD_DAY), days as i64 * 86_400 + sod)
+}
+
+/// The value of the `n` (1 to 16) ASCII digits that end at `end`.
+/// Returns (all digits, value).
+#[inline(always)]
+unsafe fn digits16(end: *const u8, n: usize) -> (bool, u64) {
+    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let t = _mm_sub_epi8(v, _mm_set1_epi8(48));
+    let lm = (0xFFFFu32 << (16 - n)) as u16;
+    let ok = _mm_cmplt_epu8_mask(t, _mm_set1_epi8(10));
+    let d = _mm_maskz_mov_epi8(lm, t);
+    let a = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
+    let b = _mm_madd_epi16(a, _mm_set1_epi32(0x0001_0064));
+    let c = _mm_packus_epi32(b, b);
+    let e = _mm_madd_epi16(c, _mm_set1_epi32(0x0001_2710));
+    let x = _mm_cvtsi128_si64(e) as u64;
+    (ok & lm == lm, (x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32))
+}
+
+/// A `ts` field of `n` bytes at `a`. Returns (cannot decide here, valid, epoch ms).
+#[inline(always)]
+unsafe fn timestamp(dt: &DateTab, a: *const u8, n: usize) -> (bool, bool, i64) {
+    let (shape, known, cal, secs) = datetime(dt, a);
+    let is20 = n == 20;
+    let is25 = n == 25;
+    let isdt = is20 | is25;
+    let isnum = n.wrapping_sub(1) < 16;
+    let (digits, value) = digits16(a.add(n), (n.wrapping_sub(1) & 15) + 1);
+    let mut suffix = *a.add(19) == b'Z';
+    let mut off = 0i64;
+    if is25 {
+        let s = *a.add(19);
+        let h1 = (*a.add(20)).wrapping_sub(b'0') as i64;
+        let h2 = (*a.add(21)).wrapping_sub(b'0') as i64;
+        let m1 = (*a.add(23)).wrapping_sub(b'0') as i64;
+        let m2 = (*a.add(24)).wrapping_sub(b'0') as i64;
+        let (oh, om) = (h1 * 10 + h2, m1 * 10 + m2);
+        suffix = ((s == b'+') | (s == b'-'))
+            & (h1 <= 9)
+            & (h2 <= 9)
+            & (m1 <= 9)
+            & (m2 <= 9)
+            & (*a.add(22) == b':')
+            & (oh <= 23)
+            & (om <= 59);
+        off = (oh * 60 + om) * 60_000;
+        if s == b'-' {
+            off = -off;
+        }
+    }
+    // A 20- or 25-byte field that is not shaped like a date may still be all
+    // digits (F3), and longer digit strings need 64-bit care: scalar path.
+    let unsure = (isdt & (!shape | !known)) | (!isdt & !isnum & (n != 0));
+    let valid = (isdt & shape & known & cal & suffix) | (isnum & digits);
+    let ms = if isdt { secs * 1000 - off } else { value as i64 };
+    (unsure, valid, ms)
+}
+
+// ------------------------------------------------------------------ ids
+
+/// Character codes of 16 bytes: 1-10 for digits, 11-36 for lower-case letters,
+/// 0 elsewhere; and the mask of bytes that have a code.
+#[inline(always)]
+unsafe fn codes16(a: *const u8) -> (__m128i, u32) {
+    let v = _mm_loadu_si128(a as *const __m128i);
+    let d = _mm_sub_epi8(v, _mm_set1_epi8(0x30));
+    let isd = _mm_cmplt_epu8_mask(d, _mm_set1_epi8(10));
+    let l = _mm_sub_epi8(v, _mm_set1_epi8(0x61));
+    let isl = _mm_cmplt_epu8_mask(l, _mm_set1_epi8(26));
+    let c = _mm_maskz_add_epi8(isd, d, _mm_set1_epi8(1));
+    let c = _mm_mask_add_epi8(c, isl, l, _mm_set1_epi8(11));
+    (c, (isd | isl) as u32)
+}
+
+/// The 54-bit key of a regular ID of `n` bytes at `a` (see ids::key9).
+/// Returns (regular, key). `n` may be anything; only 1 to 9 can be regular.
+#[inline(always)]
+unsafe fn key9_fast(a: *const u8, n: usize) -> (bool, u64) {
+    let (c, ok) = codes16(a);
+    let lm = (1u32 << (n & 15)).wrapping_sub(1);
+    let c = _mm_maskz_mov_epi8(lm as u16, c);
+    let p = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140));
+    let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_1000));
+    let x = _mm_cvtsi128_si64(q) as u64;
+    let c8 = _mm_extract_epi8::<8>(c) as u64;
+    let key = (x & 0xFFFF_FFFF) << 30 | (x >> 32) << 6 | c8;
+    ((n.wrapping_sub(1) < 9) & (ok & lm == lm), key)
+}
+
+/// The 42-bit key of a regular event ID (see ids::event_key). Returns (regular, key).
+#[inline(always)]
+unsafe fn event_key_fast(a: *const u8, n: usize) -> (bool, u64) {
+    let (c, ok) = codes16(a);
+    let lm = (1u32 << (n & 15)).wrapping_sub(1);
+    let c = _mm_srli_si128::<1>(_mm_maskz_mov_epi8(lm as u16, c));
+    let p = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0125));
+    let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_0559));
+    let x = _mm_cvtsi128_si64(q) as u64;
+    let key = (x & 0xFFFF_FFFF) * 1_874_161 + (x >> 32);
+    ((n.wrapping_sub(1) < 9) & (*a == b'e') & (ok & lm == lm), key)
+}
+
+// ------------------------------------------------------------------ scanning
+
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    let v0 = _mm256_loadu_si256(p as *const __m256i);
+    let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let (comma, nl, quote) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+    let m = |c: __m256i| (_mm256_cmpeq_epi8_mask(v0, c) as u64) | (_mm256_cmpeq_epi8_mask(v1, c) as u64) << 32;
+    (m(comma), m(nl), m(quote))
+}
+
+/// Quote check for the fields ended by the delimiters in `d`, given the quote
+/// bits `q` of those fields. Returns (nonzero if malformed, per-field "is quoted" bits).
+///
+/// A field is quoted iff its first and last bytes are quotes; any other quote
+/// makes the line malformed. With `f` = fields starting with a quote and `l` =
+/// fields ending with one, the line is well-formed iff `f == l` and the number
+/// of quotes is exactly `2 * popcount(f)`.
+#[inline(always)]
+unsafe fn quotes(q: u64, d: u64) -> (u64, u64) {
+    let f = _pext_u64(q >> 1, d) << 1 | (q & 1);
+    let l = _pext_u64(q << 1, d);
+    ((f ^ l) | (q.count_ones() as u64 ^ 2 * f.count_ones() as u64), f)
+}
+
+#[inline(always)]
+fn first_line(data: &[u8], start: usize) -> Option<usize> {
+    find_newline(data, start.saturating_sub(1).min(data.len())).map(|i| i + 1)
+}
+
+// ------------------------------------------------------------------ links
+
+#[inline]
+fn link_line(ctx: &Ctx, line: &[u8]) {
+    if let Some([a, b]) = split::<2>(line) {
+        if a.is_empty() || b.is_empty() {
+            return;
+        }
+        let sa = ctx.table.insert(ctx.users.key(a));
+        let sb = ctx.table.insert(ctx.users.key(b));
+        if sa != sb {
+            ctx.table.union(sa, sb, |x, y| ctx.users.less(x, y));
+        }
+    }
+}
+
+/// Returns the bytes consumed, or 0 if the line needs the scalar path.
+#[inline(always)]
+unsafe fn link_fast(ctx: &Ctx, p: *const u8) -> usize {
+    let v = _mm256_loadu_si256(p as *const __m256i);
+    let cm = _mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(b',' as i8)) as u64;
+    let nm = _mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(b'\n' as i8)) as u64;
+    let qm = _mm256_cmpeq_epi8_mask(v, _mm256_set1_epi8(b'"' as i8)) as u64;
+    let nl = nm.trailing_zeros() as usize;
+    let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
+    let cmb = cm & below;
+    let c0 = cmb.trailing_zeros() as usize;
+    let (bad, f) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
+    if (nl >= 32) | (cmb == 0) | (cmb & cmb.wrapping_sub(1) != 0) | (bad != 0) {
+        return 0;
+    }
+    let (f0, f1) = ((f & 1) as usize, (f >> 1 & 1) as usize);
+    let (n0, n1) = (c0 - 2 * f0, nl - c0 - 1 - 2 * f1);
+    if (n0 == 0) | (n1 == 0) {
+        return nl + 1;
+    }
+    let (r0, k0) = key9_fast(p.add(f0), n0);
+    let (r1, k1) = key9_fast(p.add(c0 + 1 + f1), n1);
+    if !(r0 & r1) {
+        return 0;
+    }
+    let sa = ctx.table.insert(k0);
+    let sb = ctx.table.insert(k1);
+    if sa != sb {
+        // Roots may be irregular IDs inserted by the scalar path: full comparison.
+        ctx.table.union(sa, sb, |x, y| ctx.users.less(x, y));
+    }
+    nl + 1
+}
+
+pub fn links_chunk(ctx: &Ctx, ch: &Chunk) {
+    let file = &ctx.files[ch.file as usize];
+    let data = file.slice();
+    let len = data.len();
+    if let Some(mut pos) = first_line(data, ch.start) {
+        let fast_end = if ctx.scalar_only { 0 } else { len.saturating_sub(MARGIN) };
+        while pos < ch.end {
+            if pos < fast_end {
+                let used = unsafe { link_fast(ctx, data.as_ptr().add(pos)) };
+                if used != 0 {
+                    pos += used;
+                    continue;
+                }
+            }
+            let e = find_newline(data, pos).unwrap_or(len);
+            link_line(ctx, &data[pos..e]);
+            pos = e + 1;
+        }
+    }
     file.release(ch.start, ch.end);
 }
 
-#[inline]
+// ------------------------------------------------------------------ events
+
+/// An event waiting for its user-table slot (prefetched when queued).
+#[derive(Clone, Copy)]
+struct PendingEvent {
+    w0: u64,
+    w1: u64,
+    key: u64,
+    extra: u64,
+    part: u32,
+}
+
+const RING: usize = 8;
+
+struct EventRing {
+    buf: [PendingEvent; RING],
+    at: usize,
+}
+
+impl EventRing {
+    fn new() -> EventRing {
+        EventRing { buf: [PendingEvent { w0: 0, w1: 0, key: 0, extra: 0, part: 0 }; RING], at: 0 }
+    }
+
+    #[inline(always)]
+    fn emit(ctx: &Ctx, d: &mut PartWriter, e: &PendingEvent) {
+        if e.key != 0 {
+            let slot = ctx.table.insert(e.key) as u64;
+            d.push2(&ctx.pool, e.part as usize, e.w0, e.w1 | slot << 31);
+            if e.w1 & PURCHASE != 0 {
+                d.push2(&ctx.pool, e.part as usize, e.extra, 0);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, ctx: &Ctx, d: &mut PartWriter, e: PendingEvent) {
+        ctx.table.prefetch(e.key);
+        let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, e);
+        self.at = (self.at + 1) & (RING - 1);
+        Self::emit(ctx, d, &old);
+    }
+
+    fn drain(&mut self, ctx: &Ctx, d: &mut PartWriter) {
+        for i in 0..RING {
+            let e = self.buf[(self.at + i) & (RING - 1)];
+            Self::emit(ctx, d, &e);
+            self.buf[(self.at + i) & (RING - 1)].key = 0;
+        }
+    }
+}
+
+#[inline(always)]
+fn ingest_field(ctx: &Ctx, ingest_s: i64) -> u64 {
+    let rel = ingest_s - ctx.ingest_base_s;
+    if rel < 0 {
+        // Too far before the window to order exactly in 21 bits: leave the
+        // fast pipeline altogether (never happens with generated data).
+        ctx.bail.store(true, Relaxed);
+    }
+    rel.clamp(0, INGEST_MAX) as u64
+}
+
+/// The literal rules for one event line.
+#[inline(never)]
 fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
     let Some(f) = split::<7>(line) else { return };
     if f[0].is_empty() {
@@ -60,13 +385,7 @@ fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
         Some(k) => k,
         None => EVENT_IRREGULAR | ctx.event_dict.intern(f[0]),
     };
-    let ingest_rel = ingest.div_euclid(1000) - ctx.ingest_base_s;
-    if ingest_rel < 0 {
-        // Too far before the window to order exactly in 21 bits: leave the
-        // fast path altogether (never happens with generated data).
-        ctx.bail.store(true, Relaxed);
-    }
-    let w0 = ek << INGEST_BITS | ingest_rel.clamp(0, INGEST_MAX) as u64;
+    let w0 = ek << INGEST_BITS | ingest_field(ctx, ingest.div_euclid(1000));
     let part = (event_hash(ek) >> 40) as usize & ctx.pd_mask;
 
     let mut valid = !f[1].is_empty() && !f[5].is_empty();
@@ -97,9 +416,8 @@ fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
         d.push2(&ctx.pool, part, w0, 0);
         return;
     }
-    let slot = ctx.table.insert(ctx.users.key(f[1]));
-    let person = ctx.table.person(slot) as u64;
-    let w1 = VALID | person << 31 | (ts - ctx.t0) as u64;
+    let slot = ctx.table.insert(ctx.users.key(f[1])) as u64;
+    let w1 = VALID | slot << 31 | (ts - ctx.t0) as u64;
     if purchase {
         let cat = ctx.products.category(f[5]) as u64;
         d.push2(&ctx.pool, part, w0, w1 | PURCHASE);
@@ -109,13 +427,132 @@ fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
     }
 }
 
+/// Returns the bytes consumed, or 0 if the line needs the scalar path.
+#[inline(always)]
+unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *const u8) -> usize {
+    // Window 1: event_id, user_id, ts and their three commas.
+    let (cm, nm, qm) = masks64(p);
+    let c0 = cm.trailing_zeros() as usize;
+    let cm1 = cm & cm.wrapping_sub(1);
+    let c1 = cm1.trailing_zeros() as usize;
+    let cm2 = cm1 & cm1.wrapping_sub(1);
+    let c2 = cm2.trailing_zeros() as usize;
+    let cm3 = cm2 & cm2.wrapping_sub(1);
+    // Three commas, and no newline before the third.
+    let mut bad = (nm.trailing_zeros() as usize <= c2) as u64;
+    let (qbad, fa) = quotes(qm & 1u64.wrapping_shl(c2 as u32).wrapping_sub(1), cm ^ cm3);
+    bad |= qbad;
+
+    // Window 2: ingest_ts, event_type, product_id, price_cents and the newline.
+    let p2 = p.add((c2 & 63) + 1);
+    let (cm, nm, qm) = masks64(p2);
+    let nl = nm.trailing_zeros() as usize;
+    let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
+    let cmb = cm & below;
+    let c3 = cmb.trailing_zeros() as usize;
+    let cmb1 = cmb & cmb.wrapping_sub(1);
+    let c4 = cmb1.trailing_zeros() as usize;
+    let cmb2 = cmb1 & cmb1.wrapping_sub(1);
+    let c5 = cmb2.trailing_zeros() as usize;
+    let cmb3 = cmb2 & cmb2.wrapping_sub(1);
+    // The newline is in the window, with exactly three commas before it.
+    bad |= ((nl == 64) | (cmb2 == 0) | (cmb3 != 0)) as u64;
+    let (qbad, fb) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
+    bad |= qbad;
+    if bad != 0 {
+        return 0;
+    }
+
+    let q = |f: u64, i: u32| (f >> i & 1) as usize;
+    let (q0, q1, q2) = (q(fa, 0), q(fa, 1), q(fa, 2));
+    let (q3, q4, q5, q6) = (q(fb, 0), q(fb, 1), q(fb, 2), q(fb, 3));
+    let (a0, n0) = (p.add(q0), c0 - 2 * q0);
+    let (a1, n1) = (p.add(c0 + 1 + q1), c1 - c0 - 1 - 2 * q1);
+    let (a2, n2) = (p.add(c1 + 1 + q2), c2 - c1 - 1 - 2 * q2);
+    let (a3, n3) = (p2.add(q3), c3 - 2 * q3);
+    let (a4, n4) = (p2.add(c3 + 1 + q4), c4 - c3 - 1 - 2 * q4);
+    let (a5, n5) = (p2.add(c4 + 1 + q5), c5 - c4 - 1 - 2 * q5);
+    let (a6, n6) = (p2.add(c5 + 1 + q6), nl - c5 - 1 - 2 * q6);
+    let used = c2 + 1 + nl + 1;
+
+    let dt = &ctx.dates;
+    let (ek_ok, ek) = event_key_fast(a0, n0);
+    let (uk_ok, uk) = key9_fast(a1, n1);
+    let (ts_unsure, ts_valid, ts) = timestamp(dt, a2, n2);
+    let (i_shape, i_known, i_cal, ingest_s) = datetime(dt, a3);
+    let ingest_ok = (n3 == 20) & i_shape & i_known & i_cal & (*a3.add(19) == b'Z');
+    // Scalar path: an empty or irregular event_id, an irregular user_id, a
+    // timestamp this path cannot decide, an ingest_ts that is not plain F1.
+    if !ek_ok | !(uk_ok | (n1 == 0)) | ts_unsure | !ingest_ok {
+        return 0;
+    }
+
+    let w = (a4 as *const u64).read_unaligned();
+    let purchase = (n4 == 8) & (w == u64::from_le_bytes(*b"purchase"));
+    let view = (n4 == 4) & ((w as u32 == u32::from_le_bytes(*b"view")) | (w as u32 == u32::from_le_bytes(*b"cart")));
+    let mut valid = (n1 != 0)
+        & (n5 != 0)
+        & (purchase | view)
+        & ts_valid
+        & (ts >= ctx.ws)
+        & (ts < ctx.we)
+        & (ingest_s * 1000 - ts <= DAY_MS);
+    let w0 = ek << INGEST_BITS | ingest_field(ctx, ingest_s);
+    let part = (event_hash(ek) >> 40) as usize & ctx.pd_mask;
+    let mut extra = 0u64;
+    let mut w1 = VALID | (ts.wrapping_sub(ctx.t0) as u64 & TS_MASK);
+    if purchase {
+        match parse_price(std::slice::from_raw_parts(a6, n6)) {
+            Some(price) => {
+                let cat = ctx.products.category(std::slice::from_raw_parts(a5, n5)) as u64;
+                extra = (price as u64) << 32 | cat;
+                w1 |= PURCHASE;
+            }
+            None => valid = false,
+        }
+    }
+    if valid {
+        ring.push(ctx, d, PendingEvent { w0, w1, key: uk, extra, part: part as u32 });
+    } else {
+        d.push2(&ctx.pool, part, w0, 0);
+    }
+    used
+}
+
 pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, ch: &Chunk) {
     let file = &ctx.files[ch.file as usize];
-    for_each_line(file.slice(), ch.start, ch.end, |line| event_line(ctx, d, line));
+    let data = file.slice();
+    let len = data.len();
+    if let Some(mut pos) = first_line(data, ch.start) {
+        let fast_end = if ctx.scalar_only { 0 } else { len.saturating_sub(MARGIN) };
+        let mut ring = EventRing::new();
+        while pos < ch.end {
+            if (pos >= HEAD) & (pos < fast_end) {
+                let used = unsafe { event_fast(ctx, d, &mut ring, data.as_ptr().add(pos)) };
+                if used != 0 {
+                    pos += used;
+                    continue;
+                }
+            }
+            let e = find_newline(data, pos).unwrap_or(len);
+            event_line(ctx, d, &data[pos..e]);
+            pos = e + 1;
+        }
+        ring.drain(ctx, d);
+    }
     file.release(ch.start, ch.end);
 }
 
-#[inline]
+// ------------------------------------------------------------------ clicks
+
+#[inline(always)]
+fn click_record(person: u64, ts_rel: u64, campaign: u64) -> (usize, u64) {
+    let local = person & ((1 << LOCAL_BITS) - 1);
+    ((person >> LOCAL_BITS) as usize, local << 52 | ts_rel << CAMPAIGN_BITS | campaign)
+}
+
+/// The literal rules for one click line.
+#[inline(never)]
 fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
     let Some(f) = split::<4>(line) else { return };
     if f[0].is_empty() || f[1].is_empty() {
@@ -131,13 +568,132 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
     };
     let slot = ctx.table.insert(ctx.users.key(f[1]));
     let person = ctx.table.person(slot) as u64;
-    let local = person & ((1 << LOCAL_BITS) - 1);
-    let w0 = local << 52 | ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64;
-    c.push2(&ctx.pool, (person >> LOCAL_BITS) as usize, w0, ctx.clicks.key(f[0]));
+    let (part, w0) = click_record(person, (ts - ctx.t0) as u64, campaign as u64);
+    c.push2(&ctx.pool, part, w0, ctx.clicks.key(f[0]));
+}
+
+/// A click on its way through the two lookups: key -> slot -> person.
+#[derive(Clone, Copy)]
+struct PendingClick {
+    /// ts_rel << CAMPAIGN_BITS | campaign
+    tc: u64,
+    click: u64,
+    /// The user key, then (second stage) the slot. 0 = empty.
+    user: u64,
+}
+
+struct ClickRing {
+    a: [PendingClick; RING],
+    b: [PendingClick; RING],
+    at: usize,
+}
+
+impl ClickRing {
+    fn new() -> ClickRing {
+        let e = PendingClick { tc: 0, click: 0, user: 0 };
+        ClickRing { a: [e; RING], b: [e; RING], at: 0 }
+    }
+
+    #[inline(always)]
+    fn step(&mut self, ctx: &Ctx, c: &mut PartWriter, new: PendingClick) {
+        if new.user != 0 {
+            ctx.table.prefetch(new.user);
+        }
+        let i = self.at;
+        self.at = (i + 1) & (RING - 1);
+        let mut mid = std::mem::replace(unsafe { self.a.get_unchecked_mut(i) }, new);
+        if mid.user != 0 {
+            let slot = ctx.table.insert(mid.user);
+            ctx.table.prefetch_person(slot);
+            mid.user = slot as u64 + 1;
+        }
+        let old = std::mem::replace(unsafe { self.b.get_unchecked_mut(i) }, mid);
+        if old.user != 0 {
+            let person = ctx.table.person((old.user - 1) as u32) as u64;
+            let local = person & ((1 << LOCAL_BITS) - 1);
+            c.push2(&ctx.pool, (person >> LOCAL_BITS) as usize, local << 52 | old.tc, old.click);
+        }
+    }
+
+    fn drain(&mut self, ctx: &Ctx, c: &mut PartWriter) {
+        for _ in 0..2 * RING {
+            self.step(ctx, c, PendingClick { tc: 0, click: 0, user: 0 });
+        }
+    }
+}
+
+/// Returns the bytes consumed, or 0 if the line needs the scalar path.
+#[inline(always)]
+unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *const u8) -> usize {
+    let (cm, nm, qm) = masks64(p);
+    let nl = nm.trailing_zeros() as usize;
+    let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
+    let cmb = cm & below;
+    let c0 = cmb.trailing_zeros() as usize;
+    let cmb1 = cmb & cmb.wrapping_sub(1);
+    let c1 = cmb1.trailing_zeros() as usize;
+    let cmb2 = cmb1 & cmb1.wrapping_sub(1);
+    let c2 = cmb2.trailing_zeros() as usize;
+    let cmb3 = cmb2 & cmb2.wrapping_sub(1);
+    let (qbad, f) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
+    if (nl == 64) | (cmb2 == 0) | (cmb3 != 0) | (qbad != 0) {
+        return 0;
+    }
+    let q = |i: u32| (f >> i & 1) as usize;
+    let (q0, q1, q2, q3) = (q(0), q(1), q(2), q(3));
+    let (a0, n0) = (p.add(q0), c0 - 2 * q0);
+    let (a1, n1) = (p.add(c0 + 1 + q1), c1 - c0 - 1 - 2 * q1);
+    let (a2, n2) = (p.add(c1 + 1 + q2), c2 - c1 - 1 - 2 * q2);
+    let (a3, n3) = (p.add(c2 + 1 + q3), nl - c2 - 1 - 2 * q3);
+    let used = nl + 1;
+    if (n0 == 0) | (n1 == 0) {
+        return used;
+    }
+    let (ck_ok, ck) = key9_fast(a0, n0);
+    let (uk_ok, uk) = key9_fast(a1, n1);
+    let (ts_unsure, ts_valid, ts) = timestamp(&ctx.dates, a3, n3);
+    if !ck_ok | !uk_ok | ts_unsure {
+        return 0;
+    }
+    // `c_<n>` without a leading zero goes straight to the table.
+    let (digits, number) = digits16(a2.add(n2), (n2.wrapping_sub(3) & 15) + 1);
+    let canonical = (n2.wrapping_sub(3) < 7)
+        & ((a2 as *const u16).read_unaligned() == u16::from_le_bytes(*b"c_"))
+        & digits
+        & (*a2.add(2) != b'0')
+        & (number < crate::lookup::DIRECT_LIMIT as u64);
+    let campaign = if canonical {
+        ctx.campaigns.index.by_number(number as usize)
+    } else {
+        ctx.campaigns.index.get(std::slice::from_raw_parts(a2, n2))
+    };
+    if (campaign != ABSENT) & ts_valid & (ts >= ctx.t0) & (ts < ctx.we) {
+        let tc = ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64;
+        ring.step(ctx, c, PendingClick { tc, click: ck, user: uk });
+    }
+    used
 }
 
 pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) {
     let file = &ctx.files[ch.file as usize];
-    for_each_line(file.slice(), ch.start, ch.end, |line| click_line(ctx, c, line));
+    let data = file.slice();
+    let len = data.len();
+    if let Some(mut pos) = first_line(data, ch.start) {
+        let fast_end = if ctx.scalar_only { 0 } else { len.saturating_sub(MARGIN) };
+        let mut ring = ClickRing::new();
+        while pos < ch.end {
+            if (pos >= HEAD) & (pos < fast_end) {
+                let used = unsafe { click_fast(ctx, c, &mut ring, data.as_ptr().add(pos)) };
+                if used != 0 {
+                    pos += used;
+                    continue;
+                }
+            }
+            let e = find_newline(data, pos).unwrap_or(len);
+            click_line(ctx, c, &data[pos..e]);
+            pos = e + 1;
+        }
+        ring.drain(ctx, c);
+    }
     file.release(ch.start, ch.end);
 }

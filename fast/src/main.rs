@@ -67,6 +67,9 @@ pub struct Ctx {
     pub users: KeySpace,
     pub clicks: KeySpace,
     pub event_dict: Dict,
+    pub dates: parse::DateTab,
+    /// Debug switch: send every line through the scalar parsers.
+    pub scalar_only: bool,
     pub table: Table,
     pub pool: BlockPool,
     pub files: Vec<FileMap>,
@@ -200,6 +203,8 @@ fn worker(ctx: &Ctx, tid: usize) {
         }
         s.finalize(&ctx.pool);
         ps.finalize(&ctx.pool);
+        // Never free: unmapping costs time and the process is about to exit.
+        std::mem::forget(sc);
     }
     ctx.sync("deduplicated");
 
@@ -214,6 +219,7 @@ fn worker(ctx: &Ctx, tid: usize) {
     }
     write_user_daily(ctx, &sc.rows, tid);
     unsafe { *ctx.acc[tid].0.get() = std::mem::take(&mut sc.acc) };
+    std::mem::forget(sc);
     ctx.sync("sessions built, user_daily written");
 }
 
@@ -250,6 +256,8 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
     ];
     let path = ctx.out_dir.join("user_daily").join(format!("part-{tid:03}.parquet"));
     parquet::write(&path, n, &columns).expect("write user_daily");
+    std::mem::forget(columns);
+    std::mem::forget((ids, cats, levels, valid));
 }
 
 fn write_campaign_daily(ctx: &Ctx) {
@@ -370,7 +378,7 @@ fn main() {
     let fits = ws < we
         && we - t0 < (1i64 << 31)
         && parse::INGEST_MAX - (window_s + 86_400 + 2) >= 86_400
-        && cap < (1 << parse::PERSON_BITS)
+        && cap < (1 << parse::SLOT_BITS)
         && campaigns.ids.len() < (1 << parse::CAMPAIGN_BITS);
     if !fits {
         eprintln!("input does not fit the fast path: using the plain implementation");
@@ -392,6 +400,8 @@ fn main() {
         users: KeySpace::new(),
         clicks: KeySpace::new(),
         event_dict: Dict::new(),
+        dates: parse::DateTab::new(ws),
+        scalar_only: std::env::var("SCALAR").is_ok(),
         table: Table::new(cap),
         pool: BlockPool::new(pool_blocks),
         files,

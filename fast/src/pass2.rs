@@ -6,7 +6,7 @@
 //! event survive. `w0 = key << 21 | ingest`, so comparing `w0` of two copies of
 //! one event compares their ingest times.
 
-use crate::parse::{event_hash, INGEST_BITS, LOCAL_BITS, PERSON_BITS, PURCHASE, TS_MASK};
+use crate::parse::{event_hash, INGEST_BITS, LOCAL_BITS, PURCHASE, SLOT_BITS, TS_MASK};
 use crate::part::PartWriter;
 use crate::Ctx;
 
@@ -15,6 +15,31 @@ pub struct Scratch {
     recs: Vec<u64>,
     tab: Vec<u32>,
     dead: Vec<u8>,
+}
+
+/// A survivor waiting for its person (the slot's root), prefetched when queued.
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    ts: u64,
+    extra: u64,
+    slot: u32,
+    /// 0 = empty, 1 = event, 2 = purchase
+    kind: u32,
+}
+
+const RING: usize = 16;
+
+#[inline(always)]
+fn emit(ctx: &Ctx, s: &mut PartWriter, ps: &mut PartWriter, e: &Pending) {
+    if e.kind != 0 {
+        let person = ctx.table.person(e.slot) as u64;
+        let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | e.ts;
+        let sp = (person >> LOCAL_BITS) as usize;
+        s.push1(&ctx.pool, sp, rec);
+        if e.kind == 2 {
+            ps.push2(&ctx.pool, sp, rec, e.extra);
+        }
+    }
 }
 
 pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter, p: usize) {
@@ -67,19 +92,28 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter,
         i += 1 + (w1 & PURCHASE != 0) as usize;
     }
 
+    let mut ring = [Pending::default(); RING];
+    let mut at = 0;
     let mut i = 0;
     while i < n {
         let w1 = recs[2 * i + 1];
         let purchase = w1 & PURCHASE != 0;
         if dead[i] == 0 && (w1 as i64) < 0 {
-            let person = (w1 >> 31) & ((1 << PERSON_BITS) - 1);
-            let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | (w1 & TS_MASK);
-            let sp = (person >> LOCAL_BITS) as usize;
-            s.push1(&ctx.pool, sp, rec);
-            if purchase {
-                ps.push2(&ctx.pool, sp, rec, recs[2 * i + 2]);
-            }
+            let slot = ((w1 >> 31) & ((1 << SLOT_BITS) - 1)) as u32;
+            ctx.table.prefetch_person(slot);
+            let new = Pending {
+                ts: w1 & TS_MASK,
+                extra: if purchase { recs[2 * i + 2] } else { 0 },
+                slot,
+                kind: 1 + purchase as u32,
+            };
+            let old = std::mem::replace(&mut ring[at], new);
+            at = (at + 1) & (RING - 1);
+            emit(ctx, s, ps, &old);
         }
         i += 1 + purchase as usize;
+    }
+    for e in &ring {
+        emit(ctx, s, ps, e);
     }
 }
