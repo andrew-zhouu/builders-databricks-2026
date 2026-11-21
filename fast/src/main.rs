@@ -493,14 +493,17 @@ fn main() {
     let (ws, we) = lookup::manifest(&std::fs::read(data_dir.join("manifest.json")).expect("manifest.json"))
         .expect("manifest window");
 
+    // Test switch: tiny chunks put every kind of line on a chunk boundary.
+    let chunk_override: Option<usize> =
+        std::env::var("CHUNK_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0);
     let mut files: Vec<FileMap> = Vec::new();
     let mut link_chunks: Vec<Chunk> = Vec::new();
     let mut main_chunks: Vec<Chunk> = Vec::new();
     let mut bytes = [0usize; 3];
     for (kind, dir, step) in [
-        (FileKind::Links, "links", LINK_CHUNK),
-        (FileKind::Clicks, "clicks", CHUNK),
-        (FileKind::Events, "events", CHUNK),
+        (FileKind::Links, "links", chunk_override.unwrap_or(LINK_CHUNK)),
+        (FileKind::Clicks, "clicks", chunk_override.unwrap_or(CHUNK)),
+        (FileKind::Events, "events", chunk_override.unwrap_or(CHUNK)),
     ] {
         for path in list_csv(&data_dir.join(dir)) {
             let map = FileMap::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -566,7 +569,7 @@ fn main() {
         event_dict: Dict::new(),
         dates: parse::DateTab::new(ws),
         scalar_only: std::env::var("SCALAR").is_ok(),
-        prefetch_ahead: std::env::var("PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        prefetch_ahead: std::env::var("PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
         zap: std::env::var("NOZAP").is_err(),
         eager_lookups: std::env::var("EAGER_LOOKUPS").is_ok(),
         table: Table::new(cap),
