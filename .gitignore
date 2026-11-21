@@ -1,0 +1,11 @@
+# Local-only: datasets, outputs, toolchains, downloaded official materials
+/data/
+/out/
+/expected/
+/official/
+/.toolchain/
+/.venv/
+/bench/results/
+target/
+__pycache__/
+*.pyc
