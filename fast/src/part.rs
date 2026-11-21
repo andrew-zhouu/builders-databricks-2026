@@ -194,6 +194,17 @@ impl PartWriter {
         &self.pblocks[self.pstart[p] as usize..self.pstart[p + 1] as usize]
     }
 
+    /// Calls `f` with each run of words of partition `p`, in order.
+    #[inline(always)]
+    pub fn for_each_run(&self, pool: &BlockPool, p: usize, mut f: impl FnMut(&[u64])) {
+        let mut rem = self.words[p] as usize;
+        for &b in self.part_blocks(p) {
+            let n = rem.min(BLOCK_WORDS);
+            f(unsafe { std::slice::from_raw_parts(pool.ptr(b) as *const u64, n) });
+            rem -= n;
+        }
+    }
+
     /// Append every word of partition `p` to `out`.
     pub fn copy_part(&self, pool: &BlockPool, p: usize, out: &mut Vec<u64>) {
         let mut rem = self.words[p] as usize;

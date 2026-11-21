@@ -552,6 +552,12 @@ pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, ch: &Chunk) {
         let mut ring = EventRing::new();
         while pos < ch.end {
             if (pos >= HEAD) & (pos < fast_end) {
+                if ctx.prefetch_ahead != 0 {
+                    // The hardware streamer stops at page boundaries; reach past them.
+                    unsafe {
+                        _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + ctx.prefetch_ahead) as *const i8)
+                    };
+                }
                 let used = unsafe { event_fast(ctx, d, &mut ring, data.as_ptr().add(pos)) };
                 if used != 0 {
                     pos += used;
