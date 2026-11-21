@@ -369,9 +369,7 @@ fn worker(ctx: &Ctx, tid: usize) {
     // ---- parse clicks and events: straight to their person's partition, plus a trace per event
     {
         let c = unsafe { &mut *ctx.c[tid].0.get() };
-        let mut out = unsafe {
-            parse::EventOut { k: &mut *ctx.k[tid].0.get(), s: &mut *ctx.s[tid].0.get(), ps: &mut *ctx.psw[tid].0.get() }
-        };
+        let mut out = unsafe { parse::EventOut { k: &mut *ctx.k[tid].0.get(), ps: &mut *ctx.psw[tid].0.get() } };
         let mut t = ctx.now();
         loop {
             let i = ctx.next_main.fetch_add(1, Relaxed);
@@ -391,7 +389,6 @@ fn worker(ctx: &Ctx, tid: usize) {
             }
         }
         out.k.finalize(&ctx.pool);
-        out.s.finalize(&ctx.pool);
         out.ps.finalize(&ctx.pool);
         c.finalize(&ctx.pool);
         ctx.charge(P_FINALIZE, t);
@@ -401,17 +398,19 @@ fn worker(ctx: &Ctx, tid: usize) {
         return;
     }
 
-    // ---- dedup: settle the event IDs that occur more than once
+    // ---- dedup: settle the event IDs that occur more than once, and send the events to their people
     {
         let x = unsafe { &mut *ctx.x[tid].0.get() };
+        let s = unsafe { &mut *ctx.s[tid].0.get() };
         let mut sc = pass2::Scratch::default();
         loop {
             let p = ctx.next_d.fetch_add(1, Relaxed);
             if p >= ctx.pd {
                 break;
             }
-            pass2::run(ctx, &mut sc, x, p);
+            pass2::run(ctx, &mut sc, x, s, p);
         }
+        s.finalize(&ctx.pool);
         x.finish(ctx.ps);
         // Never free: unmapping costs time and the process is about to exit.
         std::mem::forget(sc);
@@ -508,9 +507,9 @@ fn bench(ctx: &Ctx) {
             }
             let a = prof::snap();
             let n = {
-                let [k, s, ps, c] = &mut w;
+                let [k, _, ps, c] = &mut w;
                 match kind {
-                    FileKind::Events => parse::events_chunk(ctx, &mut parse::EventOut { k, s, ps }, &ch),
+                    FileKind::Events => parse::events_chunk(ctx, &mut parse::EventOut { k, ps }, &ch),
                     FileKind::Clicks => parse::clicks_chunk(ctx, c, &ch),
                     FileKind::Links => parse::links_chunk(ctx, &ch),
                 }

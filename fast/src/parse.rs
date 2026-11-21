@@ -25,7 +25,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::ids::{event_hash, mix9, raw_key_fast};
+use crate::ids::{event_hash, hash9, raw_key_fast};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
@@ -33,9 +33,6 @@ use crate::{Chunk, Ctx};
 
 pub const PERSON_BITS: u32 = 27;
 pub const TS_MASK: u64 = (1 << 31) - 1;
-/// People per person partition, as bits of the person's number. 13 keeps the
-/// partition writers' buffers (64 bytes per partition and stream) and a
-/// partition's events both within the second-level cache at 60M events.
 pub const LOCAL_BITS: u32 = 13;
 /// A click's first word is `person_local | ts_rel_ms(31) | campaign`: the
 /// campaign gets the bits the other two leave.
@@ -44,6 +41,27 @@ pub const CAMPAIGN_BITS: u32 = 33 - LOCAL_BITS;
 pub const CLICK_SHIFT: u32 = 31 + CAMPAIGN_BITS;
 /// Marks a cancellation among event and purchase records.
 pub const CANCEL: u64 = 1 << (31 + LOCAL_BITS);
+
+/// The second word of a trace: what the parser did with the line. Zero for a
+/// line that failed validation (nothing was written for it); else `T_VALID`,
+/// `T_PURCHASE` if it is a purchase, four more bits of the event_id's hash,
+/// the person (27 bits from bit 31) and `ts_rel_ms` (31 bits).
+pub const T_VALID: u64 = 1 << 63;
+pub const T_PURCHASE: u64 = 1 << 62;
+
+/// The trace's second word for a valid event of `person` at `ts_rel`.
+#[inline(always)]
+pub fn trace_valid(h4: u64, person: u64, ts_rel: u64) -> u64 {
+    T_VALID | (h4 & 15) << 58 | person << 31 | ts_rel
+}
+
+/// From a valid trace's second word: the event's person partition and its
+/// event record (the word the parser wrote there).
+#[inline(always)]
+pub fn trace_record(w2: u64) -> (u32, u64) {
+    let person = w2 >> 31 & ((1 << PERSON_BITS) - 1);
+    ((person >> LOCAL_BITS) as u32, (person & ((1 << LOCAL_BITS) - 1)) << 31 | (w2 & TS_MASK))
+}
 
 /// Bytes that must be readable after a line start for the fast paths.
 const MARGIN: usize = 256;
@@ -54,8 +72,6 @@ const HEAD: usize = 16;
 pub struct EventOut<'a> {
     /// Traces, partitioned by event-ID hash.
     pub k: &'a mut PartWriter,
-    /// Events, partitioned by person.
-    pub s: &'a mut PartWriter,
     /// Purchases, partitioned by person.
     pub ps: &'a mut PartWriter,
 }
@@ -480,15 +496,18 @@ pub fn event_records(ctx: &Ctx, e: &Event) -> (usize, u64, u64) {
 #[inline(never)]
 fn event_line(ctx: &Ctx, out: &mut EventOut, line: &[u8], loc: u64) {
     let Some(e) = parse_event(ctx, line) else { return };
-    let (pk, trace) = trace_of(ctx, event_hash(e.id));
-    out.k.push1(&ctx.pool, pk, trace | loc);
+    let h = event_hash(e.id);
+    let (pk, trace) = trace_of(ctx, h);
+    let mut w2 = 0;
     if e.valid {
         let (sp, rec, extra) = event_records(ctx, &e);
-        out.s.push1(&ctx.pool, sp, rec);
+        w2 = trace_valid(h >> 40, (sp as u64) << LOCAL_BITS | rec >> 31, rec & TS_MASK);
         if e.purchase {
             out.ps.push2(&ctx.pool, sp, rec, extra);
+            w2 |= T_PURCHASE;
         }
     }
+    out.k.push2(&ctx.pool, pk, trace | loc, w2);
 }
 
 /// What the SIMD path made of one event line.
@@ -668,7 +687,8 @@ struct Stage {
     /// Bytes 0..7: the offsets of the line's six commas and its newline; byte
     /// 7: bit `k` is set if field `k` is quoted.
     sep: [u64; NB],
-    /// The trace word, and the trace partition.
+    /// The trace's first word; `pk` is its partition, with four more bits of
+    /// the hash from bit 16 (for the second word).
     trace: [u64; NB],
     /// The user's key; 0 = no user.
     key: [u64; NB],
@@ -863,9 +883,10 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         // The trace: a hash of the event_id's bytes after the first (1 to 9
         // bytes in all; see ids::event_hash).
         let n0 = ln(0);
-        let x = _bzhi_u64((at(0).add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
-        let h = mix9(x);
-        *st.pk.get_unchecked_mut(i) = (((h >> 32) * pd) >> 32) as u32;
+        let a0 = at(0);
+        let x = _bzhi_u64((a0.add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
+        let h = hash9(*a0, x);
+        *st.pk.get_unchecked_mut(i) = (((h >> 32) * pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16;
         *st.trace.get_unchecked_mut(i) = (h & fp_mask) << loc_bits | loc0.wrapping_add(p as u64);
 
         // The user: `u` and 1 to 8 ASCII bytes, none of them NUL, is its own
@@ -959,28 +980,32 @@ unsafe fn stage_more(ctx: &Ctx, st: &mut Stage, nmore: usize) {
     }
 }
 
-/// Every line leaves its trace; valid events go to their person. The user's
-/// slot was prefetched by `decode`.
+/// Every line leaves its trace, which for a valid event names its person (the
+/// user's slot was prefetched by `decode`) and time; pass 2 sends the event
+/// there once the repeats are settled. Purchases also leave their price and
+/// category with their person.
 #[inline(never)]
 unsafe fn stage_emit(ctx: &Ctx, out: &mut EventOut, st: &Stage, n: usize) {
-    let (kw, sw, pw) = (out.k.cursors(), out.s.cursors(), out.ps.cursors());
+    let (kw, pw) = (out.k.cursors(), out.ps.cursors());
     let (pool, table) = (&ctx.pool, &ctx.table);
     for i in 0..n {
         let fl = *st.flags.get_unchecked(i);
         if fl & F_DEAD != 0 {
             continue;
         }
-        out.k.push1_at(kw, pool, *st.pk.get_unchecked(i) as usize, *st.trace.get_unchecked(i));
-        if fl & F_VALID == 0 {
-            continue;
+        let pk = *st.pk.get_unchecked(i) as u64;
+        let mut w2 = 0;
+        if fl & F_VALID != 0 {
+            let person = table.person_at(*st.home.get_unchecked(i) as usize, *st.key.get_unchecked(i)) as u64;
+            let ts = *st.ts.get_unchecked(i) as u64;
+            w2 = trace_valid(pk >> 16, person, ts);
+            if fl & F_PURCHASE != 0 {
+                let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | ts;
+                out.ps.push2_at(pw, pool, (person >> LOCAL_BITS) as usize, rec, *st.extra.get_unchecked(i));
+                w2 |= T_PURCHASE;
+            }
         }
-        let person = table.person_at(*st.home.get_unchecked(i) as usize, *st.key.get_unchecked(i)) as u64;
-        let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | *st.ts.get_unchecked(i) as u64;
-        let sp = (person >> LOCAL_BITS) as usize;
-        out.s.push1_at(sw, pool, sp, rec);
-        if fl & F_PURCHASE != 0 {
-            out.ps.push2_at(pw, pool, sp, rec, *st.extra.get_unchecked(i));
-        }
+        out.k.push2_at(kw, pool, pk as usize & 0xFFFF, *st.trace.get_unchecked(i), w2);
     }
 }
 

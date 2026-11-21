@@ -66,8 +66,6 @@ fn id_record(key: u64, out: &mut [u8; 16]) -> usize {
 /// An event record is `person_local(12) | ts_rel_ms(31)`. Its slot is the top
 /// 11 bits of the timestamp: slots are 2^20 ms (about 17.5 minutes) wide, which
 /// must not exceed the 30-minute session gap (see `run`).
-/// A cancellation in the multiset that has removed its event.
-const USED: u64 = u64::MAX;
 /// How many people ahead of the walk a person's user-table slot is prefetched.
 const PEOPLE_AHEAD: usize = 4;
 const SLOT_SHIFT: u32 = 20;
@@ -91,10 +89,7 @@ pub struct Scratch {
     tag: u32,
     cat_sum: Vec<u64>,
     touched: Vec<u32>,
-    /// The partition's cancelled events (a hash multiset; 0 = empty), and
-    /// scratch space for a person's purchases once theirs are removed.
-    cancel_set: Vec<u64>,
-    cancel_filter: Vec<u64>,
+    /// Scratch space for a person's purchases once the cancelled ones are removed.
     kept_pu: Vec<[u64; 2]>,
     /// The partition's people who have events.
     present: Vec<u16>,
@@ -119,8 +114,6 @@ impl Scratch {
             tag: 0,
             cat_sum: vec![0; ctx.products().categories.len()],
             touched: Vec::new(),
-            cancel_set: Vec::new(),
-            cancel_filter: Vec::new(),
             kept_pu: Vec::new(),
             present: Vec::new(),
             rows: Rows::default(),
@@ -232,41 +225,6 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     sc.h.iter_mut().for_each(|c| *c = 0);
     sc.a.clear();
     {
-        // The partition's cancellations, as a small open-addressing multiset:
-        // each one removes one event equal to it (same person, same timestamp;
-        // which of several equal events goes makes no difference).
-        // In front of it, a bitmap of 16 bits per cancellation that fits in the
-        // first-level cache: most events are turned away by one bit test.
-        let ncancel: usize = (0..ctx.nthreads).map(|t| ctx.x(t).events(p).len()).sum();
-        let bits = (4 * ncancel.max(16)).next_power_of_two().trailing_zeros();
-        let mask = (1usize << bits) - 1;
-        let fbits = (16 * ncancel.max(16)).next_power_of_two().trailing_zeros().max(6);
-        let mix = |w: u64| w.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        // Different bits of one product choose the table slot and the filter bit.
-        let slot_of = |h: u64| (h >> (64 - bits)) as usize;
-        let bit_of = |h: u64| ((h << 20) >> (64 - fbits)) as usize;
-        if ncancel > 0 {
-            sc.cancel_set.clear();
-            sc.cancel_set.resize(1 << bits, 0);
-            sc.cancel_filter.clear();
-            sc.cancel_filter.resize(1 << (fbits - 6), 0);
-            for t in 0..ctx.nthreads {
-                for &(_, w) in ctx.x(t).events(p) {
-                    // `w` carries the CANCEL bit, so it is never 0 (= empty).
-                    let h = mix(w);
-                    let mut i = slot_of(h);
-                    while sc.cancel_set[i] != 0 {
-                        i = (i + 1) & mask;
-                    }
-                    sc.cancel_set[i] = w;
-                    sc.cancel_filter[bit_of(h) >> 6] |= 1u64 << (bit_of(h) & 63);
-                }
-            }
-        }
-        let set = &mut sc.cancel_set[..];
-        let filter = &sc.cancel_filter[..];
-        let mut removed = 0usize;
-
         let (hs, hp) = sc.h.split_at_mut(SLOTS);
         let a = &mut sc.a;
         for t in 0..ctx.nthreads {
@@ -275,31 +233,6 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
             s.for_each_run(&ctx.pool, p, |run| unsafe {
                 let mut at = a.as_mut_ptr().add(a.len());
                 for &w in run {
-                    if ncancel > 0 {
-                        let key = w | CANCEL;
-                        let h = mix(key);
-                        let b = bit_of(h);
-                        if *filter.get_unchecked(b >> 6) & (1u64 << (b & 63)) != 0 {
-                            let mut i = slot_of(h);
-                            let mut cancelled = false;
-                            loop {
-                                let e = *set.get_unchecked(i);
-                                if e == 0 {
-                                    break;
-                                }
-                                if e == key {
-                                    *set.get_unchecked_mut(i) = USED;
-                                    cancelled = true;
-                                    break;
-                                }
-                                i = (i + 1) & mask;
-                            }
-                            if cancelled {
-                                removed += 1;
-                                continue;
-                            }
-                        }
-                    }
                     *hs.get_unchecked_mut((w >> SLOT_SHIFT) as usize & (SLOTS - 1)) += 1;
                     *hp.get_unchecked_mut((w >> 31) as usize & (LOCALS - 1)) += 1;
                     *at = w;
@@ -307,12 +240,6 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
                 }
                 a.set_len(at.offset_from(a.as_ptr()) as usize);
             });
-        }
-        if removed != ncancel {
-            // Every cancellation is for a record the parser wrote. Anything
-            // else is a bug, and a wrong table must not be written quietly.
-            eprintln!("partition {p}: {ncancel} cancellations but {removed} matching events");
-            std::process::abort();
         }
         let total = a.len();
         if total == 0 {
