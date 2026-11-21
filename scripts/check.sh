@@ -10,7 +10,7 @@ bash "$PROJ/tools/fixtures.sh" "$BIN" || rc=1
 run() { # name expected_dir
   local out="$PROJ/out/$1"
   rm -rf "$out"; mkdir -p "$out"
-  if ! TIMING=1 "$BIN" "$PROJ/data/$1" "$out" 2>"$out/log.txt"; then
+  if ! SS_TIMING=1 "$BIN" "$PROJ/data/$1" "$out" 2>"$out/log.txt"; then
     echo "FAIL $1: exit code"; tail -5 "$out/log.txt"; rc=1; return
   fi
   tail -1 "$out/log.txt"

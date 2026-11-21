@@ -10,7 +10,7 @@ if [ -n "$cpus" ]; then pin="taskset -c $cpus"; fi
 for i in $(seq "$runs"); do
   rm -rf "$out"; mkdir -p "$out"
   s=$(date +%s%N)
-  NCPU="$ncpu" TIMING=1 $pin "$BIN" "$PROJ/data/$name" "$out" 2>"$out.log"
+  NCPU="$ncpu" SS_TIMING=1 $pin "$BIN" "$PROJ/data/$name" "$out" 2>"$out.log"
   e=$(date +%s%N)
   echo "run $i: wall $(( (e - s) / 1000000 )) ms (ncpu=$ncpu ${cpus:+cpus=$cpus})"
   if [ "$i" = "$runs" ]; then cat "$out.log"; fi

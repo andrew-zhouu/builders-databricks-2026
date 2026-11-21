@@ -18,18 +18,18 @@ for seed in $(seq "$first" $((first + count - 1))); do
     o="$d/$mode"; mkdir -p "$o"
     case "$mode" in
       fast)   NCPU=3 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      scalar) NCPU=2 SCALAR=1 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      scalar) NCPU=2 SS_SCALAR=1 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
       slow)   "$BIN" --slow "$d/data" "$o" 2>"$o.log" ;;
       one)    NCPU=1 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
       # tiny chunks: lines of every kind start, end and straddle chunk boundaries
-      tiny)   NCPU=4 CHUNK_BYTES=$((seed % 97 + 31)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      tiny8)  NCPU=8 CHUNK_BYTES=$((seed % 1013 + 300)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      tiny)   NCPU=4 SS_CHUNK_BYTES=$((seed % 97 + 31)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      tiny8)  NCPU=8 SS_CHUNK_BYTES=$((seed % 1013 + 300)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
       # the pread input mode, whole files and tiny chunks
-      read)       NCPU=3 IO=read "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      readtiny)   NCPU=4 IO=read CHUNK_BYTES=$((seed % 211 + 17)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      readscalar) NCPU=2 IO=read SCALAR=1 CHUNK_BYTES=$((seed % 5000 + 100)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      read)       NCPU=3 SS_IO=read "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      readtiny)   NCPU=4 SS_IO=read SS_CHUNK_BYTES=$((seed % 211 + 17)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      readscalar) NCPU=2 SS_IO=read SS_SCALAR=1 SS_CHUNK_BYTES=$((seed % 5000 + 100)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
       # a tail too short for most lines: every chunk has to extend its read
-      readtail)   NCPU=3 IO=read READ_TAIL=$((seed % 7)) CHUNK_BYTES=$((seed % 401 + 50)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      readtail)   NCPU=3 SS_IO=read SS_READ_TAIL=$((seed % 7)) SS_CHUNK_BYTES=$((seed % 401 + 50)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
     esac
     if [ $? -ne 0 ] || ! "$PY" -I "$PROJ/tools/cmp.py" "$d/expected" "$o" >"$o.cmp" 2>&1; then
       bad="$bad $mode"

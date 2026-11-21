@@ -416,12 +416,14 @@ impl LinkRing {
     }
 }
 
-pub fn links_chunk(ctx: &Ctx, io: &mut Input, ch: &Chunk) {
+pub fn links_chunk(ctx: &Ctx, io: &mut Input, ch: &Chunk) -> usize {
     let View { data, start, end, fast_end } = io.view(ctx, ch);
     let len = data.len();
+    let mut lines = 0usize;
     if let Some(mut pos) = first_line(data, start) {
         let mut ring = LinkRing::new();
         while pos < end {
+            lines += 1;
             if pos < fast_end {
                 let used = unsafe { link_fast(ctx, &mut ring, data.as_ptr().add(pos)) };
                 if used != 0 {
@@ -436,6 +438,7 @@ pub fn links_chunk(ctx: &Ctx, io: &mut Input, ch: &Chunk) {
         ring.drain(ctx);
     }
     release(ctx, ch);
+    lines
 }
 
 // ------------------------------------------------------------------ events
@@ -448,24 +451,33 @@ struct PendingEvent {
     key: u64,
     extra: u64,
     part: u32,
+    /// The key's home slot in the user table, computed once when queued.
+    home: u32,
 }
 
 const RING: usize = 8;
+/// Largest prefetch distance (in rows) the rings can be set to.
+pub const RING_MAX: usize = 64;
 
 struct EventRing {
-    buf: [PendingEvent; RING],
+    buf: [PendingEvent; RING_MAX],
     at: usize,
+    mask: usize,
 }
 
 impl EventRing {
-    fn new() -> EventRing {
-        EventRing { buf: [PendingEvent { w0: 0, w1: 0, key: 0, extra: 0, part: 0 }; RING], at: 0 }
+    fn new(ctx: &Ctx) -> EventRing {
+        EventRing {
+            buf: [PendingEvent { w0: 0, w1: 0, key: 0, extra: 0, part: 0, home: 0 }; RING_MAX],
+            at: 0,
+            mask: ctx.ring_mask,
+        }
     }
 
     #[inline(always)]
     fn emit(ctx: &Ctx, d: &mut PartWriter, e: &PendingEvent) {
         if e.key != 0 {
-            let person = ctx.table.person(ctx.table.insert(e.key)) as u64;
+            let person = ctx.table.person(ctx.table.insert_at(e.home as usize, e.key)) as u64;
             d.push2(&ctx.pool, e.part as usize, e.w0, e.w1 | person << 31);
             if e.w1 & PURCHASE != 0 {
                 d.push2(&ctx.pool, e.part as usize, e.extra, 0);
@@ -474,18 +486,18 @@ impl EventRing {
     }
 
     #[inline(always)]
-    fn push(&mut self, ctx: &Ctx, d: &mut PartWriter, e: PendingEvent) {
-        ctx.table.prefetch(e.key);
+    fn push(&mut self, ctx: &Ctx, d: &mut PartWriter, mut e: PendingEvent) {
+        e.home = ctx.table.prefetch_home(e.key) as u32;
         let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, e);
-        self.at = (self.at + 1) & (RING - 1);
+        self.at = (self.at + 1) & self.mask;
         Self::emit(ctx, d, &old);
     }
 
     fn drain(&mut self, ctx: &Ctx, d: &mut PartWriter) {
-        for i in 0..RING {
-            let e = self.buf[(self.at + i) & (RING - 1)];
+        for i in 0..=self.mask {
+            let e = self.buf[(self.at + i) & self.mask];
             Self::emit(ctx, d, &e);
-            self.buf[(self.at + i) & (RING - 1)].key = 0;
+            self.buf[(self.at + i) & self.mask].key = 0;
         }
     }
 }
@@ -650,19 +662,21 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
         }
     }
     if valid {
-        ring.push(ctx, d, PendingEvent { w0, w1, key: pack9(a1, n1), extra, part: part as u32 });
+        ring.push(ctx, d, PendingEvent { w0, w1, key: pack9(a1, n1), extra, part: part as u32, home: 0 });
     } else {
         d.push2(&ctx.pool, part, w0, 0);
     }
     used
 }
 
-pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, io: &mut Input, ch: &Chunk) {
+pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, io: &mut Input, ch: &Chunk) -> usize {
     let View { data, start, end, fast_end } = io.view(ctx, ch);
     let len = data.len();
+    let mut lines = 0usize;
     if let Some(mut pos) = first_line(data, start) {
-        let mut ring = EventRing::new();
+        let mut ring = EventRing::new(ctx);
         while pos < end {
+            lines += 1;
             if (pos >= HEAD) & (pos < fast_end) {
                 if ctx.prefetch_ahead != 0 {
                     // The hardware streamer stops at page boundaries; reach past them.
@@ -683,6 +697,7 @@ pub fn events_chunk(ctx: &Ctx, d: &mut PartWriter, io: &mut Input, ch: &Chunk) {
         ring.drain(ctx, d);
     }
     release(ctx, ch);
+    lines
 }
 
 // ------------------------------------------------------------------ clicks
@@ -720,13 +735,14 @@ struct PendingClick {
 }
 
 struct ClickRing {
-    buf: [PendingClick; RING],
+    buf: [PendingClick; RING_MAX],
     at: usize,
+    mask: usize,
 }
 
 impl ClickRing {
-    fn new() -> ClickRing {
-        ClickRing { buf: [PendingClick { tc: 0, click: 0, user: 0 }; RING], at: 0 }
+    fn new(ctx: &Ctx) -> ClickRing {
+        ClickRing { buf: [PendingClick { tc: 0, click: 0, user: 0 }; RING_MAX], at: 0, mask: ctx.ring_mask }
     }
 
     #[inline(always)]
@@ -735,7 +751,7 @@ impl ClickRing {
             ctx.table.prefetch(new.user);
         }
         let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, new);
-        self.at = (self.at + 1) & (RING - 1);
+        self.at = (self.at + 1) & self.mask;
         if old.user != 0 {
             let person = ctx.table.person(ctx.table.insert(old.user)) as u64;
             let local = person & ((1 << LOCAL_BITS) - 1);
@@ -744,7 +760,7 @@ impl ClickRing {
     }
 
     fn drain(&mut self, ctx: &Ctx, c: &mut PartWriter) {
-        for _ in 0..RING {
+        for _ in 0..=self.mask {
             self.step(ctx, c, PendingClick { tc: 0, click: 0, user: 0 });
         }
     }
@@ -804,12 +820,14 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
     used
 }
 
-pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, io: &mut Input, ch: &Chunk) {
+pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, io: &mut Input, ch: &Chunk) -> usize {
     let View { data, start, end, fast_end } = io.view(ctx, ch);
     let len = data.len();
+    let mut lines = 0usize;
     if let Some(mut pos) = first_line(data, start) {
-        let mut ring = ClickRing::new();
+        let mut ring = ClickRing::new(ctx);
         while pos < end {
+            lines += 1;
             if (pos >= HEAD) & (pos < fast_end) {
                 if ctx.prefetch_ahead != 0 {
                     unsafe {
@@ -829,4 +847,5 @@ pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, io: &mut Input, ch: &Chunk) {
         ring.drain(ctx, c);
     }
     release(ctx, ch);
+    lines
 }

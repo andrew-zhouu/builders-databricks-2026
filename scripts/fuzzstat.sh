@@ -11,4 +11,4 @@ wc -l "$d/expected/user_daily.csv" "$d/expected/campaign_daily.csv"
 head -5 "$d/expected/user_daily.csv" | cat -A | cut -c1-100
 awk -F, 'NR>1{s+=$3; e+=$4; r+=$5; if($6!="")c++} END{print "sessions",s,"events",e,"revenue",r,"rows with category",c}' "$d/expected/user_daily.csv"
 awk -F, 'NR>1{s+=$4; a+=$7; if($1=="organic")o+=$4} END{print "credited sessions",s,"organic",o,"assists",a}' "$d/expected/campaign_daily.csv"
-STATS=1 TIMING=1 NCPU=2 "$BIN" "$d/data" "$d/out" 2>&1 | tail -3
+STATS=1 SS_TIMING=1 NCPU=2 "$BIN" "$d/data" "$d/out" 2>&1 | tail -3

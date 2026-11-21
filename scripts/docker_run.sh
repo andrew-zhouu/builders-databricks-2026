@@ -23,7 +23,7 @@ docker run --rm --platform linux/amd64 \
   --user 1000:1000 \
   -v "$DATA":/data:ro -v "$OUT":/output -v "$SCRATCH":/scratch \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" ${TIMING:+-e TIMING=1} \
+  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" ${TIMING:+-e SS_TIMING=1} \
   "$IMAGE"
 rc=$?
 e=$(date +%s%N)

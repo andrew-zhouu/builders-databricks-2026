@@ -16,6 +16,6 @@ if [ ! -d "$exp/user_daily" ]; then
   /usr/bin/time -f "plain implementation $name: %es %MKB" "$BIN" --slow "$PROJ/data/$name" "$exp"
 fi
 out="$PROJ/out/$name"; rm -rf "$out"; mkdir -p "$out"
-NCPU="$ncpu" TIMING=1 /usr/bin/time -f "fast $name: %es wall, %U user, %S sys, %MKB" "$BIN" "$PROJ/data/$name" "$out" 2>"$out.log"
+NCPU="$ncpu" SS_TIMING=1 /usr/bin/time -f "fast $name: %es wall, %U user, %S sys, %MKB" "$BIN" "$PROJ/data/$name" "$out" 2>"$out.log"
 cat "$out.log"
 "$PROJ/.venv/bin/python" -I "$PROJ/tools/cmp.py" "$exp" "$out"

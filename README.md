@@ -77,7 +77,7 @@ docker run --rm --network none --read-only --user 1000:1000 \
 ```
 
 The binary reads `DATA_DIR` (default `/data`), writes `OUTPUT_DIR` (default `/output`)
-and uses `NCPU` threads. `TIMING=1` prints phase times and a per-section CPU profile
+and uses `NCPU` threads. `SS_TIMING=1` prints phase times and a per-section CPU profile
 to stderr.
 
 ## Testing

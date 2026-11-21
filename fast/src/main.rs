@@ -1,6 +1,7 @@
 //! Shopping Sessions: clean, link, sessionize and attribute click-stream CSVs
 //! into two daily Parquet tables. See DESIGN.md for the pipeline.
 
+mod diag;
 mod ids;
 mod lookup;
 mod parquet;
@@ -8,6 +9,7 @@ mod parse;
 mod part;
 mod pass2;
 mod pass3;
+mod prof;
 mod slow;
 mod sys;
 mod table;
@@ -74,6 +76,8 @@ pub struct Ctx {
     pub scalar_only: bool,
     /// Software prefetch distance in bytes for the event parser (0 = off).
     pub prefetch_ahead: usize,
+    /// Rows between prefetching an event's user-table slot and using it, minus one.
+    pub ring_mask: usize,
     /// Release the big memory regions from all threads before exiting.
     zap: bool,
     /// Experiment switch: load products/campaigns before starting the threads.
@@ -103,8 +107,9 @@ pub struct Ctx {
     psw: Vec<Shared<PartWriter>>,
     acc: Vec<Shared<Vec<CampCell>>>,
     barrier: Barrier,
-    /// Thread CPU nanoseconds per profiled section, summed over threads (TIMING only).
-    pub prof: [std::sync::atomic::AtomicU64; 12],
+    /// Per profiled section, summed over threads (SS_TIMING only): CPU
+    /// nanoseconds, the four performance counters, and input rows.
+    pub prof: [[std::sync::atomic::AtomicU64; 4 + prof::NCOUNTERS]; 12],
     /// Set when the data does not fit the fast path's packed layouts.
     pub bail: AtomicBool,
     out_dir: PathBuf,
@@ -167,26 +172,38 @@ impl Ctx {
         unsafe { &*self.psw[t].0.get() }
     }
 
-    /// Profiling: the current thread CPU time, or 0 when not timing.
+    /// Profiling: this thread's CPU time and counters now (zeros when not timing).
     #[inline]
-    pub fn now(&self) -> u64 {
+    pub fn now(&self) -> prof::Snap {
         if self.timing {
-            sys::thread_cpu_ns()
+            prof::snap()
         } else {
-            0
+            prof::Snap::default()
         }
     }
 
-    /// Profiling: charge the time since `since` to `section`; returns the new "now".
+    /// Profiling: charge what the thread used since `since` to `section`, with
+    /// the number of input rows that work covered; returns the new "now".
     #[inline]
-    pub fn charge(&self, section: usize, since: u64) -> u64 {
-        if self.timing {
-            let t = sys::thread_cpu_ns();
-            self.prof[section].fetch_add(t - since, Relaxed);
-            t
-        } else {
-            0
+    pub fn charge_rows(&self, section: usize, since: prof::Snap, rows: usize) -> prof::Snap {
+        if !self.timing {
+            return since;
         }
+        let t = prof::snap();
+        let p = &self.prof[section];
+        p[0].fetch_add(t.ns - since.ns, Relaxed);
+        for i in 0..prof::NCOUNTERS {
+            p[1 + i].fetch_add(t.c[i].wrapping_sub(since.c[i]), Relaxed);
+        }
+        p[1 + prof::NCOUNTERS].fetch_add(rows as u64, Relaxed);
+        p[2 + prof::NCOUNTERS].fetch_add(t.sys_ns.saturating_sub(since.sys_ns), Relaxed);
+        p[3 + prof::NCOUNTERS].fetch_add(t.faults.saturating_sub(since.faults), Relaxed);
+        t
+    }
+
+    #[inline]
+    pub fn charge(&self, section: usize, since: prof::Snap) -> prof::Snap {
+        self.charge_rows(section, since, 0)
     }
 
     fn failed(&self) -> bool {
@@ -194,13 +211,60 @@ impl Ctx {
     }
 
     fn sync(&self, what: &str) {
+        if self.timing {
+            prof::drain();
+        }
         if self.barrier.wait().is_leader() && self.timing {
             eprintln!("[{:8.2} ms] {what}", self.t_start.elapsed().as_secs_f64() * 1e3);
         }
     }
+
+    /// The per-section profile: CPU time, and per input row the instructions,
+    /// cycles, branch misses and cache misses (where the kernel provides them).
+    fn print_profile(&self) {
+        let total: u64 = self.prof.iter().map(|p| p[0].load(Relaxed)).sum();
+        eprintln!(
+            "    section            cpu ms     %   sys ms  faults      rows  instr/row cycles/row   IPC brmiss/row llcmiss/row"
+        );
+        let mut sum = [0u64; 4 + prof::NCOUNTERS];
+        for (name, p) in P_NAMES.iter().zip(&self.prof) {
+            let v: Vec<u64> = p.iter().map(|x| x.load(Relaxed)).collect();
+            let (ns, cycles, instr, brmiss, llc, rows, sys, faults) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            if ns == 0 {
+                continue;
+            }
+            for (s, x) in sum.iter_mut().zip(&v) {
+                *s += x;
+            }
+            let per = |x: u64| if rows > 0 { x as f64 / rows as f64 } else { 0.0 };
+            eprintln!(
+                "    {name:16} {:8.2} {:5.1}% {:8.2} {faults:7} {rows:9} {:10.1} {:10.1} {:5.2} {:10.3} {:11.3}",
+                ns as f64 / 1e6,
+                100.0 * ns as f64 / total.max(1) as f64,
+                sys as f64 / 1e6,
+                per(instr),
+                per(cycles),
+                instr as f64 / cycles.max(1) as f64,
+                per(brmiss),
+                per(llc),
+            );
+        }
+        let (psys, pfaults, puser) = prof::rusage(0);
+        eprintln!(
+            "    sections: cpu {:.1} ms (sys {:.1} ms, {} faults), {:.2} G instr, {:.2} G user cycles; process: user {:.1} ms, sys {:.1} ms, {} faults",
+            sum[0] as f64 / 1e6,
+            sum[6] as f64 / 1e6,
+            sum[7],
+            sum[2] as f64 / 1e9,
+            sum[1] as f64 / 1e9,
+            puser as f64 / 1e6,
+            psys as f64 / 1e6,
+            pfaults
+        );
+    }
 }
 
-// Profiled sections (thread CPU time, printed with TIMING=1).
+// Profiled sections (printed with SS_TIMING=1).
 pub const P_EVENTS: usize = 0;
 pub const P_CLICKS: usize = 1;
 pub const P_FINALIZE: usize = 2;
@@ -211,9 +275,11 @@ pub const P_S_GATHER: usize = 6;
 pub const P_S_SORT: usize = 7;
 pub const P_S_PEOPLE: usize = 8;
 pub const P_WRITE: usize = 9;
-const P_NAMES: [&str; 10] = [
+pub const P_LINKS: usize = 10;
+pub const P_COMPRESS: usize = 11;
+const P_NAMES: [&str; 12] = [
     "parse events", "parse clicks", "finalize", "dedup gather", "dedup table", "dedup emit", "sessions gather",
-    "sessions sort", "sessions people", "write user_daily",
+    "sessions sort", "sessions people", "write user_daily", "links", "resolve people",
 ];
 
 const CHUNK: usize = 1 << 20;
@@ -251,17 +317,20 @@ fn worker(ctx: &Ctx, tid: usize) {
     }
     // ---- links: insert both IDs, join them
     let mut io = parse::Input::new();
+    let mut t = ctx.now();
     loop {
         let i = ctx.next_link.fetch_add(1, Relaxed);
         if i >= ctx.link_chunks.len() {
             break;
         }
-        parse::links_chunk(ctx, &mut io, &ctx.link_chunks[i]);
+        let lines = parse::links_chunk(ctx, &mut io, &ctx.link_chunks[i]);
+        t = ctx.charge_rows(P_LINKS, t, lines);
     }
     ctx.sync("links parsed");
     if ctx.failed() {
         return;
     }
+    let t = ctx.now();
     loop {
         let from = ctx.next_compress.fetch_add(COMPRESS_STEP, Relaxed);
         if from >= ctx.table.cap {
@@ -269,6 +338,7 @@ fn worker(ctx: &Ctx, tid: usize) {
         }
         ctx.table.compress(from, (from + COMPRESS_STEP).min(ctx.table.cap));
     }
+    ctx.charge(P_COMPRESS, t);
     ctx.sync("people resolved");
 
     // ---- parse clicks and events
@@ -284,12 +354,12 @@ fn worker(ctx: &Ctx, tid: usize) {
             let ch = &ctx.main_chunks[i];
             match ch.kind {
                 FileKind::Events => {
-                    parse::events_chunk(ctx, d, &mut io, ch);
-                    t = ctx.charge(P_EVENTS, t);
+                    let lines = parse::events_chunk(ctx, d, &mut io, ch);
+                    t = ctx.charge_rows(P_EVENTS, t, lines);
                 }
                 _ => {
-                    parse::clicks_chunk(ctx, c, &mut io, ch);
-                    t = ctx.charge(P_CLICKS, t);
+                    let lines = parse::clicks_chunk(ctx, c, &mut io, ch);
+                    t = ctx.charge_rows(P_CLICKS, t, lines);
                 }
             }
         }
@@ -332,8 +402,11 @@ fn worker(ctx: &Ctx, tid: usize) {
     }
     let t = ctx.now();
     write_user_daily(ctx, &sc.rows, tid);
-    ctx.charge(P_WRITE, t);
+    ctx.charge_rows(P_WRITE, t, sc.rows.n);
     unsafe { *ctx.acc[tid].0.get() = std::mem::take(&mut sc.acc) };
+    if ctx.timing {
+        prof::finish_thread();
+    }
     ctx.sync("sessions built, user_daily written");
 
     // ---- teardown in parallel: at exit the kernel frees the address space on
@@ -366,9 +439,14 @@ fn bench(ctx: &Ctx) {
         parse::links_chunk(ctx, &mut io, ch);
     }
     ctx.table.compress(0, ctx.table.cap);
-    let region: usize = std::env::var("BENCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 19);
-    let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+    let region: usize = std::env::var("SS_BENCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 19);
+    let iters: usize = std::env::var("SS_BENCH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+    // SS_BENCH_KIND=events|clicks|links restricts the run (and so any sampling) to one parser.
+    let only = std::env::var("SS_BENCH_KIND").ok();
     for kind in [FileKind::Events, FileKind::Clicks, FileKind::Links] {
+        if only.as_deref().is_some_and(|k| k != ["events", "clicks", "links"][kind as usize]) {
+            continue;
+        }
         let chunks = if kind == FileKind::Links { &ctx.link_chunks } else { &ctx.main_chunks };
         let Some(file) = chunks
             .iter()
@@ -378,30 +456,48 @@ fn bench(ctx: &Ctx) {
         else {
             continue;
         };
-        let data = ctx.files[file as usize].slice();
-        let end = region.min(data.len());
-        let lines = data[..end].iter().filter(|&&c| c == b'\n').count().max(1);
+        let end = region.min(ctx.files[file as usize].len);
         let ch = Chunk { file, kind, start: 0, end };
-        let mut best = u64::MAX;
+        // Keep the iteration with the fewest cycles (the least disturbed one);
+        // instruction and miss counts barely vary between iterations.
+        let (mut best, mut lines) = ([u64::MAX; 1 + prof::NCOUNTERS], 1usize);
         let mut free: Vec<u32> = Vec::new();
         for _ in 0..iters {
             let nparts = if kind == FileKind::Events { ctx.pd } else { ctx.ps };
             let mut w = PartWriter::new(nparts);
             w.free = std::mem::take(&mut free);
-            let t = sys::thread_cpu_ns();
-            match kind {
+            let a = prof::snap();
+            let n = match kind {
                 FileKind::Events => parse::events_chunk(ctx, &mut w, &mut io, &ch),
                 FileKind::Clicks => parse::clicks_chunk(ctx, &mut w, &mut io, &ch),
                 FileKind::Links => parse::links_chunk(ctx, &mut io, &ch),
+            };
+            let b = prof::snap();
+            if b.c[0] - a.c[0] < best[1] || (best[1] == u64::MAX && b.c[0] == a.c[0] && b.ns - a.ns < best[0]) {
+                best[0] = b.ns - a.ns;
+                for i in 0..prof::NCOUNTERS {
+                    best[1 + i] = b.c[i] - a.c[i];
+                }
+                lines = n.max(1);
             }
-            best = best.min(sys::thread_cpu_ns() - t);
             w.finalize(&ctx.pool);
             free = w.all_blocks().to_vec();
             free.extend_from_slice(&w.free);
         }
         let name = ["events", "clicks", "links"][kind as usize];
-        eprintln!("bench {name}: {:.1} ns/line ({lines} lines, {} bytes/line)", best as f64 / lines as f64, end / lines);
+        let per = |x: u64| x as f64 / lines as f64;
+        eprintln!(
+            "bench {name}: {:6.1} instr/line  {:6.1} cycles/line  IPC {:.2}  {:.3} brmiss/line  {:.3} llcmiss/line  {:5.1} ns/line  ({lines} lines)",
+            per(best[2]),
+            per(best[1]),
+            best[2] as f64 / best[1].max(1) as f64,
+            per(best[3]),
+            per(best[4]),
+            per(best[0]),
+        );
     }
+    prof::finish_thread();
+    prof::write_samples();
 }
 
 fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
@@ -472,15 +568,18 @@ fn write_campaign_daily(ctx: &Ctx) {
 fn main() {
     let t_start = Instant::now();
     let all_args: Vec<String> = std::env::args().collect();
-    let force_slow = all_args.iter().any(|a| a == "--slow") || std::env::var("SLOW").is_ok();
+    let force_slow = all_args.iter().any(|a| a == "--slow") || std::env::var("SS_SLOW").is_ok();
     let force_bench = all_args.iter().any(|a| a == "--bench");
     let args: Vec<String> = all_args.into_iter().filter(|a| !a.starts_with("--")).collect();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data_dir = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| env("DATA_DIR", "/data")));
     let out_dir = PathBuf::from(args.get(2).cloned().unwrap_or_else(|| env("OUTPUT_DIR", "/output")));
-    let timing = std::env::var("TIMING").is_ok();
-    sys::NOHUGE.store(std::env::var("NOHUGE").is_ok(), Relaxed);
-    sys::NORELEASE.store(std::env::var("NORELEASE").is_ok(), Relaxed);
+    let timing = std::env::var("SS_TIMING").is_ok();
+    if std::env::var("SS_DIAG").is_ok() {
+        diag::run(&data_dir);
+    }
+    sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Relaxed);
+    sys::NORELEASE.store(std::env::var("SS_NORELEASE").is_ok(), Relaxed);
     if force_slow {
         slow::run(&data_dir, &out_dir);
         unsafe { sys::_exit(0) }
@@ -503,10 +602,10 @@ fn main() {
 
     // Test switch: tiny chunks put every kind of line on a chunk boundary.
     let chunk_override: Option<usize> =
-        std::env::var("CHUNK_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0);
+        std::env::var("SS_CHUNK_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0);
     // Input mode: IO=read copies each chunk into a private buffer that fits the
     // L2 cache; the default maps the files.
-    let read_io = std::env::var("IO").map_or(false, |v| v == "read");
+    let read_io = std::env::var("SS_IO").map_or(false, |v| v == "read");
     let main_chunk = if read_io { READ_CHUNK } else { CHUNK };
     let mut files: Vec<FileMap> = Vec::new();
     let mut link_chunks: Vec<Chunk> = Vec::new();
@@ -542,7 +641,9 @@ fn main() {
 
     // Sizes. The user table holds every distinct user ID; aim for a load of at most ~0.5.
     let est_ids = links_bytes / 16 + events_bytes / 2200 + clicks_bytes / 1500 + 2048;
-    let cap = (est_ids * 2).next_multiple_of(1 << parse::LOCAL_BITS);
+    // SS_TABLE_X8 (experiment): table slots per estimated ID, in eighths.
+    let table_x8: usize = std::env::var("SS_TABLE_X8").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 8).unwrap_or(16);
+    let cap = (est_ids * table_x8 / 8).next_multiple_of(1 << parse::LOCAL_BITS);
     let ps = cap >> parse::LOCAL_BITS;
     // Event partitions: about 0.5 MB of records each, but never so many that a
     // thread's write-combining lines (64 bytes per partition) crowd its L2.
@@ -583,12 +684,18 @@ fn main() {
         clicks: KeySpace::new(),
         event_dict: Dict::new(),
         dates: parse::DateTab::new(ws),
-        scalar_only: std::env::var("SCALAR").is_ok(),
-        prefetch_ahead: std::env::var("PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
-        zap: std::env::var("NOZAP").is_err(),
-        eager_lookups: std::env::var("EAGER_LOOKUPS").is_ok(),
+        scalar_only: std::env::var("SS_SCALAR").is_ok(),
+        prefetch_ahead: std::env::var("SS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
+        ring_mask: std::env::var("SS_RING")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two() && *n <= parse::RING_MAX)
+            .unwrap_or(32)
+            - 1,
+        zap: std::env::var("SS_NOZAP").is_err(),
+        eager_lookups: std::env::var("SS_EAGER_LOOKUPS").is_ok(),
         read_io,
-        read_tail: std::env::var("READ_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(parse::TAIL),
+        read_tail: std::env::var("SS_READ_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(parse::TAIL),
         table: Table::new(cap),
         pool: BlockPool::new(pool_blocks, pool_floor),
         files,
@@ -652,11 +759,8 @@ fn main() {
         unsafe { sys::_exit(0) }
     }
     if timing {
-        let total: u64 = ctx.prof.iter().map(|p| p.load(Relaxed)).sum();
-        for (name, p) in P_NAMES.iter().zip(&ctx.prof) {
-            let ns = p.load(Relaxed);
-            eprintln!("    cpu {:8.2} ms {:5.1}%  {name}", ns as f64 / 1e6, 100.0 * ns as f64 / total.max(1) as f64);
-        }
+        ctx.print_profile();
+        prof::write_samples();
         eprintln!(
             "[{:8.2} ms] done; table {} of {} slots used, pool used {} MB, irregular ids: users {}, events {}, clicks {}",
             t_start.elapsed().as_secs_f64() * 1e3,
