@@ -54,6 +54,15 @@ pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
     p as *mut u8
 }
 
+/// Drop the fully covered pages of an anonymous range (their contents are lost).
+pub fn zap(ptr: *mut u8, len: usize) {
+    let a = (ptr as usize + 4095) & !4095;
+    let b = (ptr as usize + len) & !4095;
+    if b > a {
+        unsafe { madvise(a as *mut c_void, b - a, MADV_DONTNEED) };
+    }
+}
+
 /// A read-only private mapping of a whole file. Empty files map to an empty slice.
 pub struct FileMap {
     pub ptr: *const u8,
