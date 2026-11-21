@@ -43,6 +43,7 @@ fn emit(ctx: &Ctx, s: &mut PartWriter, ps: &mut PartWriter, e: &Pending) {
 }
 
 pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter, p: usize) {
+    let t0 = ctx.now();
     sc.recs.clear();
     for t in 0..ctx.nthreads {
         let d = ctx.d(t);
@@ -55,6 +56,7 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter,
     if n == 0 {
         return;
     }
+    let t0 = ctx.charge(crate::P_D_GATHER, t0);
     let tsize = (2 * n).next_power_of_two().max(16);
     sc.tab.clear();
     sc.tab.resize(tsize, 0);
@@ -94,6 +96,7 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter,
         i += 1 + (w1 & PURCHASE != 0) as usize;
     }
 
+    let t0 = ctx.charge(crate::P_D_DEDUP, t0);
     let mut ring = [Pending::default(); RING];
     let mut at = 0;
     let mut i = 0;
@@ -118,4 +121,5 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter,
     for e in &ring {
         emit(ctx, s, ps, e);
     }
+    ctx.charge(crate::P_D_EMIT, t0);
 }

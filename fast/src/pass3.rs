@@ -1,8 +1,15 @@
 //! Pass 3: one person partition -> sessions, attribution, and output rows.
+//!
+//! A partition holds the people whose user-table slot falls in one 4096-slot
+//! range, so a person is a 12-bit local index. Events are bucketed by person
+//! with a counting sort (two passes straight over the partition's blocks), then
+//! each person's timestamps are sorted on their own.
 
 use crate::parse::{CAMPAIGN_BITS, LOCAL_BITS, TS_MASK};
 use crate::util::{DAY_MS, GAP_MS, REACH_MS};
 use crate::Ctx;
+
+const LOCALS: usize = 1 << LOCAL_BITS;
 
 /// Per (campaign, day) counters.
 #[derive(Clone, Copy, Default)]
@@ -26,7 +33,10 @@ pub struct Rows {
 }
 
 pub struct Scratch {
-    ev: Vec<u64>,
+    /// Event timestamps grouped by person; `start[l]..start[l + 1]` is person `l`.
+    ts: Vec<u32>,
+    start: Vec<u32>,
+    cursor: Vec<u32>,
     pu: Vec<u64>,
     cl: Vec<u64>,
     tmp: Vec<u64>,
@@ -44,7 +54,9 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(ctx: &Ctx) -> Scratch {
         Scratch {
-            ev: Vec::new(),
+            ts: Vec::new(),
+            start: vec![0; LOCALS + 1],
+            cursor: vec![0; LOCALS],
             pu: Vec::new(),
             cl: Vec::new(),
             tmp: Vec::new(),
@@ -74,37 +86,88 @@ fn pairs(v: &mut [u64]) -> &mut [[u64; 2]] {
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut [u64; 2], v.len() / 2) }
 }
 
-pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
-    sc.ev.clear();
-    sc.pu.clear();
-    sc.cl.clear();
-    for t in 0..ctx.nthreads {
-        ctx.s(t).copy_part(&ctx.pool, p, &mut sc.ev);
+#[inline(always)]
+fn sort_ts(v: &mut [u32]) {
+    let n = v.len();
+    if n <= 24 {
+        for i in 1..n {
+            let x = v[i];
+            let mut j = i;
+            while j > 0 && v[j - 1] > x {
+                v[j] = v[j - 1];
+                j -= 1;
+            }
+            v[j] = x;
+        }
+    } else {
+        v.sort_unstable();
     }
-    if sc.ev.is_empty() {
+}
+
+pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
+    let t0 = ctx.now();
+    // Counting sort of the events by person: histogram, prefix sums, scatter.
+    sc.start.iter_mut().for_each(|c| *c = 0);
+    for t in 0..ctx.nthreads {
+        let start = &mut sc.start[..];
+        ctx.s(t).for_each_run(&ctx.pool, p, |run| {
+            for &w in run {
+                unsafe { *start.get_unchecked_mut((w >> 31) as usize + 1) += 1 };
+            }
+        });
+    }
+    let mut total = 0u32;
+    for l in 0..LOCALS {
+        let count = sc.start[l + 1];
+        sc.start[l] = total;
+        sc.cursor[l] = total;
+        total += count;
+    }
+    sc.start[LOCALS] = total;
+    if total == 0 {
         return;
     }
+    sc.ts.clear();
+    sc.ts.reserve(total as usize);
+    unsafe { sc.ts.set_len(total as usize) };
+    for t in 0..ctx.nthreads {
+        let (ts, cursor) = (sc.ts.as_mut_ptr(), &mut sc.cursor[..]);
+        ctx.s(t).for_each_run(&ctx.pool, p, |run| {
+            for &w in run {
+                unsafe {
+                    let c = cursor.get_unchecked_mut((w >> 31) as usize);
+                    *ts.add(*c as usize) = (w & TS_MASK) as u32;
+                    *c += 1;
+                }
+            }
+        });
+    }
+    sc.pu.clear();
+    sc.cl.clear();
     for t in 0..ctx.nthreads {
         ctx.ps(t).copy_part(&ctx.pool, p, &mut sc.pu);
         ctx.c(t).copy_part(&ctx.pool, p, &mut sc.cl);
     }
-    let mut ev = std::mem::take(&mut sc.ev);
+    let t0 = ctx.charge(crate::P_S_GATHER, t0);
+
+    let mut ts = std::mem::take(&mut sc.ts);
     let mut pu = std::mem::take(&mut sc.pu);
     let mut cl = std::mem::take(&mut sc.cl);
-    ev.sort_unstable();
     {
         let pu = pairs(&mut pu);
         pu.sort_unstable_by_key(|r| r[0]);
         let cl = pairs(&mut cl);
         cl.sort_unstable_by_key(|r| r[0]);
-        let n = ev.len();
-        let (mut i, mut pi, mut ci) = (0, 0, 0);
-        while i < n {
-            let local = ev[i] >> 31;
-            let mut j = i + 1;
-            while j < n && ev[j] >> 31 == local {
-                j += 1;
+        let mut t0 = ctx.charge(crate::P_S_SORT, t0);
+        let (mut pi, mut ci) = (0, 0);
+        for local in 0..LOCALS {
+            let (from, to) = (sc.start[local] as usize, sc.start[local + 1] as usize);
+            if from == to {
+                continue;
             }
+            let events = &mut ts[from..to];
+            sort_ts(events);
+            let local = local as u64;
             let mut pj = pi;
             while pj < pu.len() && pu[pj][0] >> 31 == local {
                 pj += 1;
@@ -117,18 +180,19 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
                 cj += 1;
             }
             let slot = (p << LOCAL_BITS) as u32 | local as u32;
-            person(ctx, sc, slot, &ev[i..j], &pu[pi..pj], &cl[ci..cj]);
-            i = j;
+            person(ctx, sc, slot, events, &pu[pi..pj], &cl[ci..cj]);
             pi = pj;
             ci = cj;
         }
+        t0 = ctx.charge(crate::P_S_PEOPLE, t0);
+        let _ = t0;
     }
-    sc.ev = ev;
+    sc.ts = ts;
     sc.pu = pu;
     sc.cl = cl;
 }
 
-fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
+fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u32], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
     let key = ctx.table.key(slot);
     let ndays = ctx.ndays;
     let organic = ctx.campaigns.organic as usize;
@@ -145,11 +209,11 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
     let (mut d_sessions, mut d_events, mut d_revenue) = (0i32, 0i32, 0i64);
     let mut k = 0;
     while k < n {
-        let start = (ev[k] & TS_MASK) as u32;
+        let start = ev[k];
         let mut last = start;
         let mut m = k + 1;
         while m < n {
-            let t = (ev[m] & TS_MASK) as u32;
+            let t = ev[m];
             if t - last > GAP_MS {
                 break;
             }

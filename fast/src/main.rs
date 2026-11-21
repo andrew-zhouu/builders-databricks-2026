@@ -70,6 +70,8 @@ pub struct Ctx {
     pub dates: parse::DateTab,
     /// Debug switch: send every line through the scalar parsers.
     pub scalar_only: bool,
+    /// Software prefetch distance in bytes for the event parser (0 = off).
+    pub prefetch_ahead: usize,
     pub table: Table,
     pub pool: BlockPool,
     pub files: Vec<FileMap>,
@@ -90,6 +92,8 @@ pub struct Ctx {
     psw: Vec<Shared<PartWriter>>,
     acc: Vec<Shared<Vec<CampCell>>>,
     barrier: Barrier,
+    /// Thread CPU nanoseconds per profiled section, summed over threads (TIMING only).
+    pub prof: [std::sync::atomic::AtomicU64; 12],
     /// Set when the data does not fit the fast path's packed layouts.
     pub bail: AtomicBool,
     out_dir: PathBuf,
@@ -117,6 +121,28 @@ impl Ctx {
         unsafe { &*self.psw[t].0.get() }
     }
 
+    /// Profiling: the current thread CPU time, or 0 when not timing.
+    #[inline]
+    pub fn now(&self) -> u64 {
+        if self.timing {
+            sys::thread_cpu_ns()
+        } else {
+            0
+        }
+    }
+
+    /// Profiling: charge the time since `since` to `section`; returns the new "now".
+    #[inline]
+    pub fn charge(&self, section: usize, since: u64) -> u64 {
+        if self.timing {
+            let t = sys::thread_cpu_ns();
+            self.prof[section].fetch_add(t - since, Relaxed);
+            t
+        } else {
+            0
+        }
+    }
+
     fn failed(&self) -> bool {
         self.bail.load(Relaxed) || self.table.overflow.load(Relaxed)
     }
@@ -127,6 +153,22 @@ impl Ctx {
         }
     }
 }
+
+// Profiled sections (thread CPU time, printed with TIMING=1).
+pub const P_EVENTS: usize = 0;
+pub const P_CLICKS: usize = 1;
+pub const P_FINALIZE: usize = 2;
+pub const P_D_GATHER: usize = 3;
+pub const P_D_DEDUP: usize = 4;
+pub const P_D_EMIT: usize = 5;
+pub const P_S_GATHER: usize = 6;
+pub const P_S_SORT: usize = 7;
+pub const P_S_PEOPLE: usize = 8;
+pub const P_WRITE: usize = 9;
+const P_NAMES: [&str; 10] = [
+    "parse events", "parse clicks", "finalize", "dedup gather", "dedup table", "dedup emit", "sessions gather",
+    "sessions sort", "sessions people", "write user_daily",
+];
 
 const CHUNK: usize = 1 << 20;
 const LINK_CHUNK: usize = 1 << 18;
@@ -171,6 +213,7 @@ fn worker(ctx: &Ctx, tid: usize) {
     {
         let d = unsafe { &mut *ctx.d[tid].0.get() };
         let c = unsafe { &mut *ctx.c[tid].0.get() };
+        let mut t = ctx.now();
         loop {
             let i = ctx.next_main.fetch_add(1, Relaxed);
             if i >= ctx.main_chunks.len() {
@@ -178,12 +221,19 @@ fn worker(ctx: &Ctx, tid: usize) {
             }
             let ch = &ctx.main_chunks[i];
             match ch.kind {
-                FileKind::Events => parse::events_chunk(ctx, d, ch),
-                _ => parse::clicks_chunk(ctx, c, ch),
+                FileKind::Events => {
+                    parse::events_chunk(ctx, d, ch);
+                    t = ctx.charge(P_EVENTS, t);
+                }
+                _ => {
+                    parse::clicks_chunk(ctx, c, ch);
+                    t = ctx.charge(P_CLICKS, t);
+                }
             }
         }
         d.finalize(&ctx.pool);
         c.finalize(&ctx.pool);
+        ctx.charge(P_FINALIZE, t);
     }
     ctx.sync("events and clicks parsed");
     if ctx.failed() {
@@ -218,7 +268,9 @@ fn worker(ctx: &Ctx, tid: usize) {
         }
         pass3::run(ctx, &mut sc, p);
     }
+    let t = ctx.now();
     write_user_daily(ctx, &sc.rows, tid);
+    ctx.charge(P_WRITE, t);
     unsafe { *ctx.acc[tid].0.get() = std::mem::take(&mut sc.acc) };
     std::mem::forget(sc);
     ctx.sync("sessions built, user_daily written");
@@ -453,6 +505,7 @@ fn main() {
         event_dict: Dict::new(),
         dates: parse::DateTab::new(ws),
         scalar_only: std::env::var("SCALAR").is_ok(),
+        prefetch_ahead: std::env::var("PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         table: Table::new(cap),
         pool: BlockPool::new(pool_blocks),
         files,
@@ -472,6 +525,7 @@ fn main() {
         psw: (0..nthreads).map(|_| Shared::new(PartWriter::new(ps))).collect(),
         acc: (0..nthreads).map(|_| Shared::new(Vec::new())).collect(),
         barrier: Barrier::new(nthreads),
+        prof: Default::default(),
         bail: AtomicBool::new(false),
         out_dir,
         timing,
@@ -512,6 +566,11 @@ fn main() {
     }
     write_campaign_daily(&ctx);
     if timing {
+        let total: u64 = ctx.prof.iter().map(|p| p.load(Relaxed)).sum();
+        for (name, p) in P_NAMES.iter().zip(&ctx.prof) {
+            let ns = p.load(Relaxed);
+            eprintln!("    cpu {:8.2} ms {:5.1}%  {name}", ns as f64 / 1e6, 100.0 * ns as f64 / total.max(1) as f64);
+        }
         eprintln!(
             "[{:8.2} ms] done; pool used {} MB, irregular ids: users {}, events {}, clicks {}",
             t_start.elapsed().as_secs_f64() * 1e3,
