@@ -78,6 +78,11 @@ pub struct Ctx {
     zap: bool,
     /// Experiment switch: load products/campaigns before starting the threads.
     eager_lookups: bool,
+    /// Input by `pread` into a private per-thread buffer instead of a mapping.
+    pub read_io: bool,
+    /// Read mode: bytes read past a chunk's end at first (test switch: a tiny
+    /// value forces the path that extends the read for an unfinished line).
+    pub read_tail: usize,
     pub table: Table,
     pub pool: BlockPool,
     pub files: Vec<FileMap>,
@@ -212,6 +217,7 @@ const P_NAMES: [&str; 10] = [
 ];
 
 const CHUNK: usize = 1 << 20;
+const READ_CHUNK: usize = 1 << 18;
 const LINK_CHUNK: usize = 1 << 18;
 const COMPRESS_STEP: usize = 1 << 16;
 
@@ -244,12 +250,13 @@ fn worker(ctx: &Ctx, tid: usize) {
         ctx.load_lookups();
     }
     // ---- links: insert both IDs, join them
+    let mut io = parse::Input::new();
     loop {
         let i = ctx.next_link.fetch_add(1, Relaxed);
         if i >= ctx.link_chunks.len() {
             break;
         }
-        parse::links_chunk(ctx, &ctx.link_chunks[i]);
+        parse::links_chunk(ctx, &mut io, &ctx.link_chunks[i]);
     }
     ctx.sync("links parsed");
     if ctx.failed() {
@@ -277,11 +284,11 @@ fn worker(ctx: &Ctx, tid: usize) {
             let ch = &ctx.main_chunks[i];
             match ch.kind {
                 FileKind::Events => {
-                    parse::events_chunk(ctx, d, ch);
+                    parse::events_chunk(ctx, d, &mut io, ch);
                     t = ctx.charge(P_EVENTS, t);
                 }
                 _ => {
-                    parse::clicks_chunk(ctx, c, ch);
+                    parse::clicks_chunk(ctx, c, &mut io, ch);
                     t = ctx.charge(P_CLICKS, t);
                 }
             }
@@ -354,8 +361,9 @@ fn worker(ctx: &Ctx, tid: usize) {
 fn bench(ctx: &Ctx) {
     sys::NORELEASE.store(true, Relaxed);
     ctx.load_lookups();
+    let mut io = parse::Input::new();
     for ch in &ctx.link_chunks {
-        parse::links_chunk(ctx, ch);
+        parse::links_chunk(ctx, &mut io, ch);
     }
     ctx.table.compress(0, ctx.table.cap);
     let region: usize = std::env::var("BENCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 19);
@@ -382,9 +390,9 @@ fn bench(ctx: &Ctx) {
             w.free = std::mem::take(&mut free);
             let t = sys::thread_cpu_ns();
             match kind {
-                FileKind::Events => parse::events_chunk(ctx, &mut w, &ch),
-                FileKind::Clicks => parse::clicks_chunk(ctx, &mut w, &ch),
-                FileKind::Links => parse::links_chunk(ctx, &ch),
+                FileKind::Events => parse::events_chunk(ctx, &mut w, &mut io, &ch),
+                FileKind::Clicks => parse::clicks_chunk(ctx, &mut w, &mut io, &ch),
+                FileKind::Links => parse::links_chunk(ctx, &mut io, &ch),
             }
             best = best.min(sys::thread_cpu_ns() - t);
             w.finalize(&ctx.pool);
@@ -496,17 +504,21 @@ fn main() {
     // Test switch: tiny chunks put every kind of line on a chunk boundary.
     let chunk_override: Option<usize> =
         std::env::var("CHUNK_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0);
+    // Input mode: IO=read copies each chunk into a private buffer that fits the
+    // L2 cache; the default maps the files.
+    let read_io = std::env::var("IO").map_or(false, |v| v == "read");
+    let main_chunk = if read_io { READ_CHUNK } else { CHUNK };
     let mut files: Vec<FileMap> = Vec::new();
     let mut link_chunks: Vec<Chunk> = Vec::new();
     let mut main_chunks: Vec<Chunk> = Vec::new();
     let mut bytes = [0usize; 3];
     for (kind, dir, step) in [
         (FileKind::Links, "links", chunk_override.unwrap_or(LINK_CHUNK)),
-        (FileKind::Clicks, "clicks", chunk_override.unwrap_or(CHUNK)),
-        (FileKind::Events, "events", chunk_override.unwrap_or(CHUNK)),
+        (FileKind::Clicks, "clicks", chunk_override.unwrap_or(main_chunk)),
+        (FileKind::Events, "events", chunk_override.unwrap_or(main_chunk)),
     ] {
         for path in list_csv(&data_dir.join(dir)) {
-            let map = FileMap::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let map = FileMap::open(&path, !read_io).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let len = map.len;
             bytes[kind as usize] += len;
             let file = files.len() as u32;
@@ -535,9 +547,12 @@ fn main() {
     // Event partitions: about 0.5 MB of records each, but never so many that a
     // thread's write-combining lines (64 bytes per partition) crowd its L2.
     let pd = (events_bytes / 2_400_000).next_power_of_two().clamp(1 << parse::MIN_PD_BITS, 2048);
-    let pool_blocks = (events_bytes * 5 / 2 + clicks_bytes * 2) / part::BLOCK_BYTES
-        + (pd + 3 * ps) * nthreads * 2
-        + 4096;
+    // Block pool: address space for the worst case (every line as short as a
+    // line can be); real data needs about a fifth of it. `pool_floor` is what
+    // to settle for if the kernel will not reserve that much.
+    let pool_slack = (pd + 3 * ps) * nthreads * 2 + 4096;
+    let pool_blocks = (events_bytes * 5 / 2 + clicks_bytes * 2) / part::BLOCK_BYTES + pool_slack;
+    let pool_floor = (events_bytes * 3 / 5 + clicks_bytes * 4 / 5) / part::BLOCK_BYTES + pool_slack;
 
     let t0 = ws - REACH_MS;
     let day0 = t0.div_euclid(DAY_MS);
@@ -572,8 +587,10 @@ fn main() {
         prefetch_ahead: std::env::var("PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
         zap: std::env::var("NOZAP").is_err(),
         eager_lookups: std::env::var("EAGER_LOOKUPS").is_ok(),
+        read_io,
+        read_tail: std::env::var("READ_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(parse::TAIL),
         table: Table::new(cap),
-        pool: BlockPool::new(pool_blocks),
+        pool: BlockPool::new(pool_blocks, pool_floor),
         files,
         link_chunks,
         main_chunks,

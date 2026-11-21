@@ -5,11 +5,58 @@
 //! oracle the fast path is diffed against at sizes the Python reference cannot
 //! reach (`--slow`).
 
-use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
 use crate::parquet::{self, Column, Kind};
 use crate::util::{for_each_line, parse_price, parse_ts, split, DAY_MS, REACH_MS};
+
+/// A fast multiplicative hasher (the default SipHash dominates this code's
+/// run time otherwise). Keys here are not attacker-chosen in any way that matters.
+#[derive(Default, Clone, Copy)]
+struct Mix(u64);
+
+impl Mix {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+}
+
+impl Hasher for Mix {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(w));
+        }
+        self.add(bytes.len() as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    #[inline]
+    fn write_i64(&mut self, v: i64) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+}
+
+type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<Mix>>;
+type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<Mix>>;
 
 struct Event {
     ingest: i64,
@@ -76,7 +123,7 @@ pub fn run(data_dir: &Path, out_dir: &Path) {
 
     // products -> category index (categories sorted byte-wise, `unknown` included)
     let products_raw = std::fs::read(data_dir.join("products.csv")).unwrap_or_default();
-    let mut product_cat: HashMap<&[u8], &[u8]> = HashMap::new();
+    let mut product_cat: HashMap<&[u8], &[u8]> = HashMap::default();
     for_each_line(&products_raw, 0, products_raw.len(), |line| {
         if let Some([id, cat]) = split::<2>(line) {
             product_cat.insert(id, cat);
@@ -90,7 +137,7 @@ pub fn run(data_dir: &Path, out_dir: &Path) {
     let unknown = cat_index[&b"unknown"[..]];
 
     let campaigns_raw = std::fs::read(data_dir.join("campaigns.csv")).unwrap_or_default();
-    let mut campaign_index: HashMap<&[u8], u32> = HashMap::new();
+    let mut campaign_index: HashMap<&[u8], u32> = HashMap::default();
     let mut campaign_ids: Vec<&[u8]> = Vec::new();
     let mut campaign_channels: Vec<&[u8]> = Vec::new();
     for_each_line(&campaigns_raw, 0, campaigns_raw.len(), |line| {
@@ -121,7 +168,7 @@ pub fn run(data_dir: &Path, out_dir: &Path) {
     }
 
     // ---- events: dedup on event_id (smallest ingest_ts), validity of the kept copy
-    let mut events: HashMap<Box<[u8]>, Event> = HashMap::new();
+    let mut events: HashMap<Box<[u8]>, Event> = HashMap::default();
     for path in csv_files(&data_dir.join("events")) {
         let data = std::fs::read(&path).expect("read events");
         for_each_line(&data, 0, data.len(), |line| {
@@ -168,7 +215,7 @@ pub fn run(data_dir: &Path, out_dir: &Path) {
         });
     }
     // (ts, purchase, price, category) per person
-    let mut per_person: HashMap<u32, Vec<(i64, bool, u32, u32)>> = HashMap::new();
+    let mut per_person: HashMap<u32, Vec<(i64, bool, u32, u32)>> = HashMap::default();
     for e in events.values() {
         if e.valid {
             let person = users.find(e.user);
@@ -178,8 +225,8 @@ pub fn run(data_dir: &Path, out_dir: &Path) {
     drop(events);
 
     // ---- clicks: dedup on click_id, validate; (ts, click_id, campaign) per person
-    let mut seen: HashSet<Box<[u8]>> = HashSet::new();
-    let mut person_clicks: HashMap<u32, Vec<(i64, Box<[u8]>, u32)>> = HashMap::new();
+    let mut seen: HashSet<Box<[u8]>> = HashSet::default();
+    let mut person_clicks: HashMap<u32, Vec<(i64, Box<[u8]>, u32)>> = HashMap::default();
     for path in csv_files(&data_dir.join("clicks")) {
         let data = std::fs::read(&path).expect("read clicks");
         for_each_line(&data, 0, data.len(), |line| {
@@ -204,9 +251,9 @@ pub fn run(data_dir: &Path, out_dir: &Path) {
 
     // ---- sessions, attribution, aggregation
     // (person, day) -> (sessions, events, revenue, category sums)
-    let mut user_daily: HashMap<(u32, i64), (i64, i64, i64, HashMap<u32, i64>)> = HashMap::new();
+    let mut user_daily: HashMap<(u32, i64), (i64, i64, i64, HashMap<u32, i64>)> = HashMap::default();
     // (campaign, day) -> (sessions, purchasing, revenue, assisted)
-    let mut campaign_daily: HashMap<(u32, i64), (i64, i64, i64, i64)> = HashMap::new();
+    let mut campaign_daily: HashMap<(u32, i64), (i64, i64, i64, i64)> = HashMap::default();
     let no_clicks: Vec<(i64, Box<[u8]>, u32)> = Vec::new();
     for (&person, list) in per_person.iter_mut() {
         list.sort_unstable_by_key(|e| e.0);

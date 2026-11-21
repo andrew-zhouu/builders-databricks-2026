@@ -39,19 +39,26 @@ const MADV_HUGEPAGE: c_int = 14;
 pub static NOHUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static NORELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Zeroed, lazily committed memory. Never returned to the OS before exit.
-pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
+/// Zeroed, lazily committed memory, or `None` if the kernel refuses the mapping
+/// (possible for very large reservations under strict overcommit). Never
+/// returned to the OS before exit.
+pub fn try_map_anon(len: usize, huge: bool) -> Option<*mut u8> {
     let len = len.max(4096);
     let p = unsafe {
         mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
     };
     if p as isize == -1 {
-        panic!("mmap of {len} bytes failed");
+        return None;
     }
     if huge && !NOHUGE.load(std::sync::atomic::Ordering::Relaxed) {
         unsafe { madvise(p, len, MADV_HUGEPAGE) };
     }
-    p as *mut u8
+    Some(p as *mut u8)
+}
+
+/// As `try_map_anon`, for memory the program cannot run without.
+pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
+    try_map_anon(len, huge).unwrap_or_else(|| panic!("mmap of {len} bytes failed"))
 }
 
 /// Drop the fully covered pages of an anonymous range (their contents are lost).
@@ -63,26 +70,44 @@ pub fn zap(ptr: *mut u8, len: usize) {
     }
 }
 
-/// A read-only private mapping of a whole file. Empty files map to an empty slice.
+/// An input file: open for positioned reads, and (unless `map` is false) a
+/// read-only private mapping of the whole of it. Empty files map to an empty slice.
 pub struct FileMap {
     pub ptr: *const u8,
     pub len: usize,
+    file: File,
 }
 unsafe impl Send for FileMap {}
 unsafe impl Sync for FileMap {}
 
 impl FileMap {
-    pub fn open(path: &std::path::Path) -> std::io::Result<FileMap> {
+    pub fn open(path: &std::path::Path, map: bool) -> std::io::Result<FileMap> {
         let f = File::open(path)?;
         let len = f.metadata()?.len() as usize;
-        if len == 0 {
-            return Ok(FileMap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+        if len == 0 || !map {
+            return Ok(FileMap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len, file: f });
         }
         let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(FileMap { ptr: p as *const u8, len })
+        Ok(FileMap { ptr: p as *const u8, len, file: f })
+    }
+
+    /// Fill `buf` from byte `offset` of the file; returns the bytes read
+    /// (short only at end of file).
+    pub fn read_at(&self, buf: &mut [u8], offset: usize) -> usize {
+        use std::os::unix::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            match self.file.read_at(&mut buf[done..], (offset + done) as u64) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+        done
     }
 
     #[inline]
