@@ -14,13 +14,16 @@ for seed in $(seq "$first" $((first + count - 1))); do
     echo "seed $seed: reference failed: $(tail -1 "$d/ref.log")"; fails=$((fails+1)); continue
   fi
   bad=""
-  for mode in fast scalar slow one; do
+  for mode in fast scalar slow one tiny tiny8; do
     o="$d/$mode"; mkdir -p "$o"
     case "$mode" in
       fast)   NCPU=3 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
       scalar) NCPU=2 SCALAR=1 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
       slow)   "$BIN" --slow "$d/data" "$o" 2>"$o.log" ;;
       one)    NCPU=1 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      # tiny chunks: lines of every kind start, end and straddle chunk boundaries
+      tiny)   NCPU=4 CHUNK_BYTES=$((seed % 97 + 31)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      tiny8)  NCPU=8 CHUNK_BYTES=$((seed % 1013 + 300)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
     esac
     if [ $? -ne 0 ] || ! "$PY" -I "$PROJ/tools/cmp.py" "$d/expected" "$o" >"$o.cmp" 2>&1; then
       bad="$bad $mode"

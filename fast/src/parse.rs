@@ -751,6 +751,11 @@ pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) {
         let mut ring = ClickRing::new();
         while pos < ch.end {
             if (pos >= HEAD) & (pos < fast_end) {
+                if ctx.prefetch_ahead != 0 {
+                    unsafe {
+                        _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + ctx.prefetch_ahead) as *const i8)
+                    };
+                }
                 let used = unsafe { click_fast(ctx, c, &mut ring, data.as_ptr().add(pos)) };
                 if used != 0 {
                     pos += used;
