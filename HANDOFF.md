@@ -111,9 +111,29 @@ What it would settle: whether transparent huge pages are available (the design l
 on them for the user table and the partition pool), whether kernel time is as large
 there as here, and whether fewer threads than hyperthreads would be faster.
 
+## An open lead: releasing memory may cost more than it saves
+
+Inside the container with the scorer's flags (`scripts/docker_ab.sh`, 20M events, 5
+interleaved rounds, min / median, on a very busy machine):
+
+| Variant | time to done, ms | kernel ms |
+| --- | --- | --- |
+| default | 1879 / 2254 | 1538 / 1981 |
+| `SS_NORELEASE=1,SS_NOZAP=1` (keep input pages mapped, no parallel teardown) | 1366 / 2036 | 1294 / 1301 |
+| `SS_NOHUGE=1` | 2432 / 3012 | 1794 / 2317 |
+| `NCPU=4` | 2505 / 2615 | 1319 / 1828 |
+
+So huge pages and 8 threads are right, but the per-chunk `madvise` calls that release
+parsed input (and the parallel teardown at the end) may be a net loss: every one of
+them interrupts all the other threads to flush their TLBs. Outside the container on a
+quieter machine at 5M the same switch made no measurable difference, so this needs a
+20M series on a quiet machine, with the process exit included, before the default
+changes. The diagnostic log includes this variant on the scorer's own kernel.
+
 ## Next steps, in order of expected value
 
-1. Submit the diagnostic image once and read its log (decides items 3 and 4).
+1. Submit the diagnostic image once and read its log (decides items 3 and 4, and the
+   open lead above).
 2. Rewrite `event_fast` for instruction count (target about 300 per line), then
    `click_fast` the same way.
 3. If the scorer shows large kernel time: test thread counts below 8 and pread there.
