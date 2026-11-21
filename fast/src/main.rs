@@ -18,6 +18,7 @@ mod table;
 mod util;
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Barrier;
@@ -546,19 +547,93 @@ fn bench(ctx: &Ctx) {
 }
 
 fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
+    use parquet::{as_bytes, index_width, pack_indices, small_dict};
     let n = rows.n;
     if n == 0 && tid != 0 {
         return;
     }
+    // Every column as a dictionary and bit-packed indexes into it.
+    let id_idx = pack_indices(rows.id_idx.iter().copied(), n, index_width(rows.people as usize));
+    let days: Vec<i32> = (0..ctx.ndays as i64).map(|d| (ctx.day0 + d) as i32).collect();
+    let day_idx = pack_indices(rows.day.iter().map(|&d| d as u32), n, index_width(days.len()));
+    // Small counts: the distinct values. (Plain, should one ever be huge.)
+    let small = |values: &[i32]| small_dict(values).map(|(dict, idx)| (pack_indices(idx.iter().copied(), n, index_width(dict.len())), dict));
+    let (sessions, events) = (small(&rows.sessions), small(&rows.events));
+    // Revenue is zero for most rows and anything for the rest.
+    let mut amounts: Vec<i64> = vec![0];
+    let mut seen: HashMap<i64, u32> = HashMap::new();
+    let revenue_at: Vec<u32> = rows
+        .revenue
+        .iter()
+        .map(|&v| {
+            if v == 0 {
+                0
+            } else {
+                *seen.entry(v).or_insert_with(|| {
+                    amounts.push(v);
+                    amounts.len() as u32 - 1
+                })
+            }
+        })
+        .collect();
+    let revenue_idx = pack_indices(revenue_at.iter().copied(), n, index_width(amounts.len()));
     let levels = parquet::def_levels_header(&rows.valid);
-    let (ids, cats) = (&rows.ids, &rows.cats);
+    let categories: Vec<u8> = ctx.cat_recs().concat();
+    let cat_idx = pack_indices(rows.cats.iter().copied(), rows.cats.len(), index_width(ctx.cat_recs().len()));
+
+    let int = |name: &'static str, values: &'_ [i32], coded: &'_ Option<(Vec<u8>, Vec<i32>)>| match coded {
+        Some((idx, dict)) => Column {
+            name,
+            ptype: parquet::INT32,
+            kind: Kind::Int,
+            optional: false,
+            payload: vec![unsafe { std::slice::from_raw_parts(idx.as_ptr(), idx.len()) }],
+            dict: Some((vec![unsafe { std::slice::from_raw_parts(dict.as_ptr() as *const u8, 4 * dict.len()) }], dict.len())),
+        },
+        None => Column {
+            name,
+            ptype: parquet::INT32,
+            kind: Kind::Int,
+            optional: false,
+            payload: vec![unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, 4 * values.len()) }],
+            dict: None,
+        },
+    };
     let columns = [
-        Column { name: "user_id", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![ids] },
-        Column { name: "day", ptype: parquet::INT32, kind: Kind::Date, optional: false, payload: vec![parquet::as_bytes(&rows.day)] },
-        Column { name: "sessions", ptype: parquet::INT32, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&rows.sessions)] },
-        Column { name: "events", ptype: parquet::INT32, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&rows.events)] },
-        Column { name: "revenue_cents", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&rows.revenue)] },
-        Column { name: "top_category", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: true, payload: vec![&levels, &rows.valid, cats] },
+        Column {
+            name: "user_id",
+            ptype: parquet::BYTE_ARRAY,
+            kind: Kind::Str,
+            optional: false,
+            payload: vec![&id_idx],
+            dict: Some((vec![&rows.ids], rows.people as usize)),
+        },
+        Column {
+            name: "day",
+            ptype: parquet::INT32,
+            kind: Kind::Date,
+            optional: false,
+            payload: vec![&day_idx],
+            dict: Some((vec![as_bytes(&days)], days.len())),
+        },
+        int("sessions", &rows.sessions, &sessions),
+        int("events", &rows.events, &events),
+        Column {
+            name: "revenue_cents",
+            ptype: parquet::INT64,
+            kind: Kind::Int,
+            optional: false,
+            payload: vec![&revenue_idx],
+            dict: Some((vec![as_bytes(&amounts)], amounts.len())),
+        },
+        Column {
+            name: "top_category",
+            ptype: parquet::BYTE_ARRAY,
+            kind: Kind::Str,
+            optional: true,
+            payload: vec![&levels, &rows.valid, &cat_idx],
+            dict: Some((vec![&categories], ctx.cat_recs().len())),
+        },
     ];
     let path = ctx.out_dir.join("user_daily").join(format!("part-{tid:03}.parquet"));
     parquet::write(&path, n, &columns).expect("write user_daily");
@@ -601,13 +676,13 @@ fn write_campaign_daily(ctx: &Ctx) {
         }
     }
     let columns = [
-        Column { name: "campaign_id", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![&ids] },
-        Column { name: "channel", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![&channels] },
-        Column { name: "day", ptype: parquet::INT32, kind: Kind::Date, optional: false, payload: vec![parquet::as_bytes(&day)] },
-        Column { name: "sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&sessions)] },
-        Column { name: "purchasing_sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&purchasing)] },
-        Column { name: "revenue_cents", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&revenue)] },
-        Column { name: "assisted_sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&assisted)] },
+        Column { name: "campaign_id", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![&ids], dict: None },
+        Column { name: "channel", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![&channels], dict: None },
+        Column { name: "day", ptype: parquet::INT32, kind: Kind::Date, optional: false, payload: vec![parquet::as_bytes(&day)], dict: None },
+        Column { name: "sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&sessions)], dict: None },
+        Column { name: "purchasing_sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&purchasing)], dict: None },
+        Column { name: "revenue_cents", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&revenue)], dict: None },
+        Column { name: "assisted_sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&assisted)], dict: None },
     ];
     let path = ctx.out_dir.join("campaign_daily").join("part-000.parquet");
     parquet::write(&path, day.len(), &columns).expect("write campaign_daily");
