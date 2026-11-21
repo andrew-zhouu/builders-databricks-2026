@@ -20,8 +20,9 @@
 //!    Every other valid copy must not count. If the kept copy is itself
 //!    invalid, nothing of the event remains, as the rules require (dedup
 //!    comes before validation).
-//! 4. Every valid event that is left is written to its person's partition,
-//!    into the trace blocks of the partitions already done.
+//! Every valid event that is left is written to its person's partition (as
+//! soon as it is known to count: most during the second reading of the
+//! traces), into the trace blocks of the partitions already done.
 
 use core::arch::x86_64::{_bzhi_u64, _mm_prefetch, _MM_HINT_T0};
 
@@ -71,8 +72,6 @@ impl Cancels {
 
 /// One copy of a possibly repeated event, read again from the input.
 struct Copy {
-    /// The trace's first word (which names the line), and its fingerprint.
-    w1: u64,
     fp: u64,
     id: (*const u8, usize),
     /// The first 16 bytes of the event_id, zero-padded: settling compares
@@ -105,11 +104,6 @@ struct Pending {
 pub struct Scratch {
     seen: Vec<u64>,
     seen2: Vec<u64>,
-    /// The first words of the traces whose events must not count, as a list,
-    /// as an open-addressing set, and as a bitmap in front of that.
-    dead: Vec<u64>,
-    dead_set: Vec<u64>,
-    dead_bits: Vec<u64>,
     cand: Vec<[u64; 2]>,
     tmp: Vec<[u64; 2]>,
     /// The first words of the traces whose lines must be read again.
@@ -125,98 +119,26 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, s: &mut PartWriter, p
     if n == 0 {
         return;
     }
-    sc.dead.clear();
-    let t0 = if n >= 2 { repeats(ctx, sc, out, p, n, t0) } else { t0 };
-
-    // The traces whose events must not count, as a set with a bitmap of 16
-    // bits per entry in front of it.
-    let ndead = sc.dead.len();
-    out.dropped += ndead;
-    let bits = (4 * ndead.max(16)).next_power_of_two().trailing_zeros();
-    let mask = (1usize << bits) - 1;
-    let fbits = (16 * ndead.max(16)).next_power_of_two().trailing_zeros().max(6);
-    let mix = |w: u64| w.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let slot_of = |h: u64| (h >> (64 - bits)) as usize;
-    let bit_of = |h: u64| ((h << 20) >> (64 - fbits)) as usize;
-    if ndead > 0 {
-        sc.dead_set.clear();
-        sc.dead_set.resize(1 << bits, 0);
-        sc.dead_bits.clear();
-        sc.dead_bits.resize(1 << (fbits - 6), 0);
-        for &w in &sc.dead {
-            // (A trace's first word is never 0: a line of the first megabyte
-            // of input would need a zero fingerprint too; harmless if so.)
-            let h = mix(w);
-            let mut i = slot_of(h);
-            while sc.dead_set[i] != 0 {
-                i = (i + 1) & mask;
-            }
-            sc.dead_set[i] = w;
-            sc.dead_bits[bit_of(h) >> 6] |= 1u64 << (bit_of(h) & 63);
-        }
-    }
-    let (set, filter) = (&sc.dead_set[..], &sc.dead_bits[..]);
-
-    // Every valid event that is left goes to its person's partition.
     let sw = s.cursors();
     let pool = &ctx.pool;
-    for t in 0..ctx.nthreads {
-        ctx.k(t).for_each_run(pool, p, |run| {
-            for r in run.chunks_exact(2) {
-                let (w1, w2) = (r[0], r[1]);
-                if w2 == 0 {
-                    continue;
-                }
-                if ndead > 0 {
-                    let h = mix(w1);
-                    let b = bit_of(h);
-                    if unsafe { *filter.get_unchecked(b >> 6) } & (1u64 << (b & 63)) != 0 {
-                        let mut i = slot_of(h);
-                        let mut dead = false;
-                        loop {
-                            let e = unsafe { *set.get_unchecked(i) };
-                            if e == 0 {
-                                break;
-                            }
-                            if e == w1 {
-                                dead = true;
-                                break;
-                            }
-                            i = (i + 1) & mask;
-                        }
-                        if dead {
-                            continue;
-                        }
-                    }
-                }
-                let (part, rec) = trace_record(w2);
-                unsafe { s.push1_at(sw, pool, part as usize, rec) };
-            }
-        });
+    // A valid event goes to its person's partition.
+    macro_rules! send {
+        ($w2:expr) => {{
+            let (part, rec) = trace_record($w2);
+            unsafe { s.push1_at(sw, pool, part as usize, rec) };
+        }};
     }
-    // The partition's trace blocks are free now: the events of later
-    // partitions are written into them.
-    for t in 0..ctx.nthreads {
-        s.free.extend_from_slice(ctx.k(t).part_blocks(p));
-    }
-    ctx.charge_rows(crate::P_D_GATHER, t0, n);
-}
 
-/// Find the event IDs that occur more than once among the `n` traces of
-/// partition `p` and settle them: the first words of the traces whose events
-/// must not count go to `sc.dead`, purchase cancellations to `out`.
-fn repeats(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize, n: usize, t0: crate::prof::Snap) -> crate::prof::Snap {
     // Which fingerprints occur more than once? A table of two bits per slot,
     // "seen" and "seen again", indexed by the fingerprint's low bits, with 8
-    // slots per trace so that few unrelated traces share one. The traces are
-    // read where the parser left them, twice.
+    // slots per trace so that few unrelated traces share one.
     let slots = (8 * n).next_power_of_two().max(4096);
     sc.seen.clear();
     sc.seen.resize(slots / 32, 0);
     let tab = &mut sc.seen[..];
     let (shift, mask) = (ctx.loc_bits, slots as u64 - 1);
     for t in 0..ctx.nthreads {
-        ctx.k(t).for_each_run(&ctx.pool, p, |run| {
+        ctx.k(t).for_each_run(pool, p, |run| {
             for r in run.chunks_exact(2) {
                 let i = (r[0] >> shift) & mask;
                 let (w, b) = ((i >> 5) as usize, 1u64 << (2 * (i & 31)));
@@ -227,27 +149,32 @@ fn repeats(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize, n: usize, t
             }
         });
     }
-    // Collected without a branch: every trace is written, and the write
-    // position only moves on past the ones that are kept.
+    // Second reading: a trace whose slot was seen once is the only one with
+    // its event ID, and its event (if valid) is sent on at once. The others
+    // are collected.
     sc.cand.clear();
     sc.cand.reserve(n);
     let mut kept = 0usize;
     for t in 0..ctx.nthreads {
-        ctx.k(t).for_each_run(&ctx.pool, p, |run| {
+        ctx.k(t).for_each_run(pool, p, |run| {
             for r in run.chunks_exact(2) {
                 let i = (r[0] >> shift) & mask;
-                unsafe {
-                    let again = *tab.get_unchecked((i >> 5) as usize) >> (2 * (i & 31) + 1) & 1;
-                    *sc.cand.as_mut_ptr().add(kept) = [r[0], r[1]];
-                    kept += again as usize;
+                let again = unsafe { *tab.get_unchecked((i >> 5) as usize) } >> (2 * (i & 31) + 1) & 1;
+                if again == 0 {
+                    if r[1] != 0 {
+                        send!(r[1]);
+                    }
+                } else {
+                    unsafe { *sc.cand.as_mut_ptr().add(kept) = [r[0], r[1]] };
+                    kept += 1;
                 }
             }
         });
     }
     unsafe { sc.cand.set_len(kept) };
-    // About half of those only share a slot with an unrelated trace. The same
-    // test again on other bits of the fingerprint removes nearly all of them,
-    // so that only true repeats are sorted.
+    // About half of the collected ones only share a slot with an unrelated
+    // trace. The same test on other bits of the fingerprint clears nearly all
+    // of those; they are sent on as well.
     if ctx.fp_mask >> 14 != 0 && sc.cand.len() >= 2 {
         let slots = (16 * sc.cand.len()).next_power_of_two().max(4096);
         let (shift2, mask2) = (shift + 13, (slots as u64 - 1) & (ctx.fp_mask >> 13));
@@ -260,24 +187,36 @@ fn repeats(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize, n: usize, t
             let v = tab[w];
             tab[w] = v | b | (v & b) << 1;
         }
-        sc.cand.retain(|r| {
+        let mut kept = 0usize;
+        for at in 0..sc.cand.len() {
+            let r = sc.cand[at];
             let i = (r[0] >> shift2) & mask2;
-            tab[(i >> 5) as usize] >> (2 * (i & 31) + 1) & 1 != 0
-        });
+            if tab[(i >> 5) as usize] >> (2 * (i & 31) + 1) & 1 != 0 {
+                sc.cand[kept] = r;
+                kept += 1;
+            } else if r[1] != 0 {
+                send!(r[1]);
+            }
+        }
+        sc.cand.truncate(kept);
     }
     let t0 = ctx.charge_rows(crate::P_D_DEDUP, t0, n);
+    // The partition's trace blocks have been read for the last time: the
+    // events of later partitions are written into them.
+    for t in 0..ctx.nthreads {
+        s.free.extend_from_slice(ctx.k(t).part_blocks(p));
+    }
     if sc.cand.is_empty() {
-        return t0;
+        return;
     }
 
     // Bring equal fingerprints together. A fingerprint that turns out to be
     // unique after all is done with. So is the usual repeat, which the traces
     // settle by themselves: every copy valid, of the same person at the same
     // time (and not a purchase, whose price the trace does not hold). Whichever
-    // copy is the kept one, exactly one of those identical events counts: all
-    // but the first are dropped. And copies that all failed validation count
-    // for nothing anyway. Only what is left needs its lines read again:
-    // `sc.reread`, groups together.
+    // copy is the kept one, exactly one of those identical events counts. And
+    // copies that all failed validation count for nothing. Only what is left
+    // needs its lines read again: `sc.reread`, groups together.
     sort_by_fp(&mut sc.cand, &mut sc.tmp, shift);
     sc.reread.clear();
     let cand = &sc.cand[..];
@@ -291,22 +230,21 @@ fn repeats(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize, n: usize, t
             same &= cand[j][1] == w2;
             j += 1;
         }
-        if j - i >= 2 {
-            if same & (w2 & T_PURCHASE == 0) {
-                if w2 != 0 {
-                    sc.dead.extend(cand[i + 1..j].iter().map(|r| r[0]));
-                }
-            } else {
-                sc.reread.extend(cand[i..j].iter().map(|r| r[0]));
+        if (j - i == 1) | (same & (w2 & T_PURCHASE == 0)) {
+            if w2 != 0 {
+                send!(w2);
+                out.dropped += j - i - 1;
             }
+        } else {
+            sc.reread.extend(cand[i..j].iter().map(|r| r[0]));
         }
         i = j;
     }
     let t0 = ctx.charge_rows(crate::P_D_GROUP, t0, sc.cand.len());
     read_again(ctx, sc);
     let t0 = ctx.charge_rows(crate::P_D_READ, t0, sc.reread.len());
-    settle(&mut sc.copies, out, &mut sc.dead);
-    ctx.charge_rows(crate::P_D_EMIT, t0, sc.reread.len())
+    settle(&mut sc.copies, out, |part, rec| unsafe { s.push1_at(sw, pool, part as usize, rec) });
+    ctx.charge_rows(crate::P_D_EMIT, t0, sc.reread.len());
 }
 
 /// Order traces by fingerprint (the bits of their first word from `shift`
@@ -380,7 +318,7 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
             continue;
         }
         let t = sc.reread[j - AHEAD];
-        let mut copy = Copy { w1: t, fp: t >> shift, id: (p, 0), head: [0; 2], ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
+        let mut copy = Copy { fp: t >> shift, id: (p, 0), head: [0; 2], ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
         let d = if can_decode(ctx, start, len) { unsafe { decode_event::<true>(ctx, p) } } else { TO_SCALAR_LINE };
         if d.used != 0 {
             copy.id = d.id;
@@ -439,10 +377,10 @@ fn same_id(a: &Copy, b: &Copy) -> bool {
     (a.id.1 == b.id.1) & (a.head == b.head) && (a.id.1 <= 16 || a.id() == b.id())
 }
 
-/// Copies of one event: every valid one that is not the kept one must not
-/// count (and takes its purchase back).
+/// The copies of one event (one or more): the kept one counts if it is valid
+/// (`send`), and every other valid one must not (and takes its purchase back).
 #[inline(always)]
-fn cancel(copies: &[Copy], out: &mut Cancels, dead: &mut Vec<u64>) {
+fn event(copies: &[Copy], out: &mut Cancels, send: &mut impl FnMut(u32, u64)) {
     let mut kept = 0;
     for (at, c) in copies.iter().enumerate() {
         if c.ingest < copies[kept].ingest {
@@ -450,18 +388,22 @@ fn cancel(copies: &[Copy], out: &mut Cancels, dead: &mut Vec<u64>) {
         }
     }
     for (at, c) in copies.iter().enumerate() {
-        if at != kept && c.valid {
-            dead.push(c.w1);
-            if c.extra != 0 {
-                out.purchases.push((c.part, [c.rec | CANCEL, c.extra]));
+        if c.valid {
+            if at == kept {
+                send(c.part, c.rec);
+            } else {
+                out.dropped += 1;
+                if c.extra != 0 {
+                    out.purchases.push((c.part, [c.rec | CANCEL, c.extra]));
+                }
             }
         }
     }
 }
 
 /// Group the copies by fingerprint and then by their actual event IDs, and
-/// drop every valid copy that is not the kept one of its event.
-fn settle(copies: &mut [Copy], out: &mut Cancels, dead: &mut Vec<u64>) {
+/// settle each event.
+fn settle(copies: &mut [Copy], out: &mut Cancels, mut send: impl FnMut(u32, u64)) {
     let mut a = 0;
     while a < copies.len() {
         let mut b = a + 1;
@@ -472,10 +414,7 @@ fn settle(copies: &mut [Copy], out: &mut Cancels, dead: &mut Vec<u64>) {
         a = b;
         // Nearly always one event's copies.
         if group[1..].iter().all(|c| same_id(c, &group[0])) {
-            cancel(group, out, dead);
-            continue;
-        }
-        if group.len() == 2 {
+            event(group, out, &mut send);
             continue;
         }
         // Different events share the fingerprint: bring equal IDs together
@@ -495,9 +434,7 @@ fn settle(copies: &mut [Copy], out: &mut Cancels, dead: &mut Vec<u64>) {
             while j < group.len() && same_id(&group[j], &group[i]) {
                 j += 1;
             }
-            if j - i >= 2 {
-                cancel(&group[i..j], out, dead);
-            }
+            event(&group[i..j], out, &mut send);
             i = j;
         }
     }

@@ -556,7 +556,12 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
     let days: Vec<i32> = (0..ctx.ndays as i64).map(|d| (ctx.day0 + d) as i32).collect();
     let day_idx = pack_indices(rows.day.iter().map(|&d| d as u32), n, index_width(days.len()));
     // Small counts: the distinct values. (Plain, should one ever be huge.)
-    let small = |values: &[i32]| small_dict(values).map(|(dict, idx)| (pack_indices(idx.iter().copied(), n, index_width(dict.len())), dict));
+    let small = |values: &[i32]| {
+        small_dict(values).map(|(dict, index)| {
+            let at = values.iter().map(|&v| unsafe { *index.get_unchecked(v as usize) });
+            (pack_indices(at, n, index_width(dict.len())), dict)
+        })
+    };
     let (sessions, events) = (small(&rows.sessions), small(&rows.events));
     // Revenue is zero for most rows and anything for the rest.
     let mut amounts: Vec<i64> = vec![0];
