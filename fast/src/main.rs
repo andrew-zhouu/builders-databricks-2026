@@ -564,39 +564,101 @@ fn bench(ctx: &Ctx) {
 }
 
 fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
-    use parquet::{as_bytes, index_width, pack_indices, small_dict};
+    use parquet::{as_bytes, index_width, pack_indices, packed_run, rle_run, small_dict};
     let n = rows.n;
-    // Every column as a dictionary and bit-packed indexes into it.
-    let id_idx = pack_indices(rows.id_idx.iter().copied(), n, index_width(rows.people as usize));
+    // The order of rows in a file is free: the rows without revenue go first.
+    // The revenue column and top_category's null flags (a row has a category
+    // exactly when it has revenue: a purchase costs at least a cent) are then
+    // two runs each, not a value and a bit per row.
+    let mut order: Vec<u32> = Vec::with_capacity(n + 1);
+    let mut paid: Vec<u32> = Vec::with_capacity(n + 1);
+    unsafe {
+        // Every row number is written to both lists; only one of them keeps it.
+        let (mut a, mut b) = (0usize, 0usize);
+        for i in 0..n {
+            let zero = (*rows.revenue.get_unchecked(i) == 0) as usize;
+            *order.as_mut_ptr().add(a) = i as u32;
+            *paid.as_mut_ptr().add(b) = i as u32;
+            a += zero;
+            b += 1 - zero;
+        }
+        order.set_len(a);
+        paid.set_len(b);
+    }
+    let free = order.len();
+    order.extend_from_slice(&paid);
+    assert_eq!(rows.cats.len(), n - free, "a row has a top category exactly when it has revenue");
+
+    // Every column as a dictionary and indexes into it. A person's rows
+    // follow each other (within each of the two parts), so their index is
+    // written as runs when that is shorter than bit-packing every row.
+    let id_width = index_width(rows.people as usize);
+    let ids_in_order = || order.iter().map(|&i| unsafe { *rows.id_idx.get_unchecked(i as usize) });
+    let (mut runs, mut last) = (0usize, u32::MAX);
+    for v in ids_in_order() {
+        runs += (v != last) as usize;
+        last = v;
+    }
+    let id_idx = if runs * (2 + (id_width as usize).div_ceil(8)) < n * id_width as usize / 8 {
+        let mut out = Vec::with_capacity(runs * 5 + 8);
+        out.push(id_width as u8);
+        let mut it = ids_in_order();
+        if let Some(mut value) = it.next() {
+            let mut count = 1usize;
+            for v in it {
+                if v == value {
+                    count += 1;
+                } else {
+                    rle_run(&mut out, value, count, id_width);
+                    value = v;
+                    count = 1;
+                }
+            }
+            rle_run(&mut out, value, count, id_width);
+        }
+        out
+    } else {
+        pack_indices(ids_in_order(), n, id_width)
+    };
     let days: Vec<i32> = (0..ctx.ndays as i64).map(|d| (ctx.day0 + d) as i32).collect();
-    let day_idx = pack_indices(rows.day.iter().map(|&d| d as u32), n, index_width(days.len()));
+    let day_idx = pack_indices(order.iter().map(|&i| unsafe { *rows.day.get_unchecked(i as usize) } as u32), n, index_width(days.len()));
     // Small counts: the distinct values. (Plain, should one ever be huge.)
     let small = |values: &[i32]| {
         small_dict(values).map(|(dict, index)| {
-            let at = values.iter().map(|&v| unsafe { *index.get_unchecked(v as usize) });
+            let at = order.iter().map(|&i| unsafe { *index.get_unchecked(*values.get_unchecked(i as usize) as usize) });
             (pack_indices(at, n, index_width(dict.len())), dict)
         })
     };
+    let plain = |values: &[i32]| -> Vec<i32> { order.iter().map(|&i| values[i as usize]).collect() };
     let (sessions, events) = (small(&rows.sessions), small(&rows.events));
-    // Revenue is zero for most rows and anything for the rest.
+    let sessions_plain = if sessions.is_none() { plain(&rows.sessions) } else { Vec::new() };
+    let events_plain = if events.is_none() { plain(&rows.events) } else { Vec::new() };
+    // Revenue: one run of zeros, then the amounts of the rows that have one.
     let mut amounts: Vec<i64> = vec![0];
     let mut seen: HashMap<i64, u32> = HashMap::new();
-    let revenue_at: Vec<u32> = rows
-        .revenue
+    let paid_at: Vec<u32> = order[free..]
         .iter()
-        .map(|&v| {
-            if v == 0 {
-                0
-            } else {
-                *seen.entry(v).or_insert_with(|| {
-                    amounts.push(v);
-                    amounts.len() as u32 - 1
-                })
-            }
+        .map(|&i| {
+            let v = rows.revenue[i as usize];
+            *seen.entry(v).or_insert_with(|| {
+                amounts.push(v);
+                amounts.len() as u32 - 1
+            })
         })
         .collect();
-    let revenue_idx = pack_indices(revenue_at.iter().copied(), n, index_width(amounts.len()));
-    let levels = parquet::def_levels_header(&rows.valid);
+    let revenue_width = index_width(amounts.len());
+    let mut revenue_idx = Vec::with_capacity(paid_at.len() * revenue_width as usize / 8 + 32);
+    revenue_idx.push(revenue_width as u8);
+    rle_run(&mut revenue_idx, 0, free, revenue_width);
+    packed_run(&mut revenue_idx, paid_at.iter().copied(), paid_at.len(), revenue_width);
+    // top_category: the definition levels (a 4-byte length, then runs of
+    // one-bit values: absent, present), then the categories of the rows that
+    // have one, which are in the same order as before.
+    let mut level_runs = Vec::with_capacity(16);
+    rle_run(&mut level_runs, 0, free, 1);
+    rle_run(&mut level_runs, 1, n - free, 1);
+    let mut levels = (level_runs.len() as u32).to_le_bytes().to_vec();
+    levels.extend_from_slice(&level_runs);
     let categories: Vec<u8> = ctx.cat_recs().concat();
     let cat_idx = pack_indices(rows.cats.iter().copied(), rows.cats.len(), index_width(ctx.cat_recs().len()));
 
@@ -635,8 +697,8 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
             payload: vec![&day_idx],
             dict: Some((vec![as_bytes(&days)], days.len())),
         },
-        int("sessions", &rows.sessions, &sessions),
-        int("events", &rows.events, &events),
+        int("sessions", &sessions_plain, &sessions),
+        int("events", &events_plain, &events),
         Column {
             name: "revenue_cents",
             ptype: parquet::INT64,
@@ -650,7 +712,7 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
             ptype: parquet::BYTE_ARRAY,
             kind: Kind::Str,
             optional: true,
-            payload: vec![&levels, &rows.valid, &cat_idx],
+            payload: vec![&levels, &cat_idx],
             dict: Some((vec![&categories], ctx.cat_recs().len())),
         },
     ];
@@ -673,38 +735,108 @@ fn write_campaign_daily(ctx: &Ctx) {
             a.revenue += b.revenue;
         }
     }
+    // This file is written last, so it is still unwritten on disk when the
+    // run ends (see sys::start_writeback): it is kept small. Text and days
+    // are dictionaries; a count column is one where that is the smaller form.
+    use parquet::{as_bytes, index_width, pack_indices};
     let (mut ids, mut channels) = (Vec::<u8>::new(), Vec::<u8>::new());
-    let (mut day, mut sessions, mut purchasing, mut assisted) = (Vec::<i32>::new(), Vec::<i64>::new(), Vec::<i64>::new(), Vec::<i64>::new());
+    let (mut nids, mut nchannels) = (0u32, 0u32);
+    let mut channel_of: HashMap<&[u8], u32> = HashMap::new();
+    let (mut id_at, mut channel_at, mut day_at) = (Vec::<u32>::new(), Vec::<u32>::new(), Vec::<u32>::new());
+    let (mut sessions, mut purchasing, mut assisted) = (Vec::<i64>::new(), Vec::<i64>::new(), Vec::<i64>::new());
     let mut revenue = Vec::<i64>::new();
     for camp in 0..ncamp {
+        let mut listed = false;
+        let mut channel = 0;
         for d in 0..ndays {
             let cell = &total.credit[camp * ndays + d];
             let assists = total.assisted[camp * ndays + d];
             if cell.sessions == 0 && assists == 0 {
                 continue;
             }
-            for (buf, s) in [(&mut ids, &ctx.campaigns().ids[camp]), (&mut channels, &ctx.campaigns().channels[camp])] {
-                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                buf.extend_from_slice(s);
+            if !listed {
+                listed = true;
+                let id = &ctx.campaigns().ids[camp];
+                ids.extend_from_slice(&(id.len() as u32).to_le_bytes());
+                ids.extend_from_slice(id);
+                nids += 1;
+                let name: &[u8] = &ctx.campaigns().channels[camp];
+                channel = *channel_of.entry(name).or_insert_with(|| {
+                    channels.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                    channels.extend_from_slice(name);
+                    nchannels += 1;
+                    nchannels - 1
+                });
             }
-            day.push((ctx.day0 + d as i64) as i32);
+            id_at.push(nids - 1);
+            channel_at.push(channel);
+            day_at.push(d as u32);
             sessions.push(cell.sessions as i64);
             purchasing.push(cell.purchasing as i64);
             revenue.push(cell.revenue as i64);
             assisted.push(assists as i64);
         }
     }
+    let n = day_at.len();
+    let days: Vec<i32> = (0..ndays as i64).map(|d| (ctx.day0 + d) as i32).collect();
+    let id_idx = pack_indices(id_at.iter().copied(), n, index_width(nids as usize));
+    let channel_idx = pack_indices(channel_at.iter().copied(), n, index_width(nchannels as usize));
+    let day_idx = pack_indices(day_at.iter().copied(), n, index_width(days.len()));
+    // The distinct values of a column and the indexes into them, if that is
+    // smaller than the values themselves.
+    let coded = |values: &[i64]| -> Option<(Vec<u8>, Vec<i64>)> {
+        let mut dict: Vec<i64> = Vec::new();
+        let mut seen: HashMap<i64, u32> = HashMap::new();
+        let at: Vec<u32> = values
+            .iter()
+            .map(|&v| {
+                *seen.entry(v).or_insert_with(|| {
+                    dict.push(v);
+                    dict.len() as u32 - 1
+                })
+            })
+            .collect();
+        let width = index_width(dict.len());
+        (8 * dict.len() + n * width as usize / 8 + 64 < 8 * n).then(|| (pack_indices(at.iter().copied(), n, width), dict))
+    };
+    let coded = [coded(&sessions), coded(&purchasing), coded(&revenue), coded(&assisted)];
+    let int = |name: &'static str, values: &'_ [i64], coded: &'_ Option<(Vec<u8>, Vec<i64>)>| match coded {
+        Some((idx, dict)) => Column {
+            name,
+            ptype: parquet::INT64,
+            kind: Kind::Int,
+            optional: false,
+            payload: vec![unsafe { std::slice::from_raw_parts(idx.as_ptr(), idx.len()) }],
+            dict: Some((vec![unsafe { std::slice::from_raw_parts(dict.as_ptr() as *const u8, 8 * dict.len()) }], dict.len())),
+        },
+        None => Column {
+            name,
+            ptype: parquet::INT64,
+            kind: Kind::Int,
+            optional: false,
+            payload: vec![unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, 8 * values.len()) }],
+            dict: None,
+        },
+    };
+    let text = |name: &'static str, idx: &'_ [u8], dict: &'_ [u8], count: u32| Column {
+        name,
+        ptype: parquet::BYTE_ARRAY,
+        kind: Kind::Str,
+        optional: false,
+        payload: vec![unsafe { std::slice::from_raw_parts(idx.as_ptr(), idx.len()) }],
+        dict: Some((vec![unsafe { std::slice::from_raw_parts(dict.as_ptr(), dict.len()) }], count as usize)),
+    };
     let columns = [
-        Column { name: "campaign_id", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![&ids], dict: None },
-        Column { name: "channel", ptype: parquet::BYTE_ARRAY, kind: Kind::Str, optional: false, payload: vec![&channels], dict: None },
-        Column { name: "day", ptype: parquet::INT32, kind: Kind::Date, optional: false, payload: vec![parquet::as_bytes(&day)], dict: None },
-        Column { name: "sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&sessions)], dict: None },
-        Column { name: "purchasing_sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&purchasing)], dict: None },
-        Column { name: "revenue_cents", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&revenue)], dict: None },
-        Column { name: "assisted_sessions", ptype: parquet::INT64, kind: Kind::Int, optional: false, payload: vec![parquet::as_bytes(&assisted)], dict: None },
+        text("campaign_id", &id_idx, &ids, nids),
+        text("channel", &channel_idx, &channels, nchannels),
+        Column { name: "day", ptype: parquet::INT32, kind: Kind::Date, optional: false, payload: vec![&day_idx], dict: Some((vec![as_bytes(&days)], days.len())) },
+        int("sessions", &sessions, &coded[0]),
+        int("purchasing_sessions", &purchasing, &coded[1]),
+        int("revenue_cents", &revenue, &coded[2]),
+        int("assisted_sessions", &assisted, &coded[3]),
     ];
     let path = ctx.out_dir.join("campaign_daily").join("part-000.parquet");
-    parquet::write(&path, day.len(), &columns).expect("write campaign_daily");
+    parquet::write(&path, n, &columns).expect("write campaign_daily");
 }
 
 fn main() {
