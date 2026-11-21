@@ -902,7 +902,8 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         *st.key.get_unchecked_mut(i) = key;
         *st.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
 
-        let (ts_dead, ts_ok, ms) = event_ts(dt, at(2), ln(2) as usize);
+        let (a2, n2) = (at(2), ln(2));
+        let (ts_dead, ts_ok, ms) = event_ts(dt, a2, n2 as usize);
         let in_window = (ms.wrapping_sub(ws) as u64) < span;
 
         // The scalar path takes what this one cannot decide: a longer
@@ -925,12 +926,16 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         // Late? ingest_ts is a valid F1 timestamp by the rules, and it almost
         // always falls on the same UTC day as ts, which settles it without
         // parsing it: on the same day the two are less than 24 hours apart.
+        // The day of ts as text: its own first ten bytes when it is F1, else
+        // from the table of the window's days.
         let a3 = at(3);
-        let day = ((ms.wrapping_sub(first_day_ms) as u64) / DAY_MS as u64).min(last_day) as usize;
-        let same = _mm_cmpeq_epi8(
-            _mm_loadu_si128(a3 as *const __m128i),
-            _mm_loadu_si128(day_text.add(day) as *const __m128i),
-        );
+        let day_of_ts = if n2 == 20 {
+            _mm_loadu_si128(a2 as *const __m128i)
+        } else {
+            let day = ((ms.wrapping_sub(first_day_ms) as u64) / DAY_MS as u64).min(last_day) as usize;
+            _mm_loadu_si128(day_text.add(day) as *const __m128i)
+        };
+        let same = _mm_cmpeq_epi8(_mm_loadu_si128(a3 as *const __m128i), day_of_ts);
         let other_day = (!_mm_movemask_epi8(same) as u32 & 0x3FF) | (*a3.add(19) ^ b'Z') as u32;
         let ingest = valid & (other_day != 0);
         let purchase = valid & (not_purchase == 0);

@@ -1,105 +1,104 @@
 # Handoff: where the work stands
 
-Last updated 2026-11-21, about 11:45 UTC (paused on request; resume from here).
+Last updated 2026-11-21, late evening UTC. Deadline: 2026-11-22 16:00 UTC (11:00 ET).
 
-## Checkpoint of the EC2 round (read this first)
+## Current state (read this first)
 
-Everything below this section predates the round; where they disagree, this wins.
+Everything below the horizontal rule predates this; where they disagree, this wins.
 
-### Commits
+### What to submit
 
 | What | Commit | Status |
 | --- | --- | --- |
-| Officially scored, **0.85 s** | `f1459cc` (tag `scored-0.85`) | Untouched. Still the only thing to submit for a score. |
-| GitHub `main` | `3201a41` | Untouched this round. |
-| `dev`, first version of the new architecture ("dedup by exception") | `81c1f75` | Fixtures, dev answer, 60 fuzz seeds x 8 modes, six seeds, 5M / 20M / 20M / 60M against the plain implementation: all pass. Same speed as scored. |
-| `dev`, staged event parser | `80002d6` | Fixtures, dev answer, 40 fuzz seeds x 8 modes pass. The state just before it (staged parser + faster settle, without the leaner decode loop and the cursor writers) passed the full check: 150 fuzz seeds x 8 modes, six seeds fast and slow, 5M / 20M / 20M / 60M. |
-| `dev` tip: the above + staged click parser | this commit | Fixtures, dev answer, 40 fuzz seeds x 8 modes pass (`scripts/remote/cycle.sh`). **Not** yet through the full check or `scripts/validate.sh` (Docker). |
+| Officially scored, **0.85 s** | `f1459cc` (tag `scored-0.85`) | Untouched fallback. |
+| GitHub `main` | `3201a41` | Untouched. Submit by SHA, never with the commit field empty. |
+| Candidate c1: staged parser, old 77 MB output | `1c50711` (tag `cand-c1`) | Full gate passed. 20M: 523 / 527 ms against 560 / 563 scored. |
+| Candidate c2: c1 + dictionary-encoded output (25 MB) | `c4b7fcf` (tag `cand-c2`) | Full gate passed. |
+| **Candidate c3: trace-only parser, pass 2 routes events** | `69557e4` (tag `cand-c3`) | Full gate passed. 20M: 501 / 503 against 555 / 561; 60M: 1556 / 1557 against 1704 / 1710. |
+| Candidate c4: c3 + merged pass 2, faster writer | `864640b` | 20M: 490 / 492 against 560 / 562; 60M: 1522 / 1526 against 1704 / 1705. Gate started (`scripts/remote.sh log c4`); recommend it once that says `CANDIDATE-OK`. |
+| Diagnostic image (fails on purpose, shows a log) | `2a2ea40` (branch `diag4`) | Not yet submitted. The single most informative submission: scorer CPU, clock under 512-bit code, huge pages, page-fault and memory costs, `/output` write speed, CPU-quota throttling. |
 
-Nothing on `dev` is a submission candidate yet: the best measured gain is 2.5%, and no
-`dev` commit of this round has been through the Docker gate.
+"Full gate" = `scripts/cand.sh NAME`: on EC2, `fullcheck.sh` (fixtures, dev answer, 150
+fuzz seeds x 8 modes, six seeds fast and slow, 5M / 20M / 20M / 60M against the plain
+implementation), then `image.sh gate` (no-cache Docker build of a clean export, no
+512-bit instructions, fixtures and dev / 5M / 20M / 60M inside the container with the
+scorer's flags). All times: EC2 m6i.2xlarge, 8 threads, wall ms, min / median of
+interleaved rounds (`scripts/abx.sh`).
 
-### Latest A/B against the scored binary
+### Architecture now
 
-EC2 m6i.2xlarge (Ice Lake, 4 cores x 2 threads), 20M events, 8 threads, wall ms,
-min / median of 5 interleaved rounds (`scripts/abx.sh m20 5 SSBIN=scored X=1`):
+1. Links -> user table (union-find), as before.
+2. Parse, in batches of 64 lines and three loops (split, decode, emit). An event line
+   leaves only a two-word *trace* in a partition chosen by a hash of its event ID:
+   `fingerprint | line position`, and `valid | purchase | 4 hash bits | person | ts`
+   (zero if the line failed validation). Purchases also leave price and category with
+   their person; clicks go to their person as before.
+3. Pass 2, per trace partition: a two-bit table finds repeated fingerprints. A trace
+   that is alone is sent to its person's partition at once. Repeats whose second words
+   are equal (same person, time, valid, not a purchase) are settled without reading
+   anything: one is sent, the rest dropped. The remaining 6% of repeat groups have
+   their lines read again and are settled by the literal rule. Events are written into
+   the trace blocks already read, so they cost no new memory.
+4. Pass 3, per person partition (8192 people): 2-pass radix by (slot, person), session
+   walk, attribution, rows. Output is dictionary-encoded Parquet.
 
-| Build | scored | build |
-| --- | --- | --- |
-| `81c1f75` | 559 / 562 | 565 / 567 |
-| `80002d6` | 562 / 564 | 549 / 550 |
-| `dev` tip | 559 / 564 | 546 / 549 |
+### What was learned this round (measured)
 
-No 60M A/B of the new builds yet (scored: 1703 / 1709 ms). CPU ms by section at the
-`dev` tip, 20M: parse events 2028 (96.9 ns/row), parse clicks 418, dedup gather 26 +
-scan 132 + settle 334, sessions gather 287 + sort 130 + people 624, links 91; kernel
-about 500 of 4200.
+* **Output size shows up outside the program.** With 77 MB of plain Parquet (223 MB at
+  60M), `docker run` took 0.1 s (20M) to 0.87 s (60M) longer than the container's own
+  StartedAt..FinishedAt on EC2; with `/output` on tmpfs or with the 3x smaller
+  dictionary-encoded output it does not (`scripts/remote/teardown.sh`). Whether the
+  scorer's clock includes that is unknown; c1 against c2/c3 on the scorer would tell.
+* **Fresh memory costs about 0.7 ms of kernel time per MB** (page zeroing under load):
+  8 more bytes per trace cost as much as they saved until the event stream moved into
+  recycled trace blocks. Ordinary pages for the pool are worse than huge pages.
+* **Dedup by exception is sensitive to the duplicate rate** (2 to 4% of events per
+  seed; the 60M set has more than the 20M one). Re-reading lines cost 140 to 250 ns
+  each; settling repeats from the traces removed 94% of the re-reads and took 60M from
+  -1% to -10% against scored.
+* The container adds a fixed ~70 ms (StartedAt..FinishedAt minus the program) on EC2.
+* The parser is bound by instruction throughput: a second hyperthread on the same core
+  adds only 24% (`scripts/remote/pbench.sh`). 512-bit masks would save ~6% of the
+  parser's instructions but lower the clock ~3% here: not worth it on this machine.
+* 12, 13 or 14 person bits per partition: no difference (13 kept). Trace partition
+  size: no difference. Settle prefetch distance: no difference.
+* Tools that proved their worth: `scripts/remote/cgasm.sh` / `cgshow.sh` / `cgsrc.sh`
+  (exact instructions per row by function, line, or instruction, via valgrind),
+  `cgcache.sh` (simulated cache misses), `sweep.sh` (profile sections per env value),
+  `keep.sh` (named binaries for A/B), `imgtime.sh` (container and docker times).
+* Beware: `remote.sh push` must not preserve file times (fixed), or cargo on EC2 skips
+  files edited before its last build.
 
-### What was learned
+### Where the time goes now (20M, CPU ms of about 3760)
 
-* **Everything is instruction-bound, with no hot spot.** Exact counts per event row
-  (valgrind on the dev set, `scripts/remote/cgasm.sh`): 867 in all; event split 155,
-  event decode 217, event emit 60, dedup + sessions 236, clicks 78, pair sort 18. The
-  time profile is equally flat. 8 threads on 4 cores run at about 1.3 instructions per
-  cycle each, so wall time follows the instruction count.
-* The leader's 0.36 s corresponds to roughly half our instructions per line. Hand
-  estimates say that is reachable only with assembly-level care in every loop (the
-  compiler emits about 1.5x what a careful hand count predicts: flag plumbing,
-  reloaded constants, spills) or with 512-bit masks.
-* What helped: validation as integers OR-ed together instead of booleans (decode 242
-  -> 217), write pointers instead of fill counts in the partition writers, no calls
-  inside the hot loops, F1 timestamps through a day-of-month table, radix grouping and
-  O(1) file lookup in settle (380 -> 338 ms).
-* What did not: staging by itself (same count as the fused loop); the staged click
-  parser (81 against 79.5 ns/row, kept because it is not slower in the A/B); a second
-  input prefetch per line; input prefetch distance 512 to 4096 (none at all costs 18%
-  of the parse); trace partitions of 1.2 MB instead of 2.4 MB (neutral; 0.6 MB is
-  worse); the settle prefetch distance, 4 to 128 lines (no effect at all, so settle is
-  not waiting for memory: find out where its 240 ns per re-read line go with
-  `scripts/remote/cgsrc.sh sessions::worker pass2.rs`, written but not yet run).
-* Dedup by exception and the old partition-then-hash dedup cost the same. The
-  generator scatters the copies of an event over random files, so nothing local helps.
-* Probes on EC2 (`scripts/remote/probe.sh dev`), for comparison with the scorer once
-  the diagnostic image is submitted: clock 3.30 GHz scalar, 3.22 with 512-bit
-  instructions in between; first touch of 256 MB 35 ms with huge pages, 93 ms without;
-  random read 108 ns (125 ns on 4K pages); copy 6.9 GB/s; map-and-touch of the input
-  45 ns/page.
+parse events 1952 (52%; split 155 + decode 217 + emit ~45 instructions per line), people
+523, parse clicks 405, pass 2 scan and routing 265, pass 3 gather 205, pair sort 135,
+links 92, write 82, resolve 33, group 30, re-read 21.
 
-### Next steps, in order
+### Next, in order of expected value
 
-1. **Diagnostic image.** The probes are in (`fast/src/probe.rs`, cargo feature
-   `probe`), and `scripts/mkdiag.sh` now builds with them, but the `diag` branch has
-   NOT been rebuilt: it is still the old `a55f0bc`. To do: `scripts/mkdiag.sh dev`,
-   `scripts/diagtest.sh` on EC2, push `diag`, then one submission of its SHA. It tells
-   us the scorer's CPU, whether 512-bit instructions slow its clock, huge pages, page
-   fault and memory costs, and whether the input is in the page cache.
-2. Keep cutting instructions with `cgasm.sh` / `cgshow.sh`: decode (217), split (155),
-   emit (60, a bucketed branch-free table probe would save about 5), clicks.
-3. Settle without re-reading lines: 16-byte traces holding the exact ID key, person,
-   timestamp and ingest delta (design in the session notes; estimated 3 to 4%).
-4. 512-bit separator masks behind a run-time switch, if the diagnostic says the clock
-   penalty is small (about 30 instructions per event line).
-5. Before any candidate: `scripts/remote/fullcheck.sh`, a 60M A/B, `scripts/validate.sh`.
+1. Get the diagnostic and c1 / c3 scored (needs the user). If output or teardown
+   matters on the scorer: gzip the user_id dictionary (the bulk of the 25 MB), start
+   writeback early.
+2. Small parser items (F1 same-day check by direct text compare is in the working
+   tree), pair sort for small lists (in the working tree), click parser diet
+   (campaign lookup by hash of the raw bytes), people loop.
+3. Finer event sub-partitions out of pass 2 so that pass 3's radix runs in L1.
 
 ### EC2 box
 
-Address, user and key are in `.local/remote.env` (untracked). Nothing is running there;
-it was left idle with everything in place.
+Address, user and key are in `.local/remote.env` (untracked).
 
-* `~/db`: the working tree (rsync of this one, no `.git` history of its own beyond the
-  first clone), toolchain in `~/db/.toolchain`, scored binary `~/db/bin/scored`.
-* Data: `~/db/data/{dev,m5,m20,n20,m60,s2_200000..s7_200000}`; reference answers
+* `~/db`: working tree (rsync of this one), toolchain `~/db/.toolchain`, scored binary
+  `~/db/bin/scored`, kept variants `~/db/bin/*`, exported candidates `~/img/*`.
+* Data: `~/db/data/{dev,m5,m20,n20,m60,s2_200000..s7_200000}`; references
   `~/db/expected/*.slow`; job logs `~/db/out/logs`.
-* From WSL: `scripts/remote.sh push` (sync sources), then
+* From WSL: `scripts/remote.sh push`, then
   `scripts/remote.sh run 'bash scripts/remote/cycle.sh 40 900'` (build, fixtures, dev,
-  40 fuzz seeds from 900, A/B against scored, section profile);
-  `scripts/remote.sh tmux NAME 'bash scripts/remote/fullcheck.sh'` and
-  `scripts/remote.sh log NAME` for the long check; `scripts/remote/status.sh` shows
-  load and jobs. Other tools in `scripts/remote/`: `cgasm.sh`, `cgshow.sh`, `cgfn.sh`
-  (instructions per line of assembly), `lineprof.sh` (time by source line), `knobs.sh`,
-  `sweep.sh`, `probe.sh`.
-* From PowerShell, a command with `|` or `$` inside nested quotes gets mangled: put it
-  in a script under `scripts/remote/` and run that.
+  40 fuzz seeds from 900, A/B against scored, section profile).
+  `scripts/cand.sh NAME` for the full gate of the committed HEAD (clean tree needed).
+* From PowerShell, never put `|` or `$` inside nested quotes: write a script under
+  `scripts/remote/` instead.
 
 ---
 
