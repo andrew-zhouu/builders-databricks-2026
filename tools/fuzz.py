@@ -206,6 +206,16 @@ def main():
                 events.append(copy)
             if R.random() < 0.3:
                 events.append(list(R.choice(events[-3:])))   # an identical copy (same ingest)
+        # an event whose earliest copy is invalid: every later, valid copy must go with
+        # it, which can leave a person with purchases but no events at all
+        if R.random() < 0.04:
+            ing = ingest_for(ts_ms)
+            lone = "u" + reg("", 8)
+            bad = [new_eid(), lone, bad_ts(ts_ms), f1(ing), "purchase", "p1", "500"]
+            events.append(bad)
+            for k in range(R.randint(1, 3)):
+                events.append([bad[0], lone if R.random() < 0.7 else user(), good_ts(ts_ms), f1(ing + (k + 1) * 60000),
+                               R.choice(["purchase", "purchase", "view"]), "p1", "500"])
 
     # identical copies must stay identical; copies with equal ingest and different
     # content are not allowed by the rules: keep the first row per (id, ingest)

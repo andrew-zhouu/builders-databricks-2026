@@ -14,7 +14,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
     echo "seed $seed: reference failed: $(tail -1 "$d/ref.log")"; fails=$((fails+1)); continue
   fi
   bad=""
-  for mode in fast scalar slow one tiny tiny8 read readtiny readscalar readtail; do
+  for mode in fast scalar slow one tiny tiny8 manyparts onepart; do
     o="$d/$mode"; mkdir -p "$o"
     case "$mode" in
       fast)   NCPU=3 "$BIN" "$d/data" "$o" 2>"$o.log" ;;
@@ -24,12 +24,9 @@ for seed in $(seq "$first" $((first + count - 1))); do
       # tiny chunks: lines of every kind start, end and straddle chunk boundaries
       tiny)   NCPU=4 SS_CHUNK_BYTES=$((seed % 97 + 31)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
       tiny8)  NCPU=8 SS_CHUNK_BYTES=$((seed % 1013 + 300)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      # the pread input mode, whole files and tiny chunks
-      read)       NCPU=3 SS_IO=read "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      readtiny)   NCPU=4 SS_IO=read SS_CHUNK_BYTES=$((seed % 211 + 17)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      readscalar) NCPU=2 SS_IO=read SS_SCALAR=1 SS_CHUNK_BYTES=$((seed % 5000 + 100)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
-      # a tail too short for most lines: every chunk has to extend its read
-      readtail)   NCPU=3 SS_IO=read SS_READ_TAIL=$((seed % 7)) SS_CHUNK_BYTES=$((seed % 401 + 50)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      # trace partitions: very many (few traces each) and a single one
+      manyparts) NCPU=4 SS_PD_BYTES=$((seed % 900 + 100)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
+      onepart)   NCPU=5 SS_PD_BYTES=1000000000 SS_SCALAR=$((seed % 2)) "$BIN" "$d/data" "$o" 2>"$o.log" ;;
     esac
     if [ $? -ne 0 ] || ! "$PY" -I "$PROJ/tools/cmp.py" "$d/expected" "$o" >"$o.cmp" 2>&1; then
       bad="$bad $mode"

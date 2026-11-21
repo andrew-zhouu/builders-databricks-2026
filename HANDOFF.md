@@ -7,14 +7,25 @@ measurements behind every statement here.
 
 | What | Commit | Where |
 | --- | --- | --- |
-| First official submission: **0.85 s**, 23rd of 130 (leader 0.59 s) | `f1459cc` | tip of `main`, tag `scored-0.85`. The fallback: never rewritten. |
+| First official submission: **0.85 s**, 23rd of 130 (leader 0.59 s) | `f1459cc` | tag `scored-0.85`; first parent of the `main` tip. The fallback: never rewritten. |
+| Tip of `main`, the default branch | `3201a41` | GitHub merge of pull request #1 (`dev` as of `9fb62dd` into `main`), made 2026-11-21 02:12 EST. Same tree as `9fb62dd`. |
 | Second candidate: validated, **not promoted** (no demonstrated advantage) | `5aa33bc` | on `dev` (later `dev` commits touch only scripts and documents); see "Second candidate" below |
 | Diagnostic image (fails on purpose, cannot score) | tip of `diag` | see "The diagnostic image" |
 
-`main` only ever moves forward, and only to a commit that has passed
+**Submit by commit SHA, never with the commit field empty.** An empty field scores the
+newest commit on the default branch, which since the merge of pull request #1 is
+`3201a41`, not the scored commit. `3201a41` runs the same default path as `f1459cc`
+(it adds an optional pread mode, a faster hasher in the fallback, a graceful
+block-pool reservation and scripts), and it has been put through `scripts/validate.sh`
+after the fact, but it has never been scored.
+
+A commit should only become the one we submit after it has passed
 `scripts/validate.sh` (clean export, no-cache Docker build, every correctness check
 run on the image's own binary, 5M and 20M scale checks, in-container runs with the
-scorer's flags) **and** has a measured advantage over what is there.
+scorer's flags) **and** has a measured advantage over the scored one. To move `main`
+again without rewriting anything, merge `main` into `dev` first (a no-op for the code:
+`dev` already contains everything in it) and then fast-forward `main`, or open a pull
+request from `dev`.
 
 ## What the official score told us
 

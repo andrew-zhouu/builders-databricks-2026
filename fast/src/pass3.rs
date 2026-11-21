@@ -5,7 +5,7 @@
 //! with a counting sort (two passes straight over the partition's blocks), then
 //! each person's timestamps are sorted on their own.
 
-use crate::parse::{CAMPAIGN_BITS, LOCAL_BITS, TS_MASK};
+use crate::parse::{CAMPAIGN_BITS, CANCEL, LOCAL_BITS, TS_MASK};
 use crate::util::{DAY_MS, GAP_MS, REACH_MS};
 use crate::Ctx;
 
@@ -36,23 +36,23 @@ pub struct Rows {
     pub cats: Vec<u8>,
 }
 
-/// The length-prefixed bytes of a regular user key (see ids.rs), written into
-/// `out`; returns their total length (4 + characters). Bytes after it are junk.
+/// The length-prefixed bytes of a regular user key (see ids.rs: `u`, then the
+/// key's bytes), written into `out`; returns their total length (4 +
+/// characters). Bytes after it are junk.
 #[inline(always)]
 fn id_record(key: u64, out: &mut [u8; 16]) -> usize {
-    use core::arch::x86_64::_pdep_u64;
-    let n = 9 - (key.trailing_zeros() / 6) as usize;
-    // Codes of the first 8 characters back to ASCII: bits 0-4 and 6 from the code, bit 5 set.
-    let w = unsafe { _pdep_u64(key >> 6, 0x5F5F_5F5F_5F5F_5F5F) } | 0x2020_2020_2020_2020;
+    let n = 1 + crate::ids::raw_len(key);
     out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
-    out[4..12].copy_from_slice(&w.to_be_bytes());
-    out[12] = ((key & 0x1F) | ((key & 0x20) << 1) | 0x20) as u8;
+    out[4] = b'u';
+    out[5..13].copy_from_slice(&key.to_be_bytes());
     4 + n
 }
 
 /// An event record is `person_local(12) | ts_rel_ms(31)`. Its slot is the top
 /// 11 bits of the timestamp: slots are 2^20 ms (about 17.5 minutes) wide, which
 /// must not exceed the 30-minute session gap (see `run`).
+/// A cancellation in the multiset that has removed its event.
+const USED: u64 = u64::MAX;
 const SLOT_SHIFT: u32 = 20;
 const SLOTS: usize = 1 << (31 - SLOT_SHIFT);
 const _: () = assert!((1u32 << SLOT_SHIFT) <= GAP_MS);
@@ -74,6 +74,10 @@ pub struct Scratch {
     tag: u32,
     cat_sum: Vec<u64>,
     touched: Vec<u32>,
+    /// The partition's cancelled events (a hash multiset; 0 = empty), and
+    /// scratch space for a person's purchases once theirs are removed.
+    cancel_set: Vec<u64>,
+    kept_pu: Vec<[u64; 2]>,
     /// The current person's user_id record: fixed 16 bytes when short, else `id_long`.
     id_rec: [u8; 16],
     id_len: usize,
@@ -99,6 +103,8 @@ impl Scratch {
             tag: 0,
             cat_sum: vec![0; ctx.products().categories.len()],
             touched: Vec::new(),
+            cancel_set: Vec::new(),
+            kept_pu: Vec::new(),
             id_rec: [0; 16],
             id_len: 0,
             id_long: Vec::new(),
@@ -204,20 +210,72 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     sc.h.iter_mut().for_each(|c| *c = 0);
     sc.a.clear();
     {
+        // The partition's cancellations, as a small open-addressing multiset:
+        // each one removes one event equal to it (same person, same timestamp;
+        // which of several equal events goes makes no difference).
+        let ncancel: usize = (0..ctx.nthreads).map(|t| ctx.x(t).events(p).len()).sum();
+        let bits = (4 * ncancel.max(16)).next_power_of_two().trailing_zeros();
+        let slot_of = |w: u64| (w.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
+        let mask = (1usize << bits) - 1;
+        if ncancel > 0 {
+            sc.cancel_set.clear();
+            sc.cancel_set.resize(1 << bits, 0);
+            for t in 0..ctx.nthreads {
+                for &(_, w) in ctx.x(t).events(p) {
+                    // `w` carries the CANCEL bit, so it is never 0 (= empty).
+                    let mut i = slot_of(w);
+                    while sc.cancel_set[i] != 0 {
+                        i = (i + 1) & mask;
+                    }
+                    sc.cancel_set[i] = w;
+                }
+            }
+        }
+        let set = &mut sc.cancel_set[..];
+        let mut removed = 0usize;
+
         let (hs, hp) = sc.h.split_at_mut(SLOTS);
         let a = &mut sc.a;
         for t in 0..ctx.nthreads {
             let s = ctx.s(t);
             a.reserve(s.part_words(p));
-            s.for_each_run(&ctx.pool, p, |run| {
+            s.for_each_run(&ctx.pool, p, |run| unsafe {
+                let mut at = a.as_mut_ptr().add(a.len());
                 for &w in run {
-                    unsafe {
-                        *hs.get_unchecked_mut((w >> SLOT_SHIFT) as usize & (SLOTS - 1)) += 1;
-                        *hp.get_unchecked_mut((w >> 31) as usize & (LOCALS - 1)) += 1;
+                    if ncancel > 0 {
+                        let key = w | CANCEL;
+                        let mut i = slot_of(key);
+                        let mut cancelled = false;
+                        loop {
+                            let e = *set.get_unchecked(i);
+                            if e == 0 {
+                                break;
+                            }
+                            if e == key {
+                                *set.get_unchecked_mut(i) = USED;
+                                cancelled = true;
+                                break;
+                            }
+                            i = (i + 1) & mask;
+                        }
+                        if cancelled {
+                            removed += 1;
+                            continue;
+                        }
                     }
+                    *hs.get_unchecked_mut((w >> SLOT_SHIFT) as usize & (SLOTS - 1)) += 1;
+                    *hp.get_unchecked_mut((w >> 31) as usize & (LOCALS - 1)) += 1;
+                    *at = w;
+                    at = at.add(1);
                 }
-                a.extend_from_slice(run);
+                a.set_len(at.offset_from(a.as_ptr()) as usize);
             });
+        }
+        if removed != ncancel {
+            // Every cancellation is for a record the parser wrote. Anything
+            // else is a bug, and a wrong table must not be written quietly.
+            eprintln!("partition {p}: {ncancel} cancellations but {removed} matching events");
+            std::process::abort();
         }
         let total = a.len();
         if total == 0 {
@@ -244,6 +302,9 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     sc.cl.clear();
     for t in 0..ctx.nthreads {
         ctx.ps(t).copy_part(&ctx.pool, p, &mut sc.pu);
+        for &(_, w) in ctx.x(t).purchases(p) {
+            sc.pu.extend_from_slice(&w);
+        }
         ctx.c(t).copy_part(&ctx.pool, p, &mut sc.cl);
     }
     let t0 = ctx.charge_rows(crate::P_S_GATHER, t0, sc.a.len());
@@ -251,7 +312,9 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     let ts = std::mem::take(&mut sc.a);
     let mut pu = std::mem::take(&mut sc.pu);
     let mut cl = std::mem::take(&mut sc.cl);
-    // Purchases by (person, ts) and clicks by (person, ts, campaign).
+    let mut kept_pu = std::mem::take(&mut sc.kept_pu);
+    // Purchases by (person, ts), a person's cancellations after their
+    // purchases; clicks by (person, ts, campaign).
     sort_pairs(&mut pu, &mut sc.b, &mut sc.h, 31);
     sort_pairs(&mut cl, &mut sc.b, &mut sc.h, 52);
     {
@@ -265,11 +328,18 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
                 continue;
             }
             let events = &ts[from..to];
-            let local = local as u64;
+            // Skip the records of people without events: someone whose events
+            // were all cancelled still has their (cancelled) purchases here.
+            while pi < pu.len() && ((pu[pi][0] >> 31) as usize & (LOCALS - 1)) < local {
+                pi += 1;
+            }
             let mut pj = pi;
-            while pj < pu.len() && pu[pj][0] >> 31 == local {
+            while pj < pu.len() && (pu[pj][0] >> 31) as usize & (LOCALS - 1) == local {
                 pj += 1;
             }
+            let mut purchases = &pu[pi..pj];
+            pi = pj;
+            let local = local as u64;
             while ci < cl.len() && cl[ci][0] >> 52 < local {
                 ci += 1;
             }
@@ -277,10 +347,15 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
             while cj < cl.len() && cl[cj][0] >> 52 == local {
                 cj += 1;
             }
-            let slot = (p << LOCAL_BITS) as u32 | local as u32;
-            person(ctx, sc, slot, events, &pu[pi..pj], &cl[ci..cj]);
-            pi = pj;
+            let clicks = &cl[ci..cj];
             ci = cj;
+            // A person's cancelled purchases sort after their purchases.
+            if purchases.last().is_some_and(|r| r[0] & CANCEL != 0) {
+                apply_purchase_cancels(purchases, &mut kept_pu);
+                purchases = &kept_pu;
+            }
+            let slot = (p << LOCAL_BITS) as u32 | local as u32;
+            person(ctx, sc, slot, events, purchases, clicks);
         }
         t0 = ctx.charge_rows(crate::P_S_PEOPLE, t0, ts.len());
         let _ = t0;
@@ -288,6 +363,21 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     sc.a = ts;
     sc.pu = pu;
     sc.cl = cl;
+    sc.kept_pu = kept_pu;
+}
+
+/// One person's purchases (in time order, cancellations last) with the
+/// cancellations applied: each removes one purchase with its timestamp, price
+/// and category.
+fn apply_purchase_cancels(records: &[[u64; 2]], kept: &mut Vec<[u64; 2]>) {
+    let first_cancel = records.partition_point(|r| r[0] & CANCEL == 0);
+    kept.clear();
+    kept.extend_from_slice(&records[..first_cancel]);
+    for c in &records[first_cancel..] {
+        if let Some(at) = kept.iter().position(|r| r[0] == c[0] & !CANCEL && r[1] == c[1]) {
+            kept.remove(at);
+        }
+    }
 }
 
 /// The earliest and latest timestamp of the run of events that starts at `i`

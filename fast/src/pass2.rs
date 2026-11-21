@@ -1,91 +1,270 @@
-//! Pass 2: deduplicate one event-id partition and scatter the surviving events
-//! to person partitions.
+//! Pass 2: dedup, by exception.
 //!
-//! Dedup comes before validation: of all well-formed copies of an event the one
-//! with the smallest ingest_ts is kept, and only if that copy is valid does the
-//! event survive. `w0 = key << 21 | ingest`, so comparing `w0` of two copies of
-//! one event compares their ingest times.
+//! The parser wrote every valid event to its person as if no event ID were
+//! ever repeated, and left a trace (fingerprint of the ID, position of the
+//! line) for every well-formed event line. Here, per trace partition:
+//!
+//! 1. Find the fingerprints that occur more than once, with two bitmaps
+//!    ("seen" and "seen again") that fit in the L1 cache. Most partitions'
+//!    traces are read twice and nothing else happens to them.
+//! 2. For each such fingerprint, read its lines again from the input and parse
+//!    them by the literal rules. Lines whose IDs really are equal are copies
+//!    of one event: the copy with the smallest ingest_ts is the kept one
+//!    (copies with equal ingest_ts are identical, so any of them will do).
+//! 3. Every other copy that passed validation was written to a person by the
+//!    parser and must not count: it gets a cancellation, which pass 3 applies
+//!    to exactly one equal record. If the kept copy is itself invalid, nothing
+//!    of the event remains, as the rules require (dedup comes before
+//!    validation).
 
-use crate::parse::{INGEST_BITS, LOCAL_BITS, PERSON_BITS, PURCHASE, TS_MASK};
-use crate::part::PartWriter;
+use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
+use crate::parse::{can_decode, decode_event, event_records, parse_event, Decoded, CANCEL, LOCAL_BITS};
+use crate::util::find_newline;
 use crate::Ctx;
+
+/// "Use the scalar path" (see `parse::Decoded`).
+const TO_SCALAR_LINE: Decoded =
+    Decoded { used: 0, id: (std::ptr::null(), 0), valid: false, user_key: 0, ts: 0, extra: 0, ingest_s: 0 };
+
+/// One thread's cancellations: (person partition, record words).
+#[derive(Default)]
+pub struct Cancels {
+    events: Vec<(u32, u64)>,
+    purchases: Vec<(u32, [u64; 2])>,
+    /// After `finish`: where each partition's entries start.
+    event_start: Vec<u32>,
+    purchase_start: Vec<u32>,
+}
+
+impl Cancels {
+    /// Order by partition, once all of pass 2 is done.
+    pub fn finish(&mut self, nparts: usize) {
+        self.events.sort_unstable_by_key(|e| e.0);
+        self.purchases.sort_unstable_by_key(|e| e.0);
+        fn starts<T>(v: &[(u32, T)], nparts: usize) -> Vec<u32> {
+            let mut s = vec![0u32; nparts + 1];
+            for e in v {
+                s[e.0 as usize + 1] += 1;
+            }
+            for p in 0..nparts {
+                s[p + 1] += s[p];
+            }
+            s
+        }
+        self.event_start = starts(&self.events, nparts);
+        self.purchase_start = starts(&self.purchases, nparts);
+    }
+
+    pub fn events(&self, p: usize) -> &[(u32, u64)] {
+        &self.events[self.event_start[p] as usize..self.event_start[p + 1] as usize]
+    }
+
+    pub fn purchases(&self, p: usize) -> &[(u32, [u64; 2])] {
+        &self.purchases[self.purchase_start[p] as usize..self.purchase_start[p + 1] as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+}
+
+/// One copy of a possibly repeated event, read again from the input.
+struct Copy {
+    fp: u64,
+    id: (*const u8, usize),
+    /// Epoch ms.
+    ingest: i64,
+    valid: bool,
+    /// The records the parser wrote for it, if valid.
+    part: u32,
+    rec: u64,
+    extra: u64,
+}
+
+impl Copy {
+    fn id(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.id.0, self.id.1) }
+    }
+}
+
+/// A valid copy waiting for its person (the user-table slot is being fetched).
+struct Pending {
+    copy: u32,
+    home: u32,
+    key: u64,
+    ts: u32,
+}
 
 #[derive(Default)]
 pub struct Scratch {
     recs: Vec<u64>,
-    tab: Vec<u32>,
-    dead: Vec<u8>,
+    seen: Vec<u64>,
+    again: Vec<u64>,
+    cand: Vec<u64>,
+    copies: Vec<Copy>,
+    lines: Vec<(*const u8, usize, usize)>,
+    pending: Vec<Pending>,
 }
 
-pub fn run(ctx: &Ctx, sc: &mut Scratch, s: &mut PartWriter, ps: &mut PartWriter, p: usize) {
+pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
     let t0 = ctx.now();
     sc.recs.clear();
     for t in 0..ctx.nthreads {
-        let d = ctx.d(t);
-        d.copy_part(&ctx.pool, p, &mut sc.recs);
-        // These blocks are never read again: reuse them for this thread's output.
-        s.free.extend_from_slice(d.part_blocks(p));
+        ctx.k(t).copy_part(&ctx.pool, p, &mut sc.recs);
     }
     let recs = &sc.recs[..];
-    let n = recs.len() / 2;
-    if n == 0 {
+    let n = recs.len();
+    if n < 2 {
         return;
     }
     let t0 = ctx.charge_rows(crate::P_D_GATHER, t0, n);
-    let tsize = (2 * n).next_power_of_two().max(16);
-    sc.tab.clear();
-    sc.tab.resize(tsize, 0);
-    sc.dead.clear();
-    sc.dead.resize(n, 0);
-    let mask = tsize - 1;
-    let shift = 64 - tsize.trailing_zeros();
-    let tab = &mut sc.tab[..];
-    let dead = &mut sc.dead[..];
 
-    let mut i = 0;
-    while i < n {
-        let w0 = recs[2 * i];
-        let w1 = recs[2 * i + 1];
-        // The stored remainder identifies the event within this partition.
-        let ek = w0 >> INGEST_BITS;
-        let mut slot = (ek.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift) as usize;
-        loop {
-            let e = tab[slot];
-            if e == 0 {
-                tab[slot] = i as u32 + 1;
-                break;
-            }
-            let o = (e - 1) as usize;
-            let ow0 = recs[2 * o];
-            if ow0 >> INGEST_BITS == ek {
-                if w0 < ow0 {
-                    dead[o] = 1;
-                    tab[slot] = i as u32 + 1;
-                } else {
-                    dead[i] = 1;
-                }
-                break;
-            }
-            slot = (slot + 1) & mask;
+    // Which fingerprints occur more than once? Indexed by the fingerprint's low
+    // bits, at 8 bits per trace, so few unrelated traces share a bit.
+    let bits = (8 * n).next_power_of_two().max(4096);
+    sc.seen.clear();
+    sc.seen.resize(bits / 64, 0);
+    sc.again.clear();
+    sc.again.resize(bits / 64, 0);
+    let (seen, again) = (&mut sc.seen[..], &mut sc.again[..]);
+    let (shift, mask) = (ctx.loc_bits, bits as u64 - 1);
+    for &r in recs {
+        let i = (r >> shift) & mask;
+        let (w, b) = ((i >> 6) as usize, 1u64 << (i & 63));
+        unsafe {
+            *again.get_unchecked_mut(w) |= *seen.get_unchecked(w) & b;
+            *seen.get_unchecked_mut(w) |= b;
         }
-        i += 1 + (w1 & PURCHASE != 0) as usize;
     }
-
+    sc.cand.clear();
+    for &r in recs {
+        let i = (r >> shift) & mask;
+        if unsafe { *again.get_unchecked((i >> 6) as usize) } & (1u64 << (i & 63)) != 0 {
+            sc.cand.push(r);
+        }
+    }
     let t0 = ctx.charge_rows(crate::P_D_DEDUP, t0, n);
-    let mut i = 0;
-    while i < n {
-        let w1 = recs[2 * i + 1];
-        let purchase = w1 & PURCHASE != 0;
-        if dead[i] == 0 && (w1 as i64) < 0 {
-            let person = (w1 >> 31) & ((1 << PERSON_BITS) - 1);
-            let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | (w1 & TS_MASK);
-            let sp = (person >> LOCAL_BITS) as usize;
-            s.push1(&ctx.pool, sp, rec);
-            if purchase {
-                ps.push2(&ctx.pool, sp, rec, recs[2 * i + 2]);
-            }
-        }
-        i += 1 + purchase as usize;
+    if sc.cand.is_empty() {
+        return;
     }
-    ctx.charge_rows(crate::P_D_EMIT, t0, n);
+
+    // Traces order by fingerprint, then by position in the input. Drop the
+    // ones whose fingerprint turns out to be unique after all (they only
+    // shared a bitmap bit with another).
+    sc.cand.sort_unstable();
+    let mut kept = 0;
+    let mut i = 0;
+    while i < sc.cand.len() {
+        let fp = sc.cand[i] >> shift;
+        let mut j = i + 1;
+        while j < sc.cand.len() && sc.cand[j] >> shift == fp {
+            j += 1;
+        }
+        if j - i >= 2 {
+            sc.cand.copy_within(i..j, kept);
+            kept += j - i;
+        }
+        i = j;
+    }
+    sc.cand.truncate(kept);
+    read_again(ctx, sc);
+    settle(&mut sc.copies, out);
+    ctx.charge_rows(crate::P_D_EMIT, t0, sc.cand.len());
+}
+
+/// Read the lines of the traces in `sc.cand` again, into `sc.copies` (same
+/// order). The lines are scattered over the input and each valid copy needs a
+/// slot of the user table, so this works in small batches: fetch the lines,
+/// decode them while the table slots are fetched, then look the people up.
+fn read_again(ctx: &Ctx, sc: &mut Scratch) {
+    const BATCH: usize = 32;
+    let (shift, loc_mask) = (ctx.loc_bits, (1u64 << ctx.loc_bits) - 1);
+    sc.copies.clear();
+    for traces in sc.cand.chunks(BATCH) {
+        sc.lines.clear();
+        for &t in traces {
+            let (data, start) = ctx.locate(t & loc_mask);
+            let p = unsafe { data.as_ptr().add(start) };
+            unsafe {
+                _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64) as *const i8);
+            }
+            sc.lines.push((p, start, data.len()));
+        }
+        sc.pending.clear();
+        for (&t, &(p, start, len)) in traces.iter().zip(&sc.lines) {
+            let mut copy = Copy { fp: t >> shift, id: (p, 0), ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
+            let d = if can_decode(ctx, start, len) { unsafe { decode_event::<true>(ctx, p) } } else { TO_SCALAR_LINE };
+            if d.used != 0 {
+                copy.id = d.id;
+                copy.ingest = d.ingest_s * 1000;
+                copy.valid = d.valid;
+                copy.extra = d.extra;
+                if d.valid {
+                    let home = ctx.table.prefetch_home(d.user_key) as u32;
+                    sc.pending.push(Pending { copy: sc.copies.len() as u32, home, key: d.user_key, ts: (d.ts - ctx.t0) as u32 });
+                }
+            } else {
+                // The literal rules. Every trace was written for a line that
+                // parsed, so this cannot fail.
+                let line = unsafe { std::slice::from_raw_parts(p, len - start) };
+                let line = &line[..find_newline(line, 0).unwrap_or(line.len())];
+                if let Some(e) = parse_event(ctx, line) {
+                    copy.id = (e.id.as_ptr(), e.id.len());
+                    copy.ingest = e.ingest;
+                    copy.valid = e.valid;
+                    if e.valid {
+                        let (part, rec, extra) = event_records(ctx, &e);
+                        (copy.part, copy.rec, copy.extra) = (part as u32, rec, extra);
+                    }
+                }
+            }
+            sc.copies.push(copy);
+        }
+        for w in &sc.pending {
+            let person = ctx.table.person(ctx.table.insert_at(w.home as usize, w.key)) as u64;
+            let copy = &mut sc.copies[w.copy as usize];
+            copy.part = (person >> LOCAL_BITS) as u32;
+            copy.rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | w.ts as u64;
+        }
+    }
+}
+
+/// Group the copies by fingerprint and then by their actual event IDs, and
+/// cancel every valid copy that is not the kept one of its event.
+fn settle(copies: &mut [Copy], out: &mut Cancels) {
+    let mut a = 0;
+    while a < copies.len() {
+        let mut b = a + 1;
+        while b < copies.len() && copies[b].fp == copies[a].fp {
+            b += 1;
+        }
+        let group = &mut copies[a..b];
+        a = b;
+        // Stable: copies of one event stay in input order.
+        if group.len() > 2 || (group.len() == 2 && group[0].id() != group[1].id()) {
+            group.sort_by(|x, y| x.id().cmp(y.id()));
+        }
+        let mut i = 0;
+        while i < group.len() {
+            let mut j = i + 1;
+            let mut kept = i;
+            while j < group.len() && group[j].id() == group[i].id() {
+                if group[j].ingest < group[kept].ingest {
+                    kept = j;
+                }
+                j += 1;
+            }
+            for (at, c) in group[i..j].iter().enumerate() {
+                if i + at != kept && c.valid {
+                    out.events.push((c.part, c.rec | CANCEL));
+                    if c.extra != 0 {
+                        out.purchases.push((c.part, [c.rec | CANCEL, c.extra]));
+                    }
+                }
+            }
+            i = j;
+        }
+    }
 }

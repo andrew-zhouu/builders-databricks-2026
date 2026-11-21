@@ -95,13 +95,12 @@ pub fn run(data_dir: &std::path::Path) -> ! {
     // The pipeline itself, several times: the first run shows a cold start (if
     // the page cache is cold), the rest the steady state and three variants.
     let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
-    let runs: [(&str, &[(&str, &str)]); 7] = [
+    let runs: [(&str, &[(&str, &str)]); 6] = [
         ("run 1 (default)", &[]),
         ("run 2 (default)", &[]),
         ("run 3 (default)", &[]),
         ("no huge pages", &[("SS_NOHUGE", "1")]),
-        ("read() instead of mmap", &[("SS_IO", "read")]),
-        ("no release, no parallel teardown", &[("SS_NORELEASE", "1"), ("SS_NOZAP", "1")]),
+        ("no parallel teardown", &[("SS_NOZAP", "1")]),
         ("4 threads", &[("NCPU", "4")]),
     ];
     for (label, envs) in runs {
