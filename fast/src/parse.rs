@@ -287,14 +287,6 @@ fn fast_end(ctx: &Ctx, len: usize) -> usize {
     }
 }
 
-#[inline(always)]
-fn prefetch_input(ctx: &Ctx, data: &[u8], pos: usize) {
-    if ctx.prefetch_ahead != 0 {
-        // The hardware streamer stops at page boundaries; reach past them.
-        unsafe { _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + ctx.prefetch_ahead) as *const i8) };
-    }
-}
-
 // ------------------------------------------------------------------ links
 
 #[inline(never)]
@@ -491,8 +483,6 @@ fn event_line(ctx: &Ctx, out: &mut EventOut, line: &[u8], loc: u64) {
         }
     }
 }
-
-const BATCH: usize = 32;
 
 /// What the SIMD path made of one event line.
 pub struct Decoded {
@@ -1074,122 +1064,204 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
     c.push2(&ctx.pool, part, w0, ctx.clicks.key(f[0]));
 }
 
-/// Valid clicks waiting for their person (see `EventBatch`).
-struct ClickBatch {
-    n: usize,
-    user: [u64; BATCH],
-    home: [u32; BATCH],
-    /// ts_rel << CAMPAIGN_BITS | campaign
-    tc: [u64; BATCH],
-    click: [u64; BATCH],
+/// A batch of click lines, for the same three loops as events (see "events,
+/// staged").
+#[repr(C, align(64))]
+struct ClickStage {
+    p: [*const u8; NB],
+    /// Bytes 0..4: the offsets of the line's three commas and its newline;
+    /// byte 7: bit `k` is set if field `k` is quoted.
+    sep: [u64; NB],
+    user: [u64; NB],
+    click: [u64; NB],
+    /// `ts_rel << CAMPAIGN_BITS | campaign`
+    tc: [u64; NB],
+    home: [u32; NB],
+    flags: [u8; NB],
+    /// Where the `ts` field starts in its line, and its length.
+    ts_at: [u8; NB],
+    ts_len: [u8; NB],
+    sl: [u64; 2],
 }
 
-impl ClickBatch {
-    fn new() -> ClickBatch {
-        ClickBatch { n: 0, user: [0; BATCH], home: [0; BATCH], tc: [0; BATCH], click: [0; BATCH] }
-    }
-
-    #[inline(always)]
-    fn add(&mut self, ctx: &Ctx, c: &mut PartWriter, user: u64, tc: u64, click: u64) {
-        let i = self.n;
-        unsafe {
-            *self.user.get_unchecked_mut(i) = user;
-            *self.home.get_unchecked_mut(i) = ctx.table.prefetch_home(user) as u32;
-            *self.tc.get_unchecked_mut(i) = tc;
-            *self.click.get_unchecked_mut(i) = click;
-        }
-        self.n = i + 1;
-        if self.n == BATCH {
-            self.flush(ctx, c);
-        }
-    }
-
-    #[inline(never)]
-    fn flush(&mut self, ctx: &Ctx, c: &mut PartWriter) {
-        for i in 0..self.n {
-            let person = ctx.table.person(ctx.table.insert_at(self.home[i] as usize, self.user[i])) as u64;
-            let (part, w0) = click_words(person, self.tc[i]);
-            c.push2(&ctx.pool, part, w0, self.click[i]);
-        }
-        self.n = 0;
-    }
-}
-
-/// Returns the bytes consumed, or 0 if the line needs the scalar path.
+/// Split the click line at `p`. Returns the bytes it takes (0: not understood,
+/// the scalar path decides) and whether it became line `i` of the batch (a
+/// line without a click_id or a user_id is dropped here).
 #[inline(always)]
-unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, batch: &mut ClickBatch, p: *const u8) -> usize {
+unsafe fn split_click(st: &mut ClickStage, i: usize, p: *const u8) -> (usize, bool) {
     let (cm, nm, qm) = masks64(p);
-    let nl = nm.trailing_zeros() as usize;
-    let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
-    let cmb = cm & below;
-    let c0 = cmb.trailing_zeros() as usize;
-    let cmb1 = cmb & cmb.wrapping_sub(1);
-    let c1 = cmb1.trailing_zeros() as usize;
-    let cmb2 = cmb1 & cmb1.wrapping_sub(1);
-    let c2 = cmb2.trailing_zeros() as usize;
-    let cmb3 = cmb2 & cmb2.wrapping_sub(1);
-    let (qbad, f) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
-    if (nl == 64) | (cmb2 == 0) | (cmb3 != 0) | (qbad != 0) {
-        return 0;
+    let nl = nm.trailing_zeros() as u64;
+    let cmb = _bzhi_u64(cm, nl as u32);
+    let c0 = cmb.trailing_zeros() as u64;
+    let cmb1 = _blsr_u64(cmb);
+    let c1 = cmb1.trailing_zeros() as u64;
+    let c2 = _blsr_u64(cmb1).trailing_zeros() as u64;
+    let q = _bzhi_u64(qm, nl as u32);
+    let d = cmb | 1u64.wrapping_shl(nl as u32);
+    let f = _pext_u64(q >> 1, d) << 1 | (q & 1);
+    let l = _pext_u64(q << 1, d);
+    // The newline is in the window, with exactly three commas before it, and
+    // the quoting is sound (see `split_event`).
+    let bad = (nl >> 6) | (cmb.count_ones() as u64 ^ 3) | (f ^ l) | (q.count_ones() as u64 ^ 2 * f.count_ones() as u64);
+    if bad != 0 {
+        return (0, false);
     }
-    let q = |i: u32| (f >> i & 1) as usize;
-    let (q0, q1, q2, q3) = (q(0), q(1), q(2), q(3));
-    let (a0, n0) = (p.add(q0), c0 - 2 * q0);
-    let (a1, n1) = (p.add(c0 + 1 + q1), c1 - c0 - 1 - 2 * q1);
-    let (a2, n2) = (p.add(c1 + 1 + q2), c2 - c1 - 1 - 2 * q2);
-    let (a3, n3) = (p.add(c2 + 1 + q3), nl - c2 - 1 - 2 * q3);
-    let used = nl + 1;
-    if (n0 == 0) | (n1 == 0) {
-        return used;
+    *st.p.get_unchecked_mut(i) = p;
+    *st.sep.get_unchecked_mut(i) = c0 | c1 << 8 | c2 << 16 | nl << 24 | f << 56;
+    let (q0, q1) = (f & 1, f >> 1 & 1);
+    ((nl + 1) as usize, (c0 != 2 * q0) & (c1 - c0 - 1 != 2 * q1))
+}
+
+const C_DEAD: u8 = 1;
+const C_VALID: u8 = 2;
+
+/// Decode the batch's click lines, in two loops with few values each: the
+/// IDs, then the timestamp. Conditions are integers that are zero when all is
+/// well (see `stage_decode`).
+#[inline(never)]
+unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let index = &ctx.campaigns().index;
+    let table = &ctx.table;
+    for i in 0..n {
+        let p = *st.p.get_unchecked(i);
+        let (start, len) = fields(*st.sep.get_unchecked(i));
+        let sl = st.sl.as_mut_ptr() as *mut u64;
+        sl.write_volatile(start);
+        sl.add(1).write_volatile(len);
+        let sl = sl as *const u8;
+        let at = |k: usize| p.add(sl.add(k).read_volatile() as usize);
+        let ln = |k: usize| sl.add(8 + k).read_volatile() as u64;
+
+        // click_id and user_id: a letter and 1 to 8 ASCII bytes, none of them
+        // NUL, are their own keys (ids::raw_key); `odd` stays zero for those.
+        let (n0, a0) = (ln(0), at(0));
+        let bits = (8 * n0 as u32).wrapping_sub(8);
+        let raw = (a0.add(1) as *const u64).read_unaligned();
+        let mut odd = ((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits);
+        odd |= (*a0 ^ b'k') as u64;
+        odd |= n0.wrapping_sub(2) >> 3;
+        *st.click.get_unchecked_mut(i) = _bzhi_u64(raw, bits).swap_bytes();
+
+        let (n1, a1) = (ln(1), at(1));
+        let bits = (8 * n1 as u32).wrapping_sub(8);
+        let raw = (a1.add(1) as *const u64).read_unaligned();
+        odd |= ((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits);
+        odd |= (*a1 ^ b'u') as u64;
+        odd |= n1.wrapping_sub(2) >> 3;
+        let user = _bzhi_u64(raw, bits).swap_bytes();
+        *st.user.get_unchecked_mut(i) = user;
+        *st.home.get_unchecked_mut(i) = table.prefetch_home(user) as u32;
+
+        // campaign_id: `c_` and 1 to 4 digits without a leading zero is a
+        // number for the table. Anything else is rare (unknown campaigns have
+        // this shape too) and left to the scalar path.
+        let a2 = at(2);
+        let m = (ln(2) as u32).wrapping_sub(2);
+        let digits = _bzhi_u32((a2.add(2) as *const u32).read_unaligned() ^ 0x3030_3030, 8 * m);
+        // The first digit is 1 to 9, the others 0 to 9: one less in the first
+        // byte, and no byte may exceed 8, 9, 9, 9 (a first digit of 0 borrows
+        // and sets its top bit).
+        let x = digits.wrapping_sub(1);
+        odd |= ((x.wrapping_add(0x7676_7677) | x) & 0x8080_8080) as u64;
+        odd |= ((a2 as *const u16).read_unaligned() ^ u16::from_le_bytes(*b"c_")) as u64;
+        odd |= (m.wrapping_sub(1) >> 2) as u64;
+        // Most significant digit first: shift the digits to the top bytes, so
+        // that the missing leading ones read as zeros.
+        let t = digits.wrapping_shl(32u32.wrapping_sub(8 * m));
+        let pairs = t.wrapping_mul(10).wrapping_add(t >> 8);
+        let number = (pairs & 0xFF) * 100 + (pairs >> 16 & 0xFF);
+        *st.tc.get_unchecked_mut(i) = index.by_number(number as usize) as u64;
+        *st.flags.get_unchecked_mut(i) = (odd != 0) as u8;
+        *st.ts_at.get_unchecked_mut(i) = sl.add(3).read_volatile();
+        *st.ts_len.get_unchecked_mut(i) = sl.add(11).read_volatile();
     }
-    let (click_ok, click_key) = raw_key_fast(a0, n0, b'k');
-    let (user_ok, user_key) = raw_key_fast(a1, n1, b'u');
-    if !(click_ok & user_ok) {
-        return 0;
+
+    let dt = &ctx.dates;
+    let (t0, span) = (ctx.t0, (ctx.we - ctx.t0) as u64);
+    for i in 0..n {
+        let a = (*st.p.get_unchecked(i)).add(*st.ts_at.get_unchecked(i) as usize);
+        let (ts_dead, ts_ok, ms) = event_ts(dt, a, *st.ts_len.get_unchecked(i) as usize);
+        let rel = ms.wrapping_sub(t0) as u64;
+        let campaign = *st.tc.get_unchecked(i);
+        let dead = *st.flags.get_unchecked(i) | ts_dead as u8;
+        let valid = ts_ok & (rel < span) & (campaign != ABSENT as u64) & (dead == 0);
+        *st.tc.get_unchecked_mut(i) = rel << CAMPAIGN_BITS | campaign;
+        *st.flags.get_unchecked_mut(i) = dead | (valid as u8) << 1;
     }
-    let (ts_decided, ts_valid, ts) = timestamp(&ctx.dates, a3, n3);
-    if !ts_decided {
-        return 0;
+}
+
+#[inline(never)]
+unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, n: usize) {
+    let cw = c.cursors();
+    let (pool, table) = (&ctx.pool, &ctx.table);
+    for i in 0..n {
+        if *st.flags.get_unchecked(i) != C_VALID {
+            continue;
+        }
+        let person = table.person_at(*st.home.get_unchecked(i) as usize, *st.user.get_unchecked(i)) as u64;
+        let (part, w0) = click_words(person, *st.tc.get_unchecked(i));
+        c.push2_at(cw, pool, part, w0, *st.click.get_unchecked(i));
     }
-    // `c_<n>` without a leading zero goes straight to the table.
-    let (digits, number) = digits16(a2.add(n2), (n2.wrapping_sub(3) & 15) + 1);
-    let canonical = (n2.wrapping_sub(3) < 7)
-        & ((a2 as *const u16).read_unaligned() == u16::from_le_bytes(*b"c_"))
-        & digits
-        & (*a2.add(2) != b'0')
-        & (number < crate::lookup::DIRECT_LIMIT as u64);
-    let campaign = if canonical {
-        ctx.campaigns().index.by_number(number as usize)
-    } else {
-        ctx.campaigns().index.get(std::slice::from_raw_parts(a2, n2))
-    };
-    if (campaign != ABSENT) & ts_valid & (ts >= ctx.t0) & (ts < ctx.we) {
-        batch.add(ctx, c, user_key, ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64, click_key);
-    }
-    used
 }
 
 pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
     let data = ctx.files[ch.file as usize].slice();
-    let (len, fast_end) = (data.len(), fast_end(ctx, data.len()));
+    let len = data.len();
+    let fast_hi = fast_end(ctx, len).min(ch.end);
+    let ahead = ctx.prefetch_ahead;
     let mut lines = 0usize;
-    if let Some(mut pos) = first_line(data, ch.start) {
-        let mut batch = ClickBatch::new();
-        while pos < ch.end {
-            lines += 1;
-            if (pos >= HEAD) & (pos < fast_end) {
-                prefetch_input(ctx, data, pos);
-                let used = unsafe { click_fast(ctx, c, &mut batch, data.as_ptr().add(pos)) };
-                if used != 0 {
+    let Some(mut pos) = first_line(data, ch.start) else { return 0 };
+    let mut st = ClickStage {
+        p: [std::ptr::null(); NB],
+        sep: [0; NB],
+        user: [0; NB],
+        click: [0; NB],
+        tc: [0; NB],
+        home: [0; NB],
+        flags: [0; NB],
+        ts_at: [0; NB],
+        ts_len: [0; NB],
+        sl: [0; 2],
+    };
+    while pos < ch.end {
+        let mut n = 0usize;
+        if pos >= HEAD {
+            unsafe {
+                while (n < NB) & (pos < fast_hi) {
+                    let p = data.as_ptr().add(pos);
+                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead) as *const i8);
+                    let (used, added) = split_click(&mut st, n, p);
+                    if used == 0 {
+                        break;
+                    }
                     pos += used;
-                    continue;
+                    lines += 1;
+                    n += added as usize;
                 }
             }
+        }
+        if n > 0 {
+            unsafe {
+                click_decode(ctx, &mut st, n);
+                click_emit(ctx, c, &st, n);
+                // The scalar path for what the stages could not decide.
+                if st.flags[..n].iter().fold(0, |a, &f| a | f) & C_DEAD != 0 {
+                    for i in 0..n {
+                        if st.flags[i] & C_DEAD != 0 {
+                            click_line(ctx, c, std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 24 & 0xFF) as usize));
+                        }
+                    }
+                }
+            }
+        }
+        if (n < NB) & (pos < ch.end) {
+            lines += 1;
             let e = find_newline(data, pos).unwrap_or(len);
             click_line(ctx, c, &data[pos..e]);
             pos = e + 1;
         }
-        batch.flush(ctx, c);
     }
     lines
 }
