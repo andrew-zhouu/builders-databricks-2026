@@ -1,0 +1,85 @@
+bench events:  512.6 instr/line   160.8 cycles/line  IPC 3.19  0.541 brmiss/line  0.013 llcmiss/line   46.3 ns/line  (6807 lines)
+total instructions: 646   (not in disassembly: 1)
+input lines: events 0  clicks 0  links 0
+
+-- by top-level symbol
+           633  98.0%  Svo_8sessions5parse12events_chunk
+             8   1.2%  Svo_8sessions6lookupNtB2_7IdIndex3get
+             2   0.3%  Svo_8sessions5parse10event_line
+             1   0.2%  _NtCshPeiEMK7Svo_8sessions4partNtB5_10PartWriter10take_block
+             1   0.2%  _NtCs8DdcAKOffGL_5alloc7raw_vecNtB5_11RawVecInner11finish_growCshPeiEMK7Svo_8sessions
+
+-- by source function (inlined code under its own name)
+           230  35.6%  parse::event_fast                 
+           166  25.7%  std:core/src                      
+            73  11.3%  parse::push                       
+            42   6.5%  parse::masks64                    
+            38   5.9%  parse::quotes                     
+            17   2.6%  parse::datetime                   
+            16   2.5%  parse::timestamp                  
+             8   1.2%  parse::pack9                      
+             8   1.2%  table::insert_at                  
+             7   1.1%  lookup::get                       
+             7   1.1%  parse::events_chunk               
+             5   0.8%  parse::digits16                   
+             5   0.8%  part::flush                       
+             4   0.6%  part::push2                       
+             3   0.5%  table::prefetch_home              
+             3   0.5%  table::home                       
+             3   0.5%  parse::emit                       
+             2   0.3%  table::slot                       
+             1   0.2%  lookup::canonical                 
+             1   0.2%  part::take_block                  
+             1   0.2%  std:std/src                       
+             1   0.2%  util::split                       
+             1   0.2%  parse::ingest_field               
+             1   0.2%  util::parse_price                 
+             1   0.2%  table::person                     
+             1   0.2%  std:alloc/src                     
+
+-- hottest source lines
+            73  11.3%  parse.rs:491   parse::push
+            59   9.1%  parse.rs:630   parse::event_fast
+            42   6.5%  parse.rs:239   parse::masks64
+            35   5.4%  parse.rs:634   parse::event_fast
+            31   4.8%  parse.rs:625   parse::event_fast
+            24   3.7%  parse.rs:256   parse::quotes
+            24   3.7%  mut_ptr.rs:971   std:core/src
+            17   2.6%  parse.rs:652   parse::event_fast
+            16   2.5%  parse.rs:601   parse::event_fast
+            16   2.5%  parse.rs:118   parse::datetime
+            15   2.3%  mod.rs:574   std:core/src
+            14   2.2%  uint_macros.rs:2719  std:core/src
+            13   2.0%  parse.rs:254   parse::quotes
+            12   1.9%  index.rs:219   std:core/src
+            10   1.5%  parse.rs:604   parse::event_fast
+            10   1.5%  parse.rs:612   parse::event_fast
+            10   1.5%  sse2.rs:232   std:core/src
+            10   1.5%  sse41.rs:1048  std:core/src
+             8   1.2%  parse.rs:584   parse::event_fast
+             8   1.2%  parse.rs:220   parse::pack9
+             7   1.1%  parse.rs:602   parse::event_fast
+             7   1.1%  ssse3.rs:289   std:core/src
+             7   1.1%  parse.rs:639   parse::event_fast
+             7   1.1%  atomic.rs:4303  std:core/src
+             6   0.9%  lookup.rs:65    lookup::get
+             6   0.9%  uint_macros.rs:178   std:core/src
+             6   0.9%  bmi2.rs:69    std:core/src
+             6   0.9%  sse2.rs:387   std:core/src
+             6   0.9%  parse.rs:169   parse::timestamp
+             5   0.8%  parse.rs:593   parse::event_fast
+             5   0.8%  parse.rs:152   parse::digits16
+             5   0.8%  ssse3.rs:98    std:core/src
+             5   0.8%  parse.rs:640   parse::event_fast
+             5   0.8%  sse.rs:1946  std:core/src
+             5   0.8%  avx.rs:1934  std:core/src
+             4   0.6%  uint_macros.rs:85    std:core/src
+             4   0.6%  sse2.rs:1570  std:core/src
+             4   0.6%  macros.rs:188   std:core/src
+             4   0.6%  parse.rs:178   parse::timestamp
+             4   0.6%  parse.rs:647   parse::event_fast
+             4   0.6%  table.rs:106   table::insert_at
+             3   0.5%  uint_macros.rs:2758  std:core/src
+             3   0.5%  parse.rs:681   parse::events_chunk
+             3   0.5%  parse.rs:597   parse::event_fast
+             3   0.5%  sse41.rs:1045  std:core/src

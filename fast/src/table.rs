@@ -78,10 +78,24 @@ impl Table {
         }
     }
 
+    /// Bring the home slot of `key` into cache and return it, for `insert_at`.
+    #[inline(always)]
+    pub fn prefetch_home(&self, key: u64) -> usize {
+        let home = self.home(key);
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.slots.add(home) as *const i8) };
+        home
+    }
+
     /// The slot of `key`, inserting it if new. Safe to call from many threads.
     #[inline(always)]
     pub fn insert(&self, key: u64) -> u32 {
-        let mut i = self.home(key);
+        self.insert_at(self.home(key), key)
+    }
+
+    /// `insert` with the key's home slot already computed.
+    #[inline(always)]
+    pub fn insert_at(&self, home: usize, key: u64) -> u32 {
+        let mut i = home;
         let mut probes = 0usize;
         loop {
             let slot = unsafe { &(*self.slots.add(i)).key };
