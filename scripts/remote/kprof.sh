@@ -4,10 +4,10 @@
 # Usage: kprof.sh [DATASET] [BINARY_NAME_IN_bin_OR_empty] [extra env assignments...]
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/env.sh"
 cd "$PROJ"
-name="${1:-m20}"; which="${2:-}"; shift 2 2>/dev/null || true
+name="${1:-m20}"; which="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift $#; fi
 BIN="$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions"
 [ -n "$which" ] && BIN="$PROJ/bin/$which"
-out=/tmp/ss-kprof; rm -rf "$out"; mkdir -p "$out"
+out=/tmp/ss-kprof; sudo rm -rf "$out"; mkdir -p "$out"
 cat data/"$name"/*/*.csv > /dev/null
 sudo perf record -q -F 2999 -g -a -o /tmp/ss-perf.data -- env NCPU=8 "$@" "$BIN" "data/$name" "$out" 2>/dev/null
 sudo chown "$USER" /tmp/ss-perf.data
