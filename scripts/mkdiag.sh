@@ -13,7 +13,9 @@ back=$(git rev-parse --abbrev-ref HEAD)
 [ -z "$(git status --porcelain)" ] || { echo "working tree not clean"; exit 1; }
 git checkout -q -B diag "$rev"
 grep -q 'SS_DIAG' Dockerfile || sed -i 's|^CMD \["/sessions"\]|# Diagnostic image: reports the environment and exits 1 on purpose. Never submit this for a score.\nENV SS_DIAG=1\nCMD ["/sessions"]|' Dockerfile
-grep -n 'SS_DIAG' Dockerfile
+# ... and builds the microbenchmarks in (fast/src/probe.rs).
+grep -q 'features probe' Dockerfile || sed -i 's|^RUN cargo build --release --locked |RUN cargo build --release --locked --features probe |' Dockerfile
+grep -n 'SS_DIAG\|features probe' Dockerfile
 git add Dockerfile
 git commit -q -m "Diagnostic image: SS_DIAG=1 (reports the environment, fails on purpose)
 

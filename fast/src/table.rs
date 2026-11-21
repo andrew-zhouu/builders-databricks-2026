@@ -86,6 +86,24 @@ impl Table {
         home
     }
 
+    /// The slot of `key`, whose home slot is `home`, and the person it belongs
+    /// to (valid once `compress` has run). The same as `insert_at` and
+    /// `person`, laid out for the usual case: the key is in its home slot.
+    #[inline(always)]
+    pub fn person_at(&self, home: usize, key: u64) -> u32 {
+        let slots = self.slots;
+        let mut slot = home as u32;
+        if unsafe { (*slots.add(home)).key.load(Relaxed) } != key {
+            slot = self.insert_at(home, key);
+        }
+        let p = unsafe { (*slots.add(slot as usize)).parent.load(Relaxed) };
+        if p == 0 {
+            slot
+        } else {
+            p - 1
+        }
+    }
+
     /// The slot of `key`, inserting it if new. Safe to call from many threads.
     #[inline(always)]
     pub fn insert(&self, key: u64) -> u32 {

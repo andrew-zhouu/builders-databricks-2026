@@ -8,6 +8,11 @@ publish = false
 name = "sessions"
 path = "src/main.rs"
 
+[features]
+# Microbenchmarks for the diagnostic image only (fast/src/probe.rs). Never part
+# of a submission build.
+probe = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"

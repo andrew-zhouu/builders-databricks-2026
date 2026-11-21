@@ -11,13 +11,21 @@ use crate::Ctx;
 
 const LOCALS: usize = 1 << LOCAL_BITS;
 
-/// Per (campaign, day) counters.
+/// Per (campaign, day) counters of the sessions credited to the campaign.
 #[derive(Clone, Copy, Default)]
-pub struct CampCell {
+pub struct Credit {
     pub sessions: u32,
     pub purchasing: u32,
-    pub assisted: u32,
     pub revenue: u64,
+}
+
+/// One thread's campaign counters, indexed by `campaign * ndays + day`. Assists
+/// are counted far more often than credits (a session has one credit but
+/// often ten assists), so they have a compact array of their own.
+#[derive(Default)]
+pub struct CampAcc {
+    pub assisted: Vec<u32>,
+    pub credit: Vec<Credit>,
 }
 
 /// user_daily rows produced by one thread, already in Parquet PLAIN layout
@@ -77,13 +85,14 @@ pub struct Scratch {
     /// The partition's cancelled events (a hash multiset; 0 = empty), and
     /// scratch space for a person's purchases once theirs are removed.
     cancel_set: Vec<u64>,
+    cancel_filter: Vec<u64>,
     kept_pu: Vec<[u64; 2]>,
     /// The current person's user_id record: fixed 16 bytes when short, else `id_long`.
     id_rec: [u8; 16],
     id_len: usize,
     id_long: Vec<u8>,
     pub rows: Rows,
-    pub acc: Vec<CampCell>,
+    pub acc: CampAcc,
 }
 
 impl Scratch {
@@ -104,12 +113,16 @@ impl Scratch {
             cat_sum: vec![0; ctx.products().categories.len()],
             touched: Vec::new(),
             cancel_set: Vec::new(),
+            cancel_filter: Vec::new(),
             kept_pu: Vec::new(),
             id_rec: [0; 16],
             id_len: 0,
             id_long: Vec::new(),
             rows: Rows::default(),
-            acc: vec![CampCell::default(); ctx.campaigns().ids.len() * ctx.ndays],
+            acc: CampAcc {
+                assisted: vec![0; ctx.campaigns().ids.len() * ctx.ndays],
+                credit: vec![Credit::default(); ctx.campaigns().ids.len() * ctx.ndays],
+            },
         }
     }
 }
@@ -213,25 +226,36 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
         // The partition's cancellations, as a small open-addressing multiset:
         // each one removes one event equal to it (same person, same timestamp;
         // which of several equal events goes makes no difference).
+        // In front of it, a bitmap of 16 bits per cancellation that fits in the
+        // first-level cache: most events are turned away by one bit test.
         let ncancel: usize = (0..ctx.nthreads).map(|t| ctx.x(t).events(p).len()).sum();
         let bits = (4 * ncancel.max(16)).next_power_of_two().trailing_zeros();
-        let slot_of = |w: u64| (w.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
         let mask = (1usize << bits) - 1;
+        let fbits = (16 * ncancel.max(16)).next_power_of_two().trailing_zeros().max(6);
+        let mix = |w: u64| w.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // Different bits of one product choose the table slot and the filter bit.
+        let slot_of = |h: u64| (h >> (64 - bits)) as usize;
+        let bit_of = |h: u64| ((h << 20) >> (64 - fbits)) as usize;
         if ncancel > 0 {
             sc.cancel_set.clear();
             sc.cancel_set.resize(1 << bits, 0);
+            sc.cancel_filter.clear();
+            sc.cancel_filter.resize(1 << (fbits - 6), 0);
             for t in 0..ctx.nthreads {
                 for &(_, w) in ctx.x(t).events(p) {
                     // `w` carries the CANCEL bit, so it is never 0 (= empty).
-                    let mut i = slot_of(w);
+                    let h = mix(w);
+                    let mut i = slot_of(h);
                     while sc.cancel_set[i] != 0 {
                         i = (i + 1) & mask;
                     }
                     sc.cancel_set[i] = w;
+                    sc.cancel_filter[bit_of(h) >> 6] |= 1u64 << (bit_of(h) & 63);
                 }
             }
         }
         let set = &mut sc.cancel_set[..];
+        let filter = &sc.cancel_filter[..];
         let mut removed = 0usize;
 
         let (hs, hp) = sc.h.split_at_mut(SLOTS);
@@ -244,23 +268,27 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
                 for &w in run {
                     if ncancel > 0 {
                         let key = w | CANCEL;
-                        let mut i = slot_of(key);
-                        let mut cancelled = false;
-                        loop {
-                            let e = *set.get_unchecked(i);
-                            if e == 0 {
-                                break;
+                        let h = mix(key);
+                        let b = bit_of(h);
+                        if *filter.get_unchecked(b >> 6) & (1u64 << (b & 63)) != 0 {
+                            let mut i = slot_of(h);
+                            let mut cancelled = false;
+                            loop {
+                                let e = *set.get_unchecked(i);
+                                if e == 0 {
+                                    break;
+                                }
+                                if e == key {
+                                    *set.get_unchecked_mut(i) = USED;
+                                    cancelled = true;
+                                    break;
+                                }
+                                i = (i + 1) & mask;
                             }
-                            if e == key {
-                                *set.get_unchecked_mut(i) = USED;
-                                cancelled = true;
-                                break;
+                            if cancelled {
+                                removed += 1;
+                                continue;
                             }
-                            i = (i + 1) & mask;
-                        }
-                        if cancelled {
-                            removed += 1;
-                            continue;
                         }
                     }
                     *hs.get_unchecked_mut((w >> SLOT_SHIFT) as usize & (SLOTS - 1)) += 1;
@@ -494,7 +522,7 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
         } else {
             organic
         };
-        let cell = &mut sc.acc[campaign * ndays + day as usize];
+        let cell = &mut sc.acc.credit[campaign * ndays + day as usize];
         cell.sessions += 1;
         cell.purchasing += purchasing as u32;
         cell.revenue += revenue;
@@ -513,7 +541,7 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
                 let camp = click_campaign(c[0]);
                 if sc.stamp[camp] != sc.tag {
                     sc.stamp[camp] = sc.tag;
-                    sc.acc[camp * ndays + day as usize].assisted += 1;
+                    sc.acc.assisted[camp * ndays + day as usize] += 1;
                 }
             }
         }
@@ -608,7 +636,7 @@ fn assists_by_campaign(sc: &mut Scratch, cl: &[[u64; 2]], ndays: usize) {
                 let from = (sc.dfirst[d] as usize).max(x);
                 let to = (sc.dfirst[d + 1] as usize).min(y);
                 if to > from {
-                    sc.acc[camp * ndays + d].assisted += (to - from) as u32;
+                    sc.acc.assisted[camp * ndays + d] += (to - from) as u32;
                 }
             }
         }

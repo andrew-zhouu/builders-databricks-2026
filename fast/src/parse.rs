@@ -25,7 +25,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::ids::{event_hash, mix16, raw_key_fast};
+use crate::ids::{event_hash, mix9, raw_key_fast};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
@@ -76,6 +76,15 @@ pub struct DateTab {
     day_text: Vec<[u8; 16]>,
     /// Epoch ms of the start of the first of those days.
     first_day_ms: i64,
+    /// `YYYY-MM-DDT` (zero-padded to 16 bytes) and the epoch ms of the day
+    /// with a given day of the month, among the days from one before the
+    /// first a click may fall on to one after the event window (F2 writes
+    /// local dates). Indexed by `tens * 10 + ones` of the low nibbles of the
+    /// two characters. Empty (no text matches) for other indexes, and
+    /// altogether when those days are too many to have distinct days of the
+    /// month.
+    dom_text: [[u8; 16]; 166],
+    dom_ms: [i64; 166],
 }
 
 impl DateTab {
@@ -87,7 +96,20 @@ impl DateTab {
             days: [[BAD_DAY; 512]; 4],
             day_text: Vec::new(),
             first_day_ms: first_day * DAY_MS,
+            dom_text: [[0xFF; 16]; 166],
+            dom_ms: [0; 166],
         };
+        if ndays + 3 <= 28 {
+            for day in first_day - 1..=first_day + ndays as i64 + 1 {
+                let (y, m, dd) = civil_from_days(day);
+                if (0..=9999).contains(&y) {
+                    let mut text = [0u8; 16];
+                    text[..11].copy_from_slice(format!("{y:04}-{m:02}-{dd:02}T").as_bytes());
+                    t.dom_text[dd as usize] = text;
+                    t.dom_ms[dd as usize] = day * DAY_MS;
+                }
+            }
+        }
         for k in 0..3 {
             let yy = y - 1 + k as i64;
             if !(0..=9999).contains(&yy) {
@@ -472,53 +494,6 @@ fn event_line(ctx: &Ctx, out: &mut EventOut, line: &[u8], loc: u64) {
 
 const BATCH: usize = 32;
 
-/// Valid events waiting for their person: the user table is the one randomly
-/// accessed structure of the parser, so its slots are prefetched when an event
-/// is queued and read a batch later.
-struct EventBatch {
-    n: usize,
-    key: [u64; BATCH],
-    home: [u32; BATCH],
-    ts: [u32; BATCH],
-    /// `price << 32 | category` of a purchase, 0 otherwise (a price is at least 1).
-    extra: [u64; BATCH],
-}
-
-impl EventBatch {
-    fn new() -> EventBatch {
-        EventBatch { n: 0, key: [0; BATCH], home: [0; BATCH], ts: [0; BATCH], extra: [0; BATCH] }
-    }
-
-    #[inline(always)]
-    fn add(&mut self, ctx: &Ctx, out: &mut EventOut, key: u64, ts: u32, extra: u64) {
-        let i = self.n;
-        unsafe {
-            *self.key.get_unchecked_mut(i) = key;
-            *self.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
-            *self.ts.get_unchecked_mut(i) = ts;
-            *self.extra.get_unchecked_mut(i) = extra;
-        }
-        self.n = i + 1;
-        if self.n == BATCH {
-            self.flush(ctx, out);
-        }
-    }
-
-    #[inline(never)]
-    fn flush(&mut self, ctx: &Ctx, out: &mut EventOut) {
-        for i in 0..self.n {
-            let person = ctx.table.person(ctx.table.insert_at(self.home[i] as usize, self.key[i])) as u64;
-            let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | self.ts[i] as u64;
-            let sp = (person >> LOCAL_BITS) as usize;
-            out.s.push1(&ctx.pool, sp, rec);
-            if self.extra[i] != 0 {
-                out.ps.push2(&ctx.pool, sp, rec, self.extra[i]);
-            }
-        }
-        self.n = 0;
-    }
-}
-
 /// What the SIMD path made of one event line.
 pub struct Decoded {
     /// Bytes consumed; 0 if the line needs the scalar path.
@@ -653,54 +628,421 @@ pub unsafe fn decode_event<const FULL: bool>(ctx: &Ctx, p: *const u8) -> Decoded
     out
 }
 
-/// The parser's fast path for the event line at `p`, whose input position is
-/// `loc`. Returns the bytes consumed, or 0 if the line needs the scalar path.
-#[inline(always)]
-unsafe fn event_fast(ctx: &Ctx, out: &mut EventOut, batch: &mut EventBatch, p: *const u8, loc: u64) -> usize {
-    let d = decode_event::<false>(ctx, p);
-    let (a0, n0) = d.id;
-    if (d.used == 0) | (n0 == 0) {
-        return d.used;
-    }
-    // The trace: a hash of the event_id's bytes (ids::event_hash).
-    let lo = _bzhi_u64((a0 as *const u64).read_unaligned(), 8 * n0 as u32);
-    let hi = _bzhi_u64((a0.add(8) as *const u64).read_unaligned(), 8 * (n0 as u32).saturating_sub(8));
-    let (pk, trace) = trace_of(ctx, mix16(lo, hi, n0));
-    out.k.push1(&ctx.pool, pk, trace | loc);
-    if d.valid {
-        batch.add(ctx, out, d.user_key, (d.ts - ctx.t0) as u32, d.extra);
-    }
-    d.used
-}
-
 /// Whether the SIMD decoder may be used on the line at byte `pos` of a file of `len` bytes.
 #[inline(always)]
 pub fn can_decode(ctx: &Ctx, pos: usize, len: usize) -> bool {
     (pos >= HEAD) & (pos < fast_end(ctx, len))
 }
 
+// ------------------------------------------------------------------ events, staged
+//
+// The parser proper works on batches of lines, in three loops:
+//
+//   split    find each line's separators and check its structure;
+//   decode   everything that depends on one line only: the trace of its
+//            event_id, its user, timestamp and validity. The user's slot in
+//            the user table is asked for here (prefetch) ...
+//   emit     ... and read here, a batch later, when the event goes to its
+//            person's partition.
+//
+// The first two contain no calls and no branch that depends on the data in an
+// unpredictable way other than the form of the timestamp. What they cannot
+// decide is marked and left to the scalar path, which implements the rules
+// literally.
+
+/// Lines per batch: their bytes and everything below stay in the L1 cache.
+const NB: usize = 64;
+/// The scalar path must take this line.
+const F_DEAD: u8 = 1;
+/// The event passed validation (and is not late, unless `F_INGEST` is set).
+const F_VALID: u8 = 4;
+const F_PURCHASE: u8 = 8;
+/// ingest_ts is not on the UTC day of ts: the lateness rule needs its value.
+const F_INGEST: u8 = 16;
+
+const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+const VIEW: u32 = u32::from_le_bytes(*b"view");
+const CART: u32 = u32::from_le_bytes(*b"cart");
+
+#[repr(C, align(64))]
+struct Stage {
+    /// Where each line starts.
+    p: [*const u8; NB],
+    /// Bytes 0..7: the offsets of the line's six commas and its newline; byte
+    /// 7: bit `k` is set if field `k` is quoted.
+    sep: [u64; NB],
+    /// The trace word, and the trace partition.
+    trace: [u64; NB],
+    /// The user's key; 0 = no user.
+    key: [u64; NB],
+    /// `price << 32 | category`, with `F_PURCHASE`.
+    extra: [u64; NB],
+    pk: [u32; NB],
+    /// The user's home slot in the user table (prefetched).
+    home: [u32; NB],
+    /// `ts - t0`, meaningful with `F_VALID`.
+    ts: [u32; NB],
+    flags: [u8; NB],
+    /// Scratch: the current line's field starts and lengths (see `fields`).
+    sl: [u64; 2],
+    /// Lines with more to do after `decode`: a lateness check on the value of
+    /// ingest_ts, or a purchase.
+    more: [u8; NB],
+}
+
+impl Stage {
+    fn new() -> Stage {
+        Stage {
+            p: [std::ptr::null(); NB],
+            sep: [0; NB],
+            trace: [0; NB],
+            key: [0; NB],
+            extra: [0; NB],
+            pk: [0; NB],
+            home: [0; NB],
+            ts: [0; NB],
+            flags: [0; NB],
+            sl: [0; 2],
+            more: [0; NB],
+        }
+    }
+}
+
+/// Every field's content, from a line's `sep` word: byte `k` of the first is
+/// where field `k` starts (offset in the line), of the second its length.
+#[inline(always)]
+unsafe fn fields(s: u64) -> (u64, u64) {
+    // One byte per field: 1 if it is quoted.
+    let quoted = _pdep_u64(s >> 56, 0x0001_0101_0101_0101);
+    let seps = s & 0x00FF_FFFF_FFFF_FFFF;
+    // A field starts after the separator before it (the line start for field
+    // 0), past its opening quote; it ends at its separator, before its closing
+    // quote. No byte borrows from the next: lengths are >= 0.
+    let start = (seps << 8).wrapping_add(0x0001_0101_0101_0100).wrapping_add(quoted);
+    (start, seps.wrapping_sub(start).wrapping_sub(quoted))
+}
+
+/// Split the line at `p`: find its seven separators and check its quoting.
+/// Returns the bytes the line takes (0: not understood, the scalar path
+/// decides) and whether it became line `i` of the batch (a line with an empty
+/// event_id is dropped here).
+#[inline(always)]
+unsafe fn split_event(st: &mut Stage, i: usize, p: *const u8) -> (usize, bool) {
+    // Window 1: event_id, user_id, ts and their three commas.
+    let (cm, nm, qm) = masks64(p);
+    let c0 = cm.trailing_zeros() as u64;
+    let cm1 = _blsr_u64(cm);
+    let c1 = cm1.trailing_zeros() as u64;
+    let cm2 = _blsr_u64(cm1);
+    let c2 = cm2.trailing_zeros() as u64;
+    // Three commas (else c2 is 64), and no newline before the third.
+    let mut bad = (c2 >> 6) | _bzhi_u64(nm, c2 as u32);
+    let qa = _bzhi_u64(qm, c2 as u32);
+    let da = cm ^ _blsr_u64(cm2);
+    // Fields that start with a quote, and fields that end with one.
+    let fa = _pext_u64(qa >> 1, da) << 1 | (qa & 1);
+    let la = _pext_u64(qa << 1, da);
+
+    // Window 2: ingest_ts, event_type, product_id, price_cents and the newline.
+    let o = (c2 & 63) + 1;
+    let (cm, nm, qm) = masks64(p.add(o as usize));
+    let nl = nm.trailing_zeros() as u64;
+    let cmb = _bzhi_u64(cm, nl as u32);
+    let c3 = cmb.trailing_zeros() as u64;
+    let cmb1 = _blsr_u64(cmb);
+    let c4 = cmb1.trailing_zeros() as u64;
+    let cmb2 = _blsr_u64(cmb1);
+    let c5 = cmb2.trailing_zeros() as u64;
+    // The newline is in the window, with exactly three commas before it.
+    bad |= (nl >> 6) | (cmb.count_ones() as u64 ^ 3);
+    let qb = _bzhi_u64(qm, nl as u32);
+    let db = cmb | 1u64.wrapping_shl(nl as u32);
+    let fb = _pext_u64(qb >> 1, db) << 1 | (qb & 1);
+    let lb = _pext_u64(qb << 1, db);
+
+    // A field is quoted iff its first and last bytes are quotes; any other
+    // quote makes the line malformed: the same fields start and end with a
+    // quote, and there are exactly two quotes for each of them.
+    let f = fa | fb << 3;
+    bad |= (f ^ (la | lb << 3)) | ((qa.count_ones() + qb.count_ones()) as u64 ^ 2 * f.count_ones() as u64);
+    if bad != 0 {
+        return (0, false);
+    }
+    *st.p.get_unchecked_mut(i) = p;
+    let d = st.sep.as_mut_ptr().add(i) as *mut u8;
+    *d = c0 as u8;
+    *d.add(1) = c1 as u8;
+    *d.add(2) = c2 as u8;
+    *d.add(3) = (o + c3) as u8;
+    *d.add(4) = (o + c4) as u8;
+    *d.add(5) = (o + c5) as u8;
+    *d.add(6) = (o + nl) as u8;
+    *d.add(7) = f as u8;
+    // An empty event_id (nothing, or just two quotes): the line is dropped.
+    ((o + nl + 1) as usize, c0 != 2 * (fa & 1))
+}
+
+/// A `ts` field of `n` bytes at `a`. Returns (the scalar path must decide,
+/// valid, epoch ms).
+#[inline(always)]
+unsafe fn event_ts(dt: &DateTab, a: *const u8, n: usize) -> (bool, bool, i64) {
+    if (n == 20) | (n == 25) {
+        // F1 or F2. The date is almost always one of the few days around the
+        // window, which have distinct days of the month: look the day up by
+        // that, and compare the text (`YYYY-MM-DDT`).
+        let w = (a.add(8) as *const u16).read_unaligned() as usize;
+        let dom = (w & 15) * 10 + (w >> 8 & 15);
+        let date = _mm_cmpeq_epi8(
+            _mm_loadu_si128(a as *const __m128i),
+            _mm_loadu_si128(dt.dom_text.get_unchecked(dom).as_ptr() as *const __m128i),
+        );
+        // `HH:MM:SS`: digits within their ranges and the two colons.
+        let d = (a.add(11) as *const u64).read_unaligned() ^ 0x3030_3A30_303A_3030;
+        let over = (d.wrapping_add(0x767A_7F76_7A7F_767D) | d) & 0x8080_8080_8080_8080;
+        let y = d.wrapping_mul(0xA01);
+        let (hh, mm, ss) = (y >> 8 & 0xFF, y >> 32 & 0xFF, y >> 56);
+        let ms = *dt.dom_ms.get_unchecked(dom) + ((hh * 3600 + mm * 60 + ss) * 1000) as i64;
+        let s = *a.add(19);
+        if (_mm_movemask_epi8(date) & 0x7FF != 0x7FF) | (over != 0) | (hh > 23) {
+            // Another date (far from the window, or none at all), a bad time, a
+            // run of digits: rare, and the scalar path knows all the rules.
+            return (true, false, 0);
+        }
+        if n == 20 {
+            return (false, s == b'Z', ms);
+        }
+        let h1 = (*a.add(20)).wrapping_sub(b'0') as i64;
+        let h2 = (*a.add(21)).wrapping_sub(b'0') as i64;
+        let m1 = (*a.add(23)).wrapping_sub(b'0') as i64;
+        let m2 = (*a.add(24)).wrapping_sub(b'0') as i64;
+        let (oh, om) = (h1 * 10 + h2, m1 * 10 + m2);
+        let ok = ((s == b'+') | (s == b'-'))
+            & (h1 <= 9)
+            & (h2 <= 9)
+            & (m1 <= 9)
+            & (m2 <= 9)
+            & (*a.add(22) == b':')
+            & (oh <= 23)
+            & (om <= 59);
+        let off = (oh * 60 + om) * 60_000;
+        return (false, ok, ms - if s == b'-' { -off } else { off });
+    }
+    if n.wrapping_sub(1) < 16 {
+        // F3: digits only. Anything else of these lengths is simply invalid.
+        let (digits, value) = digits16(a.add(n), n);
+        return (false, digits, value as i64);
+    }
+    // No valid form has this length, except a long run of digits (F3 with
+    // leading zeros): the scalar path decides what might be one.
+    let maybe_digits = (n != 0) && ((*a).wrapping_sub(b'0') < 10) & ((*a.add(n - 1)).wrapping_sub(b'0') < 10);
+    (maybe_digits, false, 0)
+}
+
+/// Decode the batch's lines (see the section comment). Conditions are kept as
+/// integers that are zero when all is well and OR-ed together, so that a line
+/// costs a handful of tests, not one per rule.
+#[inline(never)]
+unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let dt = &ctx.dates;
+    let (ws, t0, span) = (ctx.ws, ctx.t0, (ctx.we - ctx.ws) as u64);
+    let (pd, fp_mask, loc_bits) = (ctx.pd as u64, ctx.fp_mask, ctx.loc_bits);
+    let (first_day_ms, last_day) = (dt.first_day_ms, dt.day_text.len() as u64 - 1);
+    let day_text = dt.day_text.as_ptr();
+    let mut nmore = 0usize;
+    for i in 0..n {
+        let p = *st.p.get_unchecked(i);
+        let (start, len) = fields(*st.sep.get_unchecked(i));
+        // Through memory, so that each field's offset and length is one byte
+        // load, not a shift and a mask of two registers that stay live.
+        let sl = st.sl.as_mut_ptr() as *mut u64;
+        sl.write_volatile(start);
+        sl.add(1).write_volatile(len);
+        let sl = sl as *const u8;
+        let at = |k: usize| p.add(sl.add(k).read_volatile() as usize);
+        let ln = |k: usize| sl.add(8 + k).read_volatile() as u64;
+
+        // The trace: a hash of the event_id's bytes after the first (1 to 9
+        // bytes in all; see ids::event_hash).
+        let n0 = ln(0);
+        let x = _bzhi_u64((at(0).add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
+        let h = mix9(x);
+        *st.pk.get_unchecked_mut(i) = (((h >> 32) * pd) >> 32) as u32;
+        *st.trace.get_unchecked_mut(i) = (h & fp_mask) << loc_bits | loc0.wrapping_add(p as u64);
+
+        // The user: `u` and 1 to 8 ASCII bytes, none of them NUL, is its own
+        // key (ids::raw_key). `user_bad` is zero for those.
+        let n1 = ln(1);
+        let a1 = at(1);
+        let bits = (8 * n1 as u32).wrapping_sub(8);
+        let raw = (a1.add(1) as *const u64).read_unaligned();
+        let user_bad = (((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits))
+            | (*a1 ^ b'u') as u64
+            | (n1.wrapping_sub(2) > 7) as u64;
+        let key = if user_bad == 0 { _bzhi_u64(raw, bits).swap_bytes() } else { 0 };
+        *st.key.get_unchecked_mut(i) = key;
+        *st.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
+
+        let (ts_dead, ts_ok, ms) = event_ts(dt, at(2), ln(2) as usize);
+        let in_window = (ms.wrapping_sub(ws) as u64) < span;
+
+        // The scalar path takes what this one cannot decide: a longer
+        // event_id (its hash looks at more than one word), a user_id that
+        // needs the dictionary, an ingest_ts that cannot be F1, a timestamp
+        // out of the ordinary.
+        let mut dead = (n0 > 9) as u64 | (ln(3) ^ 20) | ts_dead as u64;
+        if user_bad != 0 {
+            dead |= n1; // an empty user_id is just invalid
+        }
+
+        // view / cart / purchase, exactly.
+        let n4 = ln(4);
+        let w = (at(4) as *const u64).read_unaligned();
+        let not_purchase = (n4 ^ 8) | (w ^ PURCHASE);
+        let not_view = (n4 ^ 4) | (w as u32 ^ VIEW) as u64 * (w as u32 ^ CART) as u64;
+        let invalid = dead | user_bad | not_purchase.min(not_view) | (ln(5) == 0) as u64 | !(ts_ok & in_window) as u64;
+        let valid = invalid == 0;
+
+        // Late? ingest_ts is a valid F1 timestamp by the rules, and it almost
+        // always falls on the same UTC day as ts, which settles it without
+        // parsing it: on the same day the two are less than 24 hours apart.
+        let a3 = at(3);
+        let day = ((ms.wrapping_sub(first_day_ms) as u64) / DAY_MS as u64).min(last_day) as usize;
+        let same = _mm_cmpeq_epi8(
+            _mm_loadu_si128(a3 as *const __m128i),
+            _mm_loadu_si128(day_text.add(day) as *const __m128i),
+        );
+        let other_day = (!_mm_movemask_epi8(same) as u32 & 0x3FF) | (*a3.add(19) ^ b'Z') as u32;
+        let ingest = valid & (other_day != 0);
+        let purchase = valid & (not_purchase == 0);
+
+        *st.ts.get_unchecked_mut(i) = ms.wrapping_sub(t0) as u32;
+        *st.flags.get_unchecked_mut(i) =
+            (dead != 0) as u8 | (valid as u8) << 2 | (purchase as u8) << 3 | (ingest as u8) << 4;
+        *st.more.get_unchecked_mut(nmore) = i as u8;
+        nmore += (ingest | purchase) as usize;
+    }
+    nmore
+}
+
+/// The rest of validation for the lines `decode` listed: the lateness rule by
+/// the value of ingest_ts, and a purchase's price and category.
+#[inline(never)]
+unsafe fn stage_more(ctx: &Ctx, st: &mut Stage, nmore: usize) {
+    let dt = &ctx.dates;
+    for k in 0..nmore {
+        let i = st.more[k] as usize;
+        let p = st.p[i];
+        let (start, len) = fields(st.sep[i]);
+        let at = |k: u32| p.add((start >> (8 * k)) as usize & 0xFF);
+        let ln = |k: u32| (len >> (8 * k)) as usize & 0xFF;
+        let mut fl = st.flags[i];
+        if fl & F_INGEST != 0 {
+            let a3 = at(3);
+            let (shape, known, cal, ingest_s) = datetime(dt, a3);
+            if !(shape & known & cal & (*a3.add(19) == b'Z')) {
+                st.flags[i] = F_DEAD;
+                continue;
+            }
+            if ingest_s * 1000 - (st.ts[i] as i64 + ctx.t0) > DAY_MS {
+                fl &= !(F_VALID | F_PURCHASE);
+            }
+        }
+        if fl & F_PURCHASE != 0 {
+            match parse_price(std::slice::from_raw_parts(at(6), ln(6))) {
+                Some(price) => {
+                    let product = std::slice::from_raw_parts(at(5), ln(5));
+                    st.extra[i] = (price as u64) << 32 | ctx.products().category(product) as u64;
+                }
+                None => fl &= !(F_VALID | F_PURCHASE),
+            }
+        }
+        st.flags[i] = fl;
+    }
+}
+
+/// Every line leaves its trace; valid events go to their person. The user's
+/// slot was prefetched by `decode`.
+#[inline(never)]
+unsafe fn stage_emit(ctx: &Ctx, out: &mut EventOut, st: &Stage, n: usize) {
+    let (kw, sw, pw) = (out.k.cursors(), out.s.cursors(), out.ps.cursors());
+    let (pool, table) = (&ctx.pool, &ctx.table);
+    for i in 0..n {
+        let fl = *st.flags.get_unchecked(i);
+        if fl & F_DEAD != 0 {
+            continue;
+        }
+        out.k.push1_at(kw, pool, *st.pk.get_unchecked(i) as usize, *st.trace.get_unchecked(i));
+        if fl & F_VALID == 0 {
+            continue;
+        }
+        let person = table.person_at(*st.home.get_unchecked(i) as usize, *st.key.get_unchecked(i)) as u64;
+        let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | *st.ts.get_unchecked(i) as u64;
+        let sp = (person >> LOCAL_BITS) as usize;
+        out.s.push1_at(sw, pool, sp, rec);
+        if fl & F_PURCHASE != 0 {
+            out.ps.push2_at(pw, pool, sp, rec, *st.extra.get_unchecked(i));
+        }
+    }
+}
+
 pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
     let data = ctx.files[ch.file as usize].slice();
-    let (len, fast_end) = (data.len(), fast_end(ctx, data.len()));
+    let len = data.len();
+    let fast_hi = fast_end(ctx, len).min(ch.end);
     let base = ctx.file_base[ch.file as usize];
+    // The input position of a line is `loc0 + its address`.
+    let loc0 = base.wrapping_sub(data.as_ptr() as u64);
+    let ahead = ctx.prefetch_ahead;
     let mut lines = 0usize;
-    if let Some(mut pos) = first_line(data, ch.start) {
-        let mut batch = EventBatch::new();
-        while pos < ch.end {
-            lines += 1;
-            if (pos >= HEAD) & (pos < fast_end) {
-                prefetch_input(ctx, data, pos);
-                let used = unsafe { event_fast(ctx, out, &mut batch, data.as_ptr().add(pos), base + pos as u64) };
-                if used != 0 {
+    let Some(mut pos) = first_line(data, ch.start) else { return 0 };
+    let mut st = Stage::new();
+    while pos < ch.end {
+        let mut n = 0usize;
+        if pos >= HEAD {
+            unsafe {
+                while (n < NB) & (pos < fast_hi) {
+                    let p = data.as_ptr().add(pos);
+                    // The hardware streamer stops at page boundaries; reach past them.
+                    // A line is often longer than a cache line, so two requests
+                    // per line: one alone would skip every few cache lines.
+                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead) as *const i8);
+                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead + 64) as *const i8);
+                    let (used, added) = split_event(&mut st, n, p);
+                    if used == 0 {
+                        break;
+                    }
                     pos += used;
-                    continue;
+                    lines += 1;
+                    n += added as usize;
                 }
             }
+        }
+        if n > 0 {
+            unsafe {
+                let nmore = stage_decode(ctx, &mut st, n, loc0);
+                stage_more(ctx, &mut st, nmore);
+                stage_emit(ctx, out, &st, n);
+                // The scalar path for what the stages could not decide.
+                if st.flags[..n].iter().fold(0, |a, &f| a | f) & F_DEAD != 0 {
+                    for i in 0..n {
+                        if st.flags[i] & F_DEAD != 0 {
+                            let line = std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 48 & 0xFF) as usize);
+                            event_line(ctx, out, line, loc0.wrapping_add(st.p[i] as u64));
+                        }
+                    }
+                }
+            }
+        }
+        // The batch ended early: at a line the split did not understand, or
+        // where the fast path may not read (the edges of the file).
+        if (n < NB) & (pos < ch.end) {
+            lines += 1;
             let e = find_newline(data, pos).unwrap_or(len);
             event_line(ctx, out, &data[pos..e], base + pos as u64);
             pos = e + 1;
         }
-        batch.flush(ctx, out);
     }
     lines
 }
