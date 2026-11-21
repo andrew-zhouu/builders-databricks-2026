@@ -80,6 +80,9 @@ pub struct Ctx {
     pub prefetch_ahead: usize,
     /// Unmap the big memory regions from all threads before exiting.
     zap: bool,
+    /// A thread writes its user_daily rows out whenever it holds about this
+    /// many bytes of them.
+    out_chunk: usize,
     pub table: Table,
     pub pool: BlockPool,
     pub files: Vec<FileMap>,
@@ -429,15 +432,30 @@ fn worker(ctx: &Ctx, tid: usize) {
         sized.into_iter().map(|(_, p)| p).collect()
     });
     let mut sc = pass3::Scratch::new(ctx);
+    // Rows leave in files of about `out_chunk` bytes as they come, not in one
+    // file at the end: the kernel then writes them to disk while the rest is
+    // still being computed (see sys::start_writeback), and the row buffers
+    // stay small.
+    let mut files = 0usize;
     loop {
         let i = ctx.next_s.fetch_add(1, Relaxed);
         if i >= ctx.ps {
             break;
         }
         pass3::run(ctx, &mut sc, order[i] as usize);
+        if sc.rows.bytes() >= ctx.out_chunk {
+            let t = ctx.now();
+            write_user_daily(ctx, &sc.rows, tid, files);
+            ctx.charge_rows(P_WRITE, t, sc.rows.n);
+            files += 1;
+            sc.rows.clear();
+        }
     }
     let t = ctx.now();
-    write_user_daily(ctx, &sc.rows, tid);
+    // What is left; and the table always has a file, if only an empty one.
+    if sc.rows.n > 0 || (tid == 0 && files == 0) {
+        write_user_daily(ctx, &sc.rows, tid, files);
+    }
     ctx.charge_rows(P_WRITE, t, sc.rows.n);
     unsafe { *ctx.acc[tid].0.get() = std::mem::take(&mut sc.acc) };
     if ctx.timing {
@@ -545,12 +563,9 @@ fn bench(ctx: &Ctx) {
     prof::write_samples();
 }
 
-fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
+fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
     use parquet::{as_bytes, index_width, pack_indices, small_dict};
     let n = rows.n;
-    if n == 0 && tid != 0 {
-        return;
-    }
     // Every column as a dictionary and bit-packed indexes into it.
     let id_idx = pack_indices(rows.id_idx.iter().copied(), n, index_width(rows.people as usize));
     let days: Vec<i32> = (0..ctx.ndays as i64).map(|d| (ctx.day0 + d) as i32).collect();
@@ -639,7 +654,7 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
             dict: Some((vec![&categories], ctx.cat_recs().len())),
         },
     ];
-    let path = ctx.out_dir.join("user_daily").join(format!("part-{tid:03}.parquet"));
+    let path = ctx.out_dir.join("user_daily").join(format!("part-{tid:03}-{seq:04}.parquet"));
     parquet::write(&path, n, &columns).expect("write user_daily");
 }
 
@@ -824,6 +839,8 @@ fn main() {
         scalar_only: std::env::var("SS_SCALAR").is_ok(),
         prefetch_ahead: std::env::var("SS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
         zap: std::env::var("SS_NOZAP").is_err(),
+        // SS_OUT_CHUNK (experiment): bytes of rows per user_daily file.
+        out_chunk: std::env::var("SS_OUT_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512 << 10),
         table: Table::new(cap),
         pool: BlockPool::new(pool_blocks, pool_floor),
         files,
