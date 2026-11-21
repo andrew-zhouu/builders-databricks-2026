@@ -16,7 +16,7 @@ Everything below the horizontal rule predates this; where they disagree, this wi
 | Candidate c2: c1 + dictionary-encoded output (25 MB) | `c4b7fcf` (tag `cand-c2`) | Full gate passed. |
 | **Candidate c3: trace-only parser, pass 2 routes events** | `69557e4` (tag `cand-c3`) | Full gate passed. 20M: 501 / 503 against 555 / 561; 60M: 1556 / 1557 against 1704 / 1710. |
 | **Candidate c4: c3 + merged pass 2, faster writer** | `864640b` (tag `cand-c4`) | Full gate passed. 20M: 490 / 492 against 560 / 562; 60M: 1522 / 1526 against 1704 / 1705. |
-| **Candidate c5: c4 + same-day check on the text, user table in cache-line buckets** | `4b2bdb3` (tag `cand-c5`) | Full gate passed. 20M: 485 / 487 against 488 / 488 for c4; 60M: 1502 / 1504 against 1520 / 1528. **The one to submit.** |
+| **Candidate c5: c4 + same-day check on the text, user table in cache-line buckets** | `4b2bdb3` (tag `cand-c5`) | Full gate passed. One interleaved run, scored / c4 / c5: 20M 561/564, 488/491, 488/489; 60M 1702/1705, 1520/1522, 1503/1509; a second 60M set (seed 77) 1671/1677 scored, 1438/1442 c5. Also identical to the plain implementation on four more large sets (`scripts/remote/moreseeds.sh`: a window holding 29 February 2028 at 5M and 20M, seed 31 at 20M, seed 77 at 60M) and to the Python reference on the leap-day seed at 200K. **The one to submit.** |
 | Diagnostic image (fails on purpose, shows a log) | `2a2ea40` (branch `diag4`) | Not yet submitted. The single most informative submission: scorer CPU, clock under 512-bit code, huge pages, page-fault and memory costs, `/output` write speed, CPU-quota throttling. |
 
 "Full gate" = `scripts/cand.sh NAME`: on EC2, `fullcheck.sh` (fixtures, dev answer, 150
