@@ -28,20 +28,27 @@ pub struct CampAcc {
     pub credit: Vec<Credit>,
 }
 
-/// user_daily rows produced by one thread, already in Parquet PLAIN layout
-/// column by column, so writing the file is just a handful of large writes.
+/// user_daily rows produced by one thread, column by column, in the shape the
+/// Parquet file wants them: the file is dictionary-encoded, which makes it
+/// less than half the size of plain values.
 #[derive(Default)]
 pub struct Rows {
     pub n: usize,
-    /// user_id: 4-byte length + bytes per row.
+    /// The user_id dictionary: 4-byte length + bytes, once per person, in
+    /// order of appearance; `people` of them.
     pub ids: Vec<u8>,
+    pub people: u32,
+    /// Per row: the person's number in `ids`.
+    pub id_idx: Vec<u32>,
+    /// Per row: the day, counted from the first day of the click window (`Ctx::day0`).
     pub day: Vec<i32>,
     pub sessions: Vec<i32>,
     pub events: Vec<i32>,
     pub revenue: Vec<i64>,
-    /// top_category: one validity bit per row (LSB first), and the length-prefixed non-null values.
+    /// top_category: one validity bit per row (LSB first), and the category
+    /// index of each row that has one.
     pub valid: Vec<u8>,
-    pub cats: Vec<u8>,
+    pub cats: Vec<u32>,
 }
 
 /// The length-prefixed bytes of a regular user key (see ids.rs: `u`, then the
@@ -91,10 +98,6 @@ pub struct Scratch {
     kept_pu: Vec<[u64; 2]>,
     /// The partition's people who have events.
     present: Vec<u16>,
-    /// The current person's user_id record: fixed 16 bytes when short, else `id_long`.
-    id_rec: [u8; 16],
-    id_len: usize,
-    id_long: Vec<u8>,
     pub rows: Rows,
     pub acc: CampAcc,
 }
@@ -120,9 +123,6 @@ impl Scratch {
             cancel_filter: Vec::new(),
             kept_pu: Vec::new(),
             present: Vec::new(),
-            id_rec: [0; 16],
-            id_len: 0,
-            id_long: Vec::new(),
             rows: Rows::default(),
             acc: CampAcc {
                 assisted: vec![0; ctx.campaigns().ids.len() * ctx.ndays],
@@ -353,7 +353,7 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
         r.sessions.reserve(n);
         r.events.reserve(n);
         r.revenue.reserve(n);
-        r.ids.reserve(16 * n + 16);
+        r.id_idx.reserve(n);
     }
     let ts = std::mem::take(&mut sc.a);
     let mut pu = std::mem::take(&mut sc.pu);
@@ -465,17 +465,27 @@ fn slot_group(ev: &[u64], i: usize) -> (u32, u32, usize) {
 }
 
 fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
-    // The person's name, rendered once for all of their rows.
+    // The person's name, once: the next entry of the user_id dictionary.
     let key = ctx.table.key(slot);
-    if key & crate::ids::IRREGULAR == 0 {
-        sc.id_len = id_record(key, &mut sc.id_rec);
-    } else {
-        let mut name = Vec::new();
-        ctx.users.bytes(key, &mut name);
-        sc.id_long.clear();
-        sc.id_long.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        sc.id_long.extend_from_slice(&name);
-        sc.id_len = usize::MAX;
+    {
+        let r = &mut sc.rows;
+        if key & crate::ids::IRREGULAR == 0 {
+            let mut rec = [0u8; 16];
+            let n = id_record(key, &mut rec);
+            r.ids.reserve(16);
+            unsafe {
+                // Copy a fixed 16 bytes and keep only the record's length.
+                let len = r.ids.len();
+                std::ptr::copy_nonoverlapping(rec.as_ptr(), r.ids.as_mut_ptr().add(len), 16);
+                r.ids.set_len(len + n);
+            }
+        } else {
+            let mut name = Vec::new();
+            ctx.users.bytes(key, &mut name);
+            r.ids.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            r.ids.extend_from_slice(&name);
+        }
+        r.people += 1;
     }
     let ndays = ctx.ndays;
     let organic = ctx.campaigns().organic as usize;
@@ -513,7 +523,7 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
         let day = ((start as u64 + ctx.day_off) / DAY_MS as u64) as u32;
         if day != cur_day {
             if cur_day != u32::MAX {
-                flush_day(ctx, sc, cur_day, d_sessions, d_events, d_revenue);
+                flush_day(sc, cur_day, d_sessions, d_events, d_revenue);
             }
             cur_day = day;
             d_sessions = 0;
@@ -595,14 +605,14 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
         }
         k = m;
     }
-    flush_day(ctx, sc, cur_day, d_sessions, d_events, d_revenue);
+    flush_day(sc, cur_day, d_sessions, d_events, d_revenue);
     if big {
         assists_by_campaign(sc, cl, ndays);
     }
 }
 
 #[inline]
-fn flush_day(ctx: &Ctx, sc: &mut Scratch, day: u32, sessions: i32, events: i32, revenue: i64) {
+fn flush_day(sc: &mut Scratch, day: u32, sessions: i32, events: i32, revenue: i64) {
     // Top category: highest summed price, ties to the smallest name (= smallest index).
     let mut best = u32::MAX;
     let mut best_sum = 0u64;
@@ -617,23 +627,16 @@ fn flush_day(ctx: &Ctx, sc: &mut Scratch, day: u32, sessions: i32, events: i32, 
     sc.touched.clear();
     let r = &mut sc.rows;
     // `run` reserved room for one row per event of the partition in every
-    // fixed-width column, and 16 bytes per row for short IDs and categories.
+    // per-row column.
     unsafe {
-        if sc.id_len != usize::MAX {
-            // Copy a fixed 16 bytes and keep only the record's length.
-            let len = r.ids.len();
-            std::ptr::copy_nonoverlapping(sc.id_rec.as_ptr(), r.ids.as_mut_ptr().add(len), 16);
-            r.ids.set_len(len + sc.id_len);
-        } else {
-            r.ids.extend_from_slice(&sc.id_long);
-            r.ids.reserve(16 * r.day.capacity().saturating_sub(r.day.len()));
-        }
         let n = r.n;
-        debug_assert!(n < r.day.capacity() && n < r.revenue.capacity());
-        *r.day.as_mut_ptr().add(n) = (ctx.day0 + day as i64) as i32;
+        debug_assert!(n < r.day.capacity() && n < r.revenue.capacity() && n < r.id_idx.capacity());
+        *r.id_idx.as_mut_ptr().add(n) = r.people - 1;
+        *r.day.as_mut_ptr().add(n) = day as i32;
         *r.sessions.as_mut_ptr().add(n) = sessions;
         *r.events.as_mut_ptr().add(n) = events;
         *r.revenue.as_mut_ptr().add(n) = revenue;
+        r.id_idx.set_len(n + 1);
         r.day.set_len(n + 1);
         r.sessions.set_len(n + 1);
         r.events.set_len(n + 1);
@@ -643,7 +646,7 @@ fn flush_day(ctx: &Ctx, sc: &mut Scratch, day: u32, sessions: i32, events: i32, 
         }
         if best != u32::MAX {
             *r.valid.last_mut().unwrap_unchecked() |= 1 << (n & 7);
-            r.cats.extend_from_slice(&ctx.cat_recs()[best as usize]);
+            r.cats.push(best);
         }
         r.n = n + 1;
     }

@@ -1,5 +1,8 @@
-//! A minimal Parquet writer: one row group, one PLAIN uncompressed v1 data page
-//! per column. Page payloads are borrowed slices, written without copying.
+//! A minimal Parquet writer: one row group, one uncompressed v1 data page per
+//! column, PLAIN or dictionary-encoded (a PLAIN dictionary page, then indices
+//! in the RLE / bit-packed hybrid: what every Parquet writer produces by
+//! default, so every reader takes it). Page payloads are borrowed slices,
+//! written without copying.
 
 use std::fs::File;
 use std::io::Write;
@@ -22,8 +25,70 @@ pub struct Column<'a> {
     pub kind: Kind,
     /// OPTIONAL column: `payload` then starts with the definition levels section.
     pub optional: bool,
-    /// The page body, in order (levels, then PLAIN values).
+    /// The data page body, in order: levels, then PLAIN values or, with
+    /// `dict`, the dictionary indices (`pack_indices`).
     pub payload: Vec<&'a [u8]>,
+    /// For a dictionary-encoded column: the PLAIN-encoded dictionary values
+    /// and how many there are.
+    pub dict: Option<(Vec<&'a [u8]>, usize)>,
+}
+
+/// The body of a dictionary-indices data page for `values`, each below
+/// `2^width`: the bit width, then one bit-packed run (the last group of eight
+/// padded with zeros).
+pub fn pack_indices(values: impl Iterator<Item = u32>, count: usize, width: u32) -> Vec<u8> {
+    let width = width.clamp(1, 32);
+    let groups = count.div_ceil(8);
+    let mut out = Vec::with_capacity(groups * width as usize + 16);
+    out.push(width as u8);
+    let mut run = Thrift { b: Vec::with_capacity(8) };
+    run.varint((groups as u64) << 1 | 1);
+    out.extend_from_slice(&run.b);
+    let start = out.len();
+    let bytes = groups * width as usize;
+    // Room for whole-word writes past the end.
+    out.resize(start + bytes + 8, 0);
+    let (mut acc, mut nbits, mut at) = (0u64, 0u32, start);
+    for v in values {
+        acc |= (v as u64) << nbits;
+        nbits += width;
+        if nbits >= 32 {
+            out[at..at + 4].copy_from_slice(&(acc as u32).to_le_bytes());
+            at += 4;
+            acc >>= 32;
+            nbits -= 32;
+        }
+    }
+    out[at..at + 8].copy_from_slice(&acc.to_le_bytes());
+    out.truncate(start + bytes);
+    out
+}
+
+/// The number of bits that hold every index below `n`.
+pub fn index_width(n: usize) -> u32 {
+    (usize::BITS - n.saturating_sub(1).leading_zeros()).max(1)
+}
+
+/// A dictionary for small non-negative integers: the distinct values in order
+/// of first appearance, and each value's index. `None` if a value is negative
+/// or too large for a direct table.
+pub fn small_dict(values: &[i32]) -> Option<(Vec<i32>, Vec<u32>)> {
+    let max = *values.iter().max()?;
+    if max >= 1 << 22 || values.iter().any(|&v| v < 0) {
+        return None;
+    }
+    let mut index = vec![u32::MAX; max as usize + 1];
+    let mut dict = Vec::new();
+    let mut out = Vec::with_capacity(values.len());
+    for &v in values {
+        let slot = &mut index[v as usize];
+        if *slot == u32::MAX {
+            *slot = dict.len() as u32;
+            dict.push(v);
+        }
+        out.push(*slot);
+    }
+    Some((dict, out))
 }
 
 struct Thrift {
@@ -71,14 +136,27 @@ impl Thrift {
     }
 }
 
-fn page_header(num_values: usize, size: usize) -> Vec<u8> {
+fn dictionary_page_header(num_values: usize, size: usize) -> Vec<u8> {
+    let mut t = Thrift { b: Vec::with_capacity(32) };
+    t.i32(1, 2); // DICTIONARY_PAGE
+    t.i32(1, size as i32);
+    t.i32(1, size as i32);
+    t.begin(4); // dictionary_page_header (field 7)
+    t.i32(1, num_values as i32);
+    t.i32(1, 0); // PLAIN
+    t.end();
+    t.end();
+    t.b
+}
+
+fn page_header(num_values: usize, size: usize, encoding: i32) -> Vec<u8> {
     let mut t = Thrift { b: Vec::with_capacity(32) };
     t.i32(1, 0); // DATA_PAGE
     t.i32(1, size as i32);
     t.i32(1, size as i32);
     t.begin(2); // data_page_header (field 5)
     t.i32(1, num_values as i32);
-    t.i32(1, 0); // PLAIN
+    t.i32(1, encoding); // PLAIN (0) or RLE_DICTIONARY (8)
     t.i32(1, 3); // definition levels: RLE
     t.i32(1, 3); // repetition levels: RLE
     t.end();
@@ -120,17 +198,27 @@ pub fn write(path: &Path, rows: usize, columns: &[Column]) -> std::io::Result<()
     let mut f = File::create(path)?;
     let mut offset = 4usize;
     f.write_all(b"PAR1")?;
-    // (data page offset, total size) per column
-    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    // (chunk offset, data page offset, total size) per column
+    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
     if rows > 0 {
         for c in columns {
+            let start = offset;
+            if let Some((dict, count)) = &c.dict {
+                let size: usize = dict.iter().map(|p| p.len()).sum();
+                let header = dictionary_page_header(*count, size);
+                f.write_all(&header)?;
+                for p in dict {
+                    f.write_all(p)?;
+                }
+                offset += header.len() + size;
+            }
             let size: usize = c.payload.iter().map(|p| p.len()).sum();
-            let header = page_header(rows, size);
+            let header = page_header(rows, size, if c.dict.is_some() { 8 } else { 0 });
             f.write_all(&header)?;
             for p in &c.payload {
                 f.write_all(p)?;
             }
-            chunks.push((offset, header.len() + size));
+            chunks.push((start, offset, offset + header.len() + size - start));
             offset += header.len() + size;
         }
     }
@@ -169,12 +257,17 @@ pub fn write(path: &Path, rows: usize, columns: &[Column]) -> std::io::Result<()
         t.list(1, 12, 1); // row_groups
         t.list(1, 12, columns.len()); // columns
         let mut total = 0usize;
-        for (c, &(at, size)) in columns.iter().zip(&chunks) {
+        for (c, &(at, data_at, size)) in columns.iter().zip(&chunks) {
             total += size;
             t.i64(2, at as i64); // file_offset
             t.begin(1); // meta_data
             t.i32(1, c.ptype);
-            if c.optional {
+            if c.dict.is_some() {
+                t.list(1, 5, 3);
+                t.zigzag(0); // PLAIN (the dictionary)
+                t.zigzag(3); // RLE (levels, and the hybrid the indices are in)
+                t.zigzag(8); // RLE_DICTIONARY
+            } else if c.optional {
                 t.list(1, 5, 2);
                 t.zigzag(0); // PLAIN
                 t.zigzag(3); // RLE
@@ -189,7 +282,10 @@ pub fn write(path: &Path, rows: usize, columns: &[Column]) -> std::io::Result<()
             t.i64(1, rows as i64); // num_values
             t.i64(1, size as i64); // total_uncompressed_size
             t.i64(1, size as i64); // total_compressed_size
-            t.i64(2, at as i64); // data_page_offset
+            t.i64(2, data_at as i64); // data_page_offset (field 9)
+            if c.dict.is_some() {
+                t.i64(2, at as i64); // dictionary_page_offset (field 11)
+            }
             t.end();
             t.end();
         }
