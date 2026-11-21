@@ -1,0 +1,72 @@
+//! Thin OS layer: anonymous and file mappings, madvise, immediate exit.
+
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::os::raw::{c_int, c_void};
+
+extern "C" {
+    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    pub fn _exit(code: c_int) -> !;
+}
+
+const PROT_READ: c_int = 1;
+const PROT_WRITE: c_int = 2;
+const MAP_PRIVATE: c_int = 2;
+const MAP_ANONYMOUS: c_int = 0x20;
+const MAP_NORESERVE: c_int = 0x4000;
+const MADV_DONTNEED: c_int = 4;
+const MADV_HUGEPAGE: c_int = 14;
+
+/// Zeroed, lazily committed memory. Never returned to the OS before exit.
+pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
+    let len = len.max(4096);
+    let p = unsafe {
+        mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
+    };
+    if p as isize == -1 {
+        panic!("mmap of {len} bytes failed");
+    }
+    if huge {
+        unsafe { madvise(p, len, MADV_HUGEPAGE) };
+    }
+    p as *mut u8
+}
+
+/// A read-only private mapping of a whole file. Empty files map to an empty slice.
+pub struct FileMap {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+unsafe impl Send for FileMap {}
+unsafe impl Sync for FileMap {}
+
+impl FileMap {
+    pub fn open(path: &std::path::Path) -> std::io::Result<FileMap> {
+        let f = File::open(path)?;
+        let len = f.metadata()?.len() as usize;
+        if len == 0 {
+            return Ok(FileMap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+        }
+        let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
+        if p as isize == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(FileMap { ptr: p as *const u8, len })
+    }
+
+    #[inline]
+    pub fn slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Drop the page-table entries of fully covered pages in `[start, end)`; the
+    /// pages stay in the page cache. Spreads unmap work over the worker threads.
+    pub fn release(&self, start: usize, end: usize) {
+        let a = (start + 4095) & !4095;
+        let b = end & !4095;
+        if b > a {
+            unsafe { madvise(self.ptr.add(a) as *mut c_void, b - a, MADV_DONTNEED) };
+        }
+    }
+}
