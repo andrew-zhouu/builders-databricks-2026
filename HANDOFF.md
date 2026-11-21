@@ -1,7 +1,110 @@
 # Handoff: where the work stands
 
-Last updated 2026-11-21. Read this first when resuming. `bench/NOTES.md` has the
-measurements behind every statement here.
+Last updated 2026-11-21, about 11:45 UTC (paused on request; resume from here).
+
+## Checkpoint of the EC2 round (read this first)
+
+Everything below this section predates the round; where they disagree, this wins.
+
+### Commits
+
+| What | Commit | Status |
+| --- | --- | --- |
+| Officially scored, **0.85 s** | `f1459cc` (tag `scored-0.85`) | Untouched. Still the only thing to submit for a score. |
+| GitHub `main` | `3201a41` | Untouched this round. |
+| `dev`, first version of the new architecture ("dedup by exception") | `81c1f75` | Fixtures, dev answer, 60 fuzz seeds x 8 modes, six seeds, 5M / 20M / 20M / 60M against the plain implementation: all pass. Same speed as scored. |
+| `dev`, staged event parser | `80002d6` | Fixtures, dev answer, 40 fuzz seeds x 8 modes pass. The state just before it (staged parser + faster settle, without the leaner decode loop and the cursor writers) passed the full check: 150 fuzz seeds x 8 modes, six seeds fast and slow, 5M / 20M / 20M / 60M. |
+| `dev` tip: the above + staged click parser | this commit | Fixtures, dev answer, 40 fuzz seeds x 8 modes pass (`scripts/remote/cycle.sh`). **Not** yet through the full check or `scripts/validate.sh` (Docker). |
+
+Nothing on `dev` is a submission candidate yet: the best measured gain is 2.5%, and no
+`dev` commit of this round has been through the Docker gate.
+
+### Latest A/B against the scored binary
+
+EC2 m6i.2xlarge (Ice Lake, 4 cores x 2 threads), 20M events, 8 threads, wall ms,
+min / median of 5 interleaved rounds (`scripts/abx.sh m20 5 SSBIN=scored X=1`):
+
+| Build | scored | build |
+| --- | --- | --- |
+| `81c1f75` | 559 / 562 | 565 / 567 |
+| `80002d6` | 562 / 564 | 549 / 550 |
+| `dev` tip | 559 / 564 | 546 / 549 |
+
+No 60M A/B of the new builds yet (scored: 1703 / 1709 ms). CPU ms by section at the
+`dev` tip, 20M: parse events 2028 (96.9 ns/row), parse clicks 418, dedup gather 26 +
+scan 132 + settle 334, sessions gather 287 + sort 130 + people 624, links 91; kernel
+about 500 of 4200.
+
+### What was learned
+
+* **Everything is instruction-bound, with no hot spot.** Exact counts per event row
+  (valgrind on the dev set, `scripts/remote/cgasm.sh`): 867 in all; event split 155,
+  event decode 217, event emit 60, dedup + sessions 236, clicks 78, pair sort 18. The
+  time profile is equally flat. 8 threads on 4 cores run at about 1.3 instructions per
+  cycle each, so wall time follows the instruction count.
+* The leader's 0.36 s corresponds to roughly half our instructions per line. Hand
+  estimates say that is reachable only with assembly-level care in every loop (the
+  compiler emits about 1.5x what a careful hand count predicts: flag plumbing,
+  reloaded constants, spills) or with 512-bit masks.
+* What helped: validation as integers OR-ed together instead of booleans (decode 242
+  -> 217), write pointers instead of fill counts in the partition writers, no calls
+  inside the hot loops, F1 timestamps through a day-of-month table, radix grouping and
+  O(1) file lookup in settle (380 -> 338 ms).
+* What did not: staging by itself (same count as the fused loop); the staged click
+  parser (81 against 79.5 ns/row, kept because it is not slower in the A/B); a second
+  input prefetch per line; input prefetch distance 512 to 4096 (none at all costs 18%
+  of the parse); trace partitions of 1.2 MB instead of 2.4 MB (neutral; 0.6 MB is
+  worse); the settle prefetch distance, 4 to 128 lines (no effect at all, so settle is
+  not waiting for memory: find out where its 240 ns per re-read line go with
+  `scripts/remote/cgsrc.sh sessions::worker pass2.rs`, written but not yet run).
+* Dedup by exception and the old partition-then-hash dedup cost the same. The
+  generator scatters the copies of an event over random files, so nothing local helps.
+* Probes on EC2 (`scripts/remote/probe.sh dev`), for comparison with the scorer once
+  the diagnostic image is submitted: clock 3.30 GHz scalar, 3.22 with 512-bit
+  instructions in between; first touch of 256 MB 35 ms with huge pages, 93 ms without;
+  random read 108 ns (125 ns on 4K pages); copy 6.9 GB/s; map-and-touch of the input
+  45 ns/page.
+
+### Next steps, in order
+
+1. **Diagnostic image.** The probes are in (`fast/src/probe.rs`, cargo feature
+   `probe`), and `scripts/mkdiag.sh` now builds with them, but the `diag` branch has
+   NOT been rebuilt: it is still the old `a55f0bc`. To do: `scripts/mkdiag.sh dev`,
+   `scripts/diagtest.sh` on EC2, push `diag`, then one submission of its SHA. It tells
+   us the scorer's CPU, whether 512-bit instructions slow its clock, huge pages, page
+   fault and memory costs, and whether the input is in the page cache.
+2. Keep cutting instructions with `cgasm.sh` / `cgshow.sh`: decode (217), split (155),
+   emit (60, a bucketed branch-free table probe would save about 5), clicks.
+3. Settle without re-reading lines: 16-byte traces holding the exact ID key, person,
+   timestamp and ingest delta (design in the session notes; estimated 3 to 4%).
+4. 512-bit separator masks behind a run-time switch, if the diagnostic says the clock
+   penalty is small (about 30 instructions per event line).
+5. Before any candidate: `scripts/remote/fullcheck.sh`, a 60M A/B, `scripts/validate.sh`.
+
+### EC2 box
+
+Address, user and key are in `.local/remote.env` (untracked). Nothing is running there;
+it was left idle with everything in place.
+
+* `~/db`: the working tree (rsync of this one, no `.git` history of its own beyond the
+  first clone), toolchain in `~/db/.toolchain`, scored binary `~/db/bin/scored`.
+* Data: `~/db/data/{dev,m5,m20,n20,m60,s2_200000..s7_200000}`; reference answers
+  `~/db/expected/*.slow`; job logs `~/db/out/logs`.
+* From WSL: `scripts/remote.sh push` (sync sources), then
+  `scripts/remote.sh run 'bash scripts/remote/cycle.sh 40 900'` (build, fixtures, dev,
+  40 fuzz seeds from 900, A/B against scored, section profile);
+  `scripts/remote.sh tmux NAME 'bash scripts/remote/fullcheck.sh'` and
+  `scripts/remote.sh log NAME` for the long check; `scripts/remote/status.sh` shows
+  load and jobs. Other tools in `scripts/remote/`: `cgasm.sh`, `cgshow.sh`, `cgfn.sh`
+  (instructions per line of assembly), `lineprof.sh` (time by source line), `knobs.sh`,
+  `sweep.sh`, `probe.sh`.
+* From PowerShell, a command with `|` or `$` inside nested quotes gets mangled: put it
+  in a script under `scripts/remote/` and run that.
+
+---
+
+The sections below are from before the EC2 round. `bench/NOTES.md` has the
+measurements behind them.
 
 ## Commits that matter
 
