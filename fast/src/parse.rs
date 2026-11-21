@@ -305,42 +305,47 @@ unsafe fn link_fast(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
     nl + 1
 }
 
-/// Links waiting for their two table slots (prefetched when queued).
+/// Links on their way into the union-find, two stages behind the parser so
+/// that each memory access has been prefetched: first the two home slots
+/// (insert), then the two current parents (union).
 struct LinkRing {
-    buf: [(u64, u64); RING],
+    /// Stage 1: the two user keys; `(0, 0)` = empty.
+    keys: [(u64, u64); RING],
+    /// Stage 2: the two slots; equal = nothing to do.
+    slots: [(u32, u32); RING],
     at: usize,
 }
 
 impl LinkRing {
     fn new() -> LinkRing {
-        LinkRing { buf: [(0, 0); RING], at: 0 }
-    }
-
-    #[inline(always)]
-    fn apply(ctx: &Ctx, e: (u64, u64)) {
-        if e.0 != 0 {
-            let sa = ctx.table.insert(e.0);
-            let sb = ctx.table.insert(e.1);
-            if sa != sb {
-                // Roots may be irregular IDs inserted by the scalar path: full comparison.
-                ctx.table.union(sa, sb, |x, y| ctx.users.less(x, y));
-            }
-        }
+        LinkRing { keys: [(0, 0); RING], slots: [(0, 0); RING], at: 0 }
     }
 
     #[inline(always)]
     fn push(&mut self, ctx: &Ctx, e: (u64, u64)) {
-        ctx.table.prefetch(e.0);
-        ctx.table.prefetch(e.1);
-        let old = std::mem::replace(unsafe { self.buf.get_unchecked_mut(self.at) }, e);
-        self.at = (self.at + 1) & (RING - 1);
-        Self::apply(ctx, old);
+        if e.0 != 0 {
+            ctx.table.prefetch_for_insert(e.0);
+            ctx.table.prefetch_for_insert(e.1);
+        }
+        let i = self.at;
+        self.at = (i + 1) & (RING - 1);
+        let k = std::mem::replace(unsafe { self.keys.get_unchecked_mut(i) }, e);
+        let mut s = (0u32, 0u32);
+        if k.0 != 0 {
+            s = (ctx.table.insert(k.0), ctx.table.insert(k.1));
+            ctx.table.prefetch_parent(s.0);
+            ctx.table.prefetch_parent(s.1);
+        }
+        let old = std::mem::replace(unsafe { self.slots.get_unchecked_mut(i) }, s);
+        if old.0 != old.1 {
+            // Roots may be irregular IDs inserted by the scalar path: full comparison.
+            ctx.table.union(old.0, old.1, |x, y| ctx.users.less(x, y));
+        }
     }
 
     fn drain(&mut self, ctx: &Ctx) {
-        for i in 0..RING {
-            let e = std::mem::replace(&mut self.buf[(self.at + i) & (RING - 1)], (0, 0));
-            Self::apply(ctx, e);
+        for _ in 0..2 * RING {
+            self.push(ctx, (0, 0));
         }
     }
 }
@@ -480,7 +485,7 @@ fn event_line(ctx: &Ctx, d: &mut PartWriter, line: &[u8]) {
     let person = ctx.table.person(ctx.table.insert(ctx.users.key(f[1]))) as u64;
     let w1 = VALID | person << 31 | (ts - ctx.t0) as u64;
     if purchase {
-        let cat = ctx.products.category(f[5]) as u64;
+        let cat = ctx.products().category(f[5]) as u64;
         d.push2(&ctx.pool, part, w0, w1 | PURCHASE);
         d.push2(&ctx.pool, part, (price as u64) << 32 | cat, 0);
     } else {
@@ -573,7 +578,7 @@ unsafe fn event_fast(ctx: &Ctx, d: &mut PartWriter, ring: &mut EventRing, p: *co
         let price = std::slice::from_raw_parts(p2.add(c5 + 1 + q6), nl - c5 - 1 - 2 * q6);
         match parse_price(price) {
             Some(price) => {
-                let cat = ctx.products.category(std::slice::from_raw_parts(p2.add(c4 + 1 + q5), n5)) as u64;
+                let cat = ctx.products().category(std::slice::from_raw_parts(p2.add(c4 + 1 + q5), n5)) as u64;
                 extra = (price as u64) << 32 | cat;
                 w1 |= PURCHASE;
             }
@@ -627,7 +632,7 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
     if f[0].is_empty() || f[1].is_empty() {
         return;
     }
-    let campaign = ctx.campaigns.index.get(f[2]);
+    let campaign = ctx.campaigns().index.get(f[2]);
     if campaign == ABSENT {
         return;
     }
@@ -726,9 +731,9 @@ unsafe fn click_fast(ctx: &Ctx, c: &mut PartWriter, ring: &mut ClickRing, p: *co
         & (*a2.add(2) != b'0')
         & (number < crate::lookup::DIRECT_LIMIT as u64);
     let campaign = if canonical {
-        ctx.campaigns.index.by_number(number as usize)
+        ctx.campaigns().index.by_number(number as usize)
     } else {
-        ctx.campaigns.index.get(std::slice::from_raw_parts(a2, n2))
+        ctx.campaigns().index.get(std::slice::from_raw_parts(a2, n2))
     };
     if (campaign != ABSENT) & ts_valid & (ts >= ctx.t0) & (ts < ctx.we) {
         let tc = ((ts - ctx.t0) as u64) << CAMPAIGN_BITS | campaign as u64;

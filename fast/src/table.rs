@@ -63,6 +63,21 @@ impl Table {
         unsafe { _mm_prefetch::<_MM_HINT_T0>(self.slots.add(slot as usize) as *const i8) };
     }
 
+    /// Bring the home slot of `key` into cache for writing (a new key is expected).
+    #[inline(always)]
+    pub fn prefetch_for_insert(&self, key: u64) {
+        unsafe { _mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(self.slots.add(self.home(key)) as *const i8) };
+    }
+
+    /// Bring the slot of `slot`'s parent into cache, if it has one.
+    #[inline(always)]
+    pub fn prefetch_parent(&self, slot: u32) {
+        let p = self.slot(slot).parent.load(Relaxed);
+        if p != 0 {
+            self.prefetch_slot(p - 1);
+        }
+    }
+
     /// The slot of `key`, inserting it if new. Safe to call from many threads.
     #[inline(always)]
     pub fn insert(&self, key: u64) -> u32 {

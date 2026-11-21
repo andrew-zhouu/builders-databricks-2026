@@ -62,10 +62,10 @@ pub struct Ctx {
     pub day_off: u64,
     pub ndays: usize,
     pub nthreads: usize,
-    pub products: Products,
-    /// Category names as Parquet PLAIN values (4-byte length + bytes), by index.
-    pub cat_recs: Vec<Vec<u8>>,
-    pub campaigns: Campaigns,
+    /// products.csv and campaigns.csv, loaded by thread 0 while the others
+    /// already parse links; read only after the first barrier.
+    lookups: Shared<Option<Lookups>>,
+    data_dir: PathBuf,
     pub users: KeySpace,
     pub clicks: KeySpace,
     pub event_dict: Dict,
@@ -76,6 +76,8 @@ pub struct Ctx {
     pub prefetch_ahead: usize,
     /// Release the big memory regions from all threads before exiting.
     zap: bool,
+    /// Experiment switch: load products/campaigns before starting the threads.
+    eager_lookups: bool,
     pub table: Table,
     pub pool: BlockPool,
     pub files: Vec<FileMap>,
@@ -105,7 +107,42 @@ pub struct Ctx {
     t_start: Instant,
 }
 
+pub struct Lookups {
+    pub products: Products,
+    pub campaigns: Campaigns,
+    /// Category names as Parquet PLAIN values (4-byte length + bytes), by index.
+    pub cat_recs: Vec<Vec<u8>>,
+}
+
 impl Ctx {
+    fn load_lookups(&self) {
+        let products = Products::load(&std::fs::read(self.data_dir.join("products.csv")).unwrap_or_default());
+        let campaigns = Campaigns::load(&std::fs::read(self.data_dir.join("campaigns.csv")).unwrap_or_default());
+        if campaigns.ids.len() >= (1 << parse::CAMPAIGN_BITS) {
+            self.bail.store(true, Relaxed);
+        }
+        let cat_recs =
+            products.categories.iter().map(|name| [&(name.len() as u32).to_le_bytes()[..], name].concat()).collect();
+        unsafe { *self.lookups.0.get() = Some(Lookups { products, campaigns, cat_recs }) };
+    }
+
+    #[inline(always)]
+    fn lookups(&self) -> &Lookups {
+        unsafe { (*self.lookups.0.get()).as_ref().unwrap_unchecked() }
+    }
+    #[inline(always)]
+    pub fn products(&self) -> &Products {
+        &self.lookups().products
+    }
+    #[inline(always)]
+    pub fn campaigns(&self) -> &Campaigns {
+        &self.lookups().campaigns
+    }
+    #[inline(always)]
+    pub fn cat_recs(&self) -> &[Vec<u8>] {
+        &self.lookups().cat_recs
+    }
+
     // Writers are mutated only by their owning thread during the phase that
     // fills them, and only read (by anyone) after the barrier that follows.
     #[inline(always)]
@@ -203,6 +240,9 @@ fn worker(ctx: &Ctx, tid: usize) {
         *ctx.s[tid].0.get() = PartWriter::new(ctx.ps);
         *ctx.psw[tid].0.get() = PartWriter::new(ctx.ps);
     }
+    if tid == 0 && !ctx.eager_lookups {
+        ctx.load_lookups();
+    }
     // ---- links: insert both IDs, join them
     loop {
         let i = ctx.next_link.fetch_add(1, Relaxed);
@@ -212,6 +252,9 @@ fn worker(ctx: &Ctx, tid: usize) {
         parse::links_chunk(ctx, &ctx.link_chunks[i]);
     }
     ctx.sync("links parsed");
+    if ctx.failed() {
+        return;
+    }
     loop {
         let from = ctx.next_compress.fetch_add(COMPRESS_STEP, Relaxed);
         if from >= ctx.table.cap {
@@ -310,6 +353,7 @@ fn worker(ctx: &Ctx, tid: usize) {
 /// minimum is meaningful even on a busy machine.
 fn bench(ctx: &Ctx) {
     sys::NORELEASE.store(true, Relaxed);
+    ctx.load_lookups();
     for ch in &ctx.link_chunks {
         parse::links_chunk(ctx, ch);
     }
@@ -372,7 +416,7 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
 }
 
 fn write_campaign_daily(ctx: &Ctx) {
-    let ncamp = ctx.campaigns.ids.len();
+    let ncamp = ctx.campaigns().ids.len();
     let ndays = ctx.ndays;
     let mut total = vec![CampCell::default(); ncamp * ndays];
     for t in 0..ctx.nthreads {
@@ -393,7 +437,7 @@ fn write_campaign_daily(ctx: &Ctx) {
             if cell.sessions == 0 && cell.assisted == 0 {
                 continue;
             }
-            for (buf, s) in [(&mut ids, &ctx.campaigns.ids[camp]), (&mut channels, &ctx.campaigns.channels[camp])] {
+            for (buf, s) in [(&mut ids, &ctx.campaigns().ids[camp]), (&mut channels, &ctx.campaigns().channels[camp])] {
                 buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 buf.extend_from_slice(s);
             }
@@ -448,10 +492,6 @@ fn main() {
     mark("start");
     let (ws, we) = lookup::manifest(&std::fs::read(data_dir.join("manifest.json")).expect("manifest.json"))
         .expect("manifest window");
-    let products = Products::load(&std::fs::read(data_dir.join("products.csv")).unwrap_or_default());
-    mark("products loaded");
-    let campaigns = Campaigns::load(&std::fs::read(data_dir.join("campaigns.csv")).unwrap_or_default());
-    mark("campaigns loaded");
 
     let mut files: Vec<FileMap> = Vec::new();
     let mut link_chunks: Vec<Chunk> = Vec::new();
@@ -503,8 +543,7 @@ fn main() {
     let fits = ws < we
         && we - t0 < (1i64 << 31)
         && parse::INGEST_MAX - (window_s + 86_400 + 2) >= 86_400
-        && cap < (1 << parse::PERSON_BITS)
-        && campaigns.ids.len() < (1 << parse::CAMPAIGN_BITS);
+        && cap < (1 << parse::PERSON_BITS);
     if !fits {
         eprintln!("input does not fit the fast path: using the plain implementation");
         slow::run(&data_dir, &out_dir);
@@ -520,13 +559,8 @@ fn main() {
         day_off: (t0 - day0 * DAY_MS) as u64,
         ndays: ((we - 1).div_euclid(DAY_MS) - day0 + 1) as usize,
         nthreads,
-        cat_recs: products
-            .categories
-            .iter()
-            .map(|name| [&(name.len() as u32).to_le_bytes()[..], name].concat())
-            .collect(),
-        products,
-        campaigns,
+        lookups: Shared::new(None),
+        data_dir: data_dir.clone(),
         users: KeySpace::new(),
         clicks: KeySpace::new(),
         event_dict: Dict::new(),
@@ -534,6 +568,7 @@ fn main() {
         scalar_only: std::env::var("SCALAR").is_ok(),
         prefetch_ahead: std::env::var("PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         zap: std::env::var("NOZAP").is_err(),
+        eager_lookups: std::env::var("EAGER_LOOKUPS").is_ok(),
         table: Table::new(cap),
         pool: BlockPool::new(pool_blocks),
         files,
@@ -578,6 +613,10 @@ fn main() {
     if force_bench {
         bench(&ctx);
         unsafe { sys::_exit(0) }
+    }
+    if ctx.eager_lookups {
+        ctx.load_lookups();
+        mark("lookups loaded");
     }
     std::thread::scope(|scope| {
         for tid in 1..nthreads {
