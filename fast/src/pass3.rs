@@ -61,6 +61,8 @@ fn id_record(key: u64, out: &mut [u8; 16]) -> usize {
 /// must not exceed the 30-minute session gap (see `run`).
 /// A cancellation in the multiset that has removed its event.
 const USED: u64 = u64::MAX;
+/// How many people ahead of the walk a person's user-table slot is prefetched.
+const PEOPLE_AHEAD: usize = 4;
 const SLOT_SHIFT: u32 = 20;
 const SLOTS: usize = 1 << (31 - SLOT_SHIFT);
 const _: () = assert!((1u32 << SLOT_SHIFT) <= GAP_MS);
@@ -87,6 +89,8 @@ pub struct Scratch {
     cancel_set: Vec<u64>,
     cancel_filter: Vec<u64>,
     kept_pu: Vec<[u64; 2]>,
+    /// The partition's people who have events.
+    present: Vec<u16>,
     /// The current person's user_id record: fixed 16 bytes when short, else `id_long`.
     id_rec: [u8; 16],
     id_len: usize,
@@ -115,6 +119,7 @@ impl Scratch {
             cancel_set: Vec::new(),
             cancel_filter: Vec::new(),
             kept_pu: Vec::new(),
+            present: Vec::new(),
             id_rec: [0; 16],
             id_len: 0,
             id_long: Vec::new(),
@@ -153,17 +158,21 @@ fn sort_pairs(v: &mut Vec<u64>, tmp: &mut Vec<u64>, hist: &mut [u32], shift: u32
     let hist = &mut hist[..LOCALS];
     hist.iter_mut().for_each(|c| *c = 0);
     for r in v.chunks_exact(2) {
-        hist[(r[0] >> shift) as usize & (LOCALS - 1)] += 1;
+        unsafe { *hist.get_unchecked_mut((r[0] >> shift) as usize & (LOCALS - 1)) += 1 };
     }
     prefix(hist);
     tmp.clear();
-    tmp.resize(2 * n, 0);
-    for r in v.chunks_exact(2) {
-        let c = &mut hist[(r[0] >> shift) as usize & (LOCALS - 1)];
-        let at = 2 * *c as usize;
-        tmp[at] = r[0];
-        tmp[at + 1] = r[1];
-        *c += 1;
+    tmp.reserve(2 * n);
+    unsafe {
+        tmp.set_len(2 * n);
+        let dst = tmp.as_mut_ptr();
+        for r in v.chunks_exact(2) {
+            let c = hist.get_unchecked_mut((r[0] >> shift) as usize & (LOCALS - 1));
+            let at = 2 * *c as usize;
+            *dst.add(at) = r[0];
+            *dst.add(at + 1) = r[1];
+            *c += 1;
+        }
     }
     // `hist[l]` is now the end of person `l`'s records, and so the start of the next person's.
     let out = pairs(tmp);
@@ -337,6 +346,15 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     }
     let t0 = ctx.charge_rows(crate::P_S_GATHER, t0, sc.a.len());
 
+    {
+        // At most one row per event (see `flush_day`).
+        let (r, n) = (&mut sc.rows, sc.a.len());
+        r.day.reserve(n);
+        r.sessions.reserve(n);
+        r.events.reserve(n);
+        r.revenue.reserve(n);
+        r.ids.reserve(16 * n + 16);
+    }
     let ts = std::mem::take(&mut sc.a);
     let mut pu = std::mem::take(&mut sc.pu);
     let mut cl = std::mem::take(&mut sc.cl);
@@ -350,11 +368,27 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
         let cl = pairs(&mut cl);
         let mut t0 = ctx.charge_rows(crate::P_S_SORT, t0, pu.len() + cl.len());
         let (mut pi, mut ci) = (0, 0);
-        for local in 0..LOCALS {
-            let (from, to) = (sc.start[local] as usize, sc.start[local + 1] as usize);
-            if from == to {
-                continue;
+        // The people with events, so that the walk has no hard-to-predict
+        // skip, and so that each one's name (a slot of the user table, far
+        // from any cache) can be asked for a few people ahead.
+        let mut present = std::mem::take(&mut sc.present);
+        present.clear();
+        present.reserve(LOCALS + PEOPLE_AHEAD);
+        unsafe {
+            let mut n = 0;
+            for local in 0..LOCALS {
+                *present.as_mut_ptr().add(n) = local as u16;
+                n += (sc.start[local] != sc.start[local + 1]) as usize;
             }
+            present.set_len(n);
+        }
+        let base = (p << LOCAL_BITS) as u32;
+        for at in 0..present.len() {
+            if let Some(&next) = present.get(at + PEOPLE_AHEAD) {
+                ctx.table.prefetch_slot(base | next as u32);
+            }
+            let local = present[at] as usize;
+            let (from, to) = (sc.start[local] as usize, sc.start[local + 1] as usize);
             let events = &ts[from..to];
             // Skip the records of people without events: someone whose events
             // were all cancelled still has their (cancelled) purchases here.
@@ -382,9 +416,9 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
                 apply_purchase_cancels(purchases, &mut kept_pu);
                 purchases = &kept_pu;
             }
-            let slot = (p << LOCAL_BITS) as u32 | local as u32;
-            person(ctx, sc, slot, events, purchases, clicks);
+            person(ctx, sc, base | local as u32, events, purchases, clicks);
         }
+        sc.present = present;
         t0 = ctx.charge_rows(crate::P_S_PEOPLE, t0, ts.len());
         let _ = t0;
     }
@@ -413,16 +447,21 @@ fn apply_purchase_cancels(records: &[[u64; 2]], kept: &mut Vec<[u64; 2]>) {
 /// to one person, so equal bits above the slot shift mean an equal slot.
 #[inline(always)]
 fn slot_group(ev: &[u64], i: usize) -> (u32, u32, usize) {
-    let slot = ev[i] >> SLOT_SHIFT;
-    let (mut min, mut max) = (u32::MAX, 0u32);
-    let mut j = i;
-    while j < ev.len() && ev[j] >> SLOT_SHIFT == slot {
-        let t = (ev[j] & TS_MASK) as u32;
-        min = min.min(t);
-        max = max.max(t);
-        j += 1;
+    debug_assert!(i < ev.len());
+    unsafe {
+        let first = *ev.get_unchecked(i);
+        let slot = first >> SLOT_SHIFT;
+        let t = (first & TS_MASK) as u32;
+        let (mut min, mut max) = (t, t);
+        let mut j = i + 1;
+        while j < ev.len() && *ev.get_unchecked(j) >> SLOT_SHIFT == slot {
+            let t = (*ev.get_unchecked(j) & TS_MASK) as u32;
+            min = min.min(t);
+            max = max.max(t);
+            j += 1;
+        }
+        (min, max, j)
     }
-    (min, max, j)
 }
 
 fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
@@ -484,13 +523,13 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
         // Purchases of this session: every purchase with ts in [start, last].
         let mut revenue = 0u64;
         let mut purchasing = false;
-        while pk < pu.len() && (pu[pk][0] & TS_MASK) as u32 <= last {
-            let w = pu[pk][1];
+        while pk < pu.len() && (unsafe { pu.get_unchecked(pk) }[0] & TS_MASK) as u32 <= last {
+            let w = unsafe { pu.get_unchecked(pk) }[1];
             let price = w >> 32;
             let cat = w as u32;
             revenue += price;
             purchasing = true;
-            let cell = &mut sc.cat_sum[cat as usize];
+            let cell = unsafe { sc.cat_sum.get_unchecked_mut(cat as usize) };
             if *cell == 0 {
                 sc.touched.push(cat);
             }
@@ -502,27 +541,30 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
         d_revenue += revenue as i64;
 
         // Credit: the latest click in [start - 7 days, start]; ties to the smallest click_id.
-        while hi < nc && click_ts(cl[hi][0]) <= start {
+        let c0 = |i: usize| unsafe { cl.get_unchecked(i) }[0];
+        while hi < nc && click_ts(c0(hi)) <= start {
             hi += 1;
         }
-        while lo < hi && click_ts(cl[lo][0]) as i64 + REACH_MS < start as i64 {
+        while lo < hi && click_ts(c0(lo)) as i64 + REACH_MS < start as i64 {
             lo += 1;
         }
         let campaign = if hi > lo {
-            let tmax = click_ts(cl[hi - 1][0]);
+            let tmax = click_ts(c0(hi - 1));
             let mut best = hi - 1;
             let mut j = hi - 1;
-            while j > lo && click_ts(cl[j - 1][0]) == tmax {
+            while j > lo && click_ts(c0(j - 1)) == tmax {
                 j -= 1;
                 if ctx.clicks.less(cl[j][1], cl[best][1]) {
                     best = j;
                 }
             }
-            click_campaign(cl[best][0])
+            click_campaign(c0(best))
         } else {
             organic
         };
-        let cell = &mut sc.acc.credit[campaign * ndays + day as usize];
+        // (A campaign is an index into the campaign list and a day is inside
+        // the window, by construction of the records.)
+        let cell = unsafe { sc.acc.credit.get_unchecked_mut(campaign * ndays + day as usize) };
         cell.sessions += 1;
         cell.purchasing += purchasing as u32;
         cell.revenue += revenue;
@@ -537,11 +579,14 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
                 sc.stamp.iter_mut().for_each(|s| *s = 0);
                 sc.tag = 1;
             }
-            for c in &cl[lo..hi] {
+            for c in unsafe { cl.get_unchecked(lo..hi) } {
                 let camp = click_campaign(c[0]);
-                if sc.stamp[camp] != sc.tag {
-                    sc.stamp[camp] = sc.tag;
-                    sc.acc.assisted[camp * ndays + day as usize] += 1;
+                unsafe {
+                    let stamp = sc.stamp.get_unchecked_mut(camp);
+                    if *stamp != sc.tag {
+                        *stamp = sc.tag;
+                        *sc.acc.assisted.get_unchecked_mut(camp * ndays + day as usize) += 1;
+                    }
                 }
             }
         }
@@ -571,29 +616,37 @@ fn flush_day(ctx: &Ctx, sc: &mut Scratch, day: u32, sessions: i32, events: i32, 
     }
     sc.touched.clear();
     let r = &mut sc.rows;
-    if sc.id_len != usize::MAX {
-        // Copy a fixed 16 bytes and keep only the record's length.
-        r.ids.reserve(16);
-        unsafe {
+    // `run` reserved room for one row per event of the partition in every
+    // fixed-width column, and 16 bytes per row for short IDs and categories.
+    unsafe {
+        if sc.id_len != usize::MAX {
+            // Copy a fixed 16 bytes and keep only the record's length.
             let len = r.ids.len();
             std::ptr::copy_nonoverlapping(sc.id_rec.as_ptr(), r.ids.as_mut_ptr().add(len), 16);
             r.ids.set_len(len + sc.id_len);
+        } else {
+            r.ids.extend_from_slice(&sc.id_long);
+            r.ids.reserve(16 * r.day.capacity().saturating_sub(r.day.len()));
         }
-    } else {
-        r.ids.extend_from_slice(&sc.id_long);
+        let n = r.n;
+        debug_assert!(n < r.day.capacity() && n < r.revenue.capacity());
+        *r.day.as_mut_ptr().add(n) = (ctx.day0 + day as i64) as i32;
+        *r.sessions.as_mut_ptr().add(n) = sessions;
+        *r.events.as_mut_ptr().add(n) = events;
+        *r.revenue.as_mut_ptr().add(n) = revenue;
+        r.day.set_len(n + 1);
+        r.sessions.set_len(n + 1);
+        r.events.set_len(n + 1);
+        r.revenue.set_len(n + 1);
+        if n & 7 == 0 {
+            r.valid.push(0);
+        }
+        if best != u32::MAX {
+            *r.valid.last_mut().unwrap_unchecked() |= 1 << (n & 7);
+            r.cats.extend_from_slice(&ctx.cat_recs()[best as usize]);
+        }
+        r.n = n + 1;
     }
-    r.day.push((ctx.day0 + day as i64) as i32);
-    r.sessions.push(sessions);
-    r.events.push(events);
-    r.revenue.push(revenue);
-    if r.n & 7 == 0 {
-        r.valid.push(0);
-    }
-    if best != u32::MAX {
-        *r.valid.last_mut().unwrap() |= 1 << (r.n & 7);
-        r.cats.extend_from_slice(&ctx.cat_recs()[best as usize]);
-    }
-    r.n += 1;
 }
 
 /// Assists for a person with many sessions and clicks. A campaign assists a

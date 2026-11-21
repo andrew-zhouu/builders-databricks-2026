@@ -17,7 +17,7 @@
 //!    of the event remains, as the rules require (dedup comes before
 //!    validation).
 
-use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_prefetch, _MM_HINT_T0};
+use core::arch::x86_64::{_bzhi_u64, _mm_prefetch, _MM_HINT_T0};
 
 use crate::parse::{can_decode, decode_event, event_records, parse_event, Decoded, CANCEL, LOCAL_BITS};
 use crate::util::find_newline;
@@ -73,6 +73,9 @@ impl Cancels {
 struct Copy {
     fp: u64,
     id: (*const u8, usize),
+    /// The first 16 bytes of the event_id, zero-padded: settling compares
+    /// these, because by then the line itself has left the cache.
+    head: [u64; 2],
     /// Epoch ms.
     ingest: i64,
     valid: bool,
@@ -186,7 +189,9 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
         i = j;
     }
     sc.cand.truncate(kept);
+    let t0 = ctx.charge_rows(crate::P_D_GROUP, t0, sc.cand.len());
     read_again(ctx, sc);
+    let t0 = ctx.charge_rows(crate::P_D_READ, t0, sc.cand.len());
     settle(&mut sc.copies, out);
     ctx.charge_rows(crate::P_D_EMIT, t0, sc.cand.len());
 }
@@ -253,6 +258,8 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
             unsafe {
                 _mm_prefetch::<_MM_HINT_T0>(q as *const i8);
                 _mm_prefetch::<_MM_HINT_T0>(q.wrapping_add(64) as *const i8);
+                // The decoder's second 64-byte window usually reaches into a third cache line.
+                _mm_prefetch::<_MM_HINT_T0>(q.wrapping_add(128) as *const i8);
             }
             ring[j % AHEAD] = (q, at, data.len());
         }
@@ -260,10 +267,18 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
             continue;
         }
         let t = sc.cand[j - AHEAD];
-        let mut copy = Copy { fp: t >> shift, id: (p, 0), ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
+        let mut copy = Copy { fp: t >> shift, id: (p, 0), head: [0; 2], ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
         let d = if can_decode(ctx, start, len) { unsafe { decode_event::<true>(ctx, p) } } else { TO_SCALAR_LINE };
         if d.used != 0 {
             copy.id = d.id;
+            // (At least `MARGIN` bytes are readable from a line this decoder takes.)
+            copy.head = unsafe {
+                let n = d.id.1 as u32;
+                [
+                    _bzhi_u64((d.id.0 as *const u64).read_unaligned(), 8 * n),
+                    _bzhi_u64((d.id.0.add(8) as *const u64).read_unaligned(), 8 * n.saturating_sub(8)),
+                ]
+            };
             copy.ingest = d.ingest_s * 1000;
             copy.valid = d.valid;
             copy.extra = d.extra;
@@ -278,6 +293,13 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
             let line = &line[..find_newline(line, 0).unwrap_or(line.len())];
             if let Some(e) = parse_event(ctx, line) {
                 copy.id = (e.id.as_ptr(), e.id.len());
+                let mut head = [0u8; 16];
+                let n = e.id.len().min(16);
+                head[..n].copy_from_slice(&e.id[..n]);
+                copy.head = [
+                    u64::from_le_bytes(head[..8].try_into().unwrap()),
+                    u64::from_le_bytes(head[8..].try_into().unwrap()),
+                ];
                 copy.ingest = e.ingest;
                 copy.valid = e.valid;
                 if e.valid {
@@ -301,21 +323,7 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
 /// Whether two copies have the same event_id.
 #[inline(always)]
 fn same_id(a: &Copy, b: &Copy) -> bool {
-    let n = a.id.1;
-    if n != b.id.1 {
-        return false;
-    }
-    if n == 0 || n > 16 {
-        return a.id() == b.id();
-    }
-    // A line that parsed has more than 16 bytes from the start of its
-    // event_id (its ingest_ts alone is 20).
-    unsafe {
-        let x = _mm_loadu_si128(a.id.0 as *const __m128i);
-        let y = _mm_loadu_si128(b.id.0 as *const __m128i);
-        let differ = !(_mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) as u32);
-        differ & ((1u32 << n) - 1) == 0
-    }
+    (a.id.1 == b.id.1) & (a.head == b.head) && (a.id.1 <= 16 || a.id() == b.id())
 }
 
 /// Copies of one event: cancel every valid one that is not the kept one.
@@ -348,14 +356,25 @@ fn settle(copies: &mut [Copy], out: &mut Cancels) {
         }
         let group = &mut copies[a..b];
         a = b;
-        if group.len() == 2 {
-            if same_id(&group[0], &group[1]) {
-                cancel(group, out);
-            }
+        // Nearly always one event's copies.
+        if group[1..].iter().all(|c| same_id(c, &group[0])) {
+            cancel(group, out);
             continue;
         }
-        // Stable: copies of one event stay in input order.
-        group.sort_by(|x, y| x.id().cmp(y.id()));
+        if group.len() == 2 {
+            continue;
+        }
+        // Different events share the fingerprint: bring equal IDs together
+        // (any order that does will do; stable, so copies stay in input order).
+        group.sort_by(|x, y| {
+            (x.id.1, x.head).cmp(&(y.id.1, y.head)).then_with(|| {
+                if x.id.1 > 16 {
+                    x.id().cmp(y.id())
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+        });
         let mut i = 0;
         while i < group.len() {
             let mut j = i + 1;
