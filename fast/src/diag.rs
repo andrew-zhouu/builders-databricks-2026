@@ -38,7 +38,15 @@ fn dir_summary(path: &std::path::Path) -> (usize, u64, u64) {
 
 pub fn run(data_dir: &std::path::Path) -> ! {
     let all = |_: &str| true;
+    // Measurements worth repeating at the end of the log, in case only one
+    // end of it is shown.
+    #[allow(unused_mut)]
+    let mut key: Vec<String> = Vec::new();
+    // First of all, before anything reads the input: is it in the page cache?
+    #[cfg(feature = "probe")]
+    crate::probe::page_cache(data_dir, &mut key);
     eprintln!("== diag: environment");
+    show("/proc/cmdline", &all, 1);
     show("/proc/version", &all, 1);
     show("/proc/cpuinfo", &|l| l.starts_with("model name") || l.starts_with("cpu MHz") || l.starts_with("cache size"), 3);
     if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
@@ -92,15 +100,29 @@ pub fn run(data_dir: &std::path::Path) -> ! {
         eprintln!("  {dir}: {n} files, {bytes} bytes, largest {largest}");
     }
 
+    #[cfg(feature = "probe")]
+    {
+        let threads = std::env::var("NCPU")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+            .unwrap_or(8)
+            .clamp(1, 64);
+        crate::probe::run(data_dir, threads, &mut key);
+    }
+    eprintln!("== diag: probes");
+    for line in &key {
+        eprintln!("  {line}");
+    }
+
     // The pipeline itself, several times: the first run shows a cold start (if
-    // the page cache is cold), the rest the steady state and three variants.
+    // the page cache is cold), the rest the steady state and two variants.
     let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
-    let runs: [(&str, &[(&str, &str)]); 6] = [
+    let runs: [(&str, &[(&str, &str)]); 5] = [
         ("run 1 (default)", &[]),
         ("run 2 (default)", &[]),
         ("run 3 (default)", &[]),
         ("no huge pages", &[("SS_NOHUGE", "1")]),
-        ("no parallel teardown", &[("SS_NOZAP", "1")]),
         ("4 threads", &[("NCPU", "4")]),
     ];
     for (label, envs) in runs {
@@ -112,8 +134,18 @@ pub fn run(data_dir: &std::path::Path) -> ! {
         }
         let t = Instant::now();
         let status = cmd.status();
-        eprintln!("== diag: {label}: {:.1} ms wall including spawn and exit, {:?}", t.elapsed().as_secs_f64() * 1e3, status.map(|s| s.code()));
+        let line = format!("{label}: {:.1} ms wall including spawn and exit, {:?}", t.elapsed().as_secs_f64() * 1e3, status.map(|s| s.code()));
+        eprintln!("== diag: {line}");
+        key.push(line);
     }
+    eprintln!("== diag: summary");
+    show("/proc/cpuinfo", &|l| l.starts_with("model name"), 1);
+    show("/proc/version", &all, 1);
+    show("/sys/kernel/mm/transparent_hugepage/enabled", &all, 1);
+    for line in &key {
+        eprintln!("  {line}");
+    }
+    println!("diagnostic image: the report is on stderr; exiting with a failure code on purpose");
     eprintln!("== diag: done; exiting with a failure code on purpose so that this log is shown");
     std::process::exit(1)
 }

@@ -40,14 +40,14 @@ pub fn raw_key(b: &[u8], prefix: u8) -> Option<u64> {
 #[inline(always)]
 pub unsafe fn raw_key_fast(a: *const u8, n: usize, prefix: u8) -> (bool, u64) {
     use core::arch::x86_64::_bzhi_u64;
-    // payload = bytes 1..n, little-endian in `w`, zero above them
-    let w = _bzhi_u64((a.add(1) as *const u64).read_unaligned(), 8u32.wrapping_mul((n as u32).wrapping_sub(1)));
-    // bytes beyond the payload read as non-zero for the "no NUL inside" test
-    let fill = !_bzhi_u64(u64::MAX, 8u32.wrapping_mul((n as u32).wrapping_sub(1)));
-    let v = w | fill;
-    let has_zero = v.wrapping_sub(LOW_BITS) & !v & HIGH_BITS;
-    let ok = (n.wrapping_sub(2) < 8) & (*a == prefix) & ((w & HIGH_BITS) | has_zero == 0);
-    (ok, w.swap_bytes())
+    // The payload is bytes 1..n: the low `bits` bits of `raw`.
+    let bits = 8u32.wrapping_mul((n as u32).wrapping_sub(1));
+    let raw = (a.add(1) as *const u64).read_unaligned();
+    // Among the payload's bytes: a NUL (the first test marks a zero byte, and
+    // nothing below the lowest one), or a byte that is not ASCII?
+    let odd = ((raw.wrapping_sub(LOW_BITS) & !raw) | raw) & _bzhi_u64(HIGH_BITS, bits);
+    let ok = (n.wrapping_sub(2) < 8) & (*a == prefix) & (odd == 0);
+    (ok, _bzhi_u64(raw, bits).swap_bytes())
 }
 
 /// The length of a regular ID's payload (1 to 8) from its key.
@@ -61,6 +61,16 @@ pub fn raw_len(key: u64) -> usize {
 #[inline]
 pub fn event_hash(b: &[u8]) -> u64 {
     let n = b.len();
+    if n <= 9 {
+        // The usual shape, a letter and up to 8 more bytes: the bytes after the
+        // first are the hash input (IDs that differ only in their first byte
+        // share a hash, which is allowed).
+        let mut w = [0u8; 8];
+        if n > 1 {
+            w[..n - 1].copy_from_slice(&b[1..]);
+        }
+        return mix9(u64::from_le_bytes(w));
+    }
     let mut buf = [0u8; 16];
     let head = n.min(16);
     buf[..head].copy_from_slice(&b[..head]);
@@ -74,6 +84,15 @@ pub fn event_hash(b: &[u8]) -> u64 {
         h = finish((h ^ u64::from_le_bytes(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     }
     h
+}
+
+/// The hash of an ID of at most 9 bytes: `x` holds its bytes after the first,
+/// little-endian and zero-padded.
+#[inline(always)]
+pub fn mix9(x: u64) -> u64 {
+    let a = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let b = (a ^ (a >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    b ^ (b >> 32)
 }
 
 /// The hash of an ID of `n <= 16` bytes whose bytes, zero-padded, are `lo` and `hi`.

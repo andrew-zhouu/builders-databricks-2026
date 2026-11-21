@@ -17,7 +17,7 @@
 //!    of the event remains, as the rules require (dedup comes before
 //!    validation).
 
-use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_prefetch, _MM_HINT_T0};
 
 use crate::parse::{can_decode, decode_event, event_records, parse_event, Decoded, CANCEL, LOCAL_BITS};
 use crate::util::find_newline;
@@ -103,8 +103,8 @@ pub struct Scratch {
     again: Vec<u64>,
     cand: Vec<u64>,
     copies: Vec<Copy>,
-    lines: Vec<(*const u8, usize, usize)>,
     pending: Vec<Pending>,
+    tmp: Vec<u64>,
 }
 
 pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
@@ -144,15 +144,33 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
             sc.cand.push(r);
         }
     }
+    // About half of those only share a bitmap bit with an unrelated trace. The
+    // same test again on other bits of the fingerprint removes nearly all of
+    // them, so that only true repeats are sorted and read again.
+    if ctx.fp_mask >> 14 != 0 && sc.cand.len() >= 2 {
+        let bits = (16 * sc.cand.len()).next_power_of_two().max(4096).min(64 * seen.len());
+        let (shift2, mask2) = (shift + 13, (bits as u64 - 1) & (ctx.fp_mask >> 13));
+        seen[..bits / 64].fill(0);
+        again[..bits / 64].fill(0);
+        for &r in &sc.cand {
+            let i = (r >> shift2) & mask2;
+            let (w, b) = ((i >> 6) as usize, 1u64 << (i & 63));
+            again[w] |= seen[w] & b;
+            seen[w] |= b;
+        }
+        sc.cand.retain(|&r| {
+            let i = (r >> shift2) & mask2;
+            again[(i >> 6) as usize] & (1u64 << (i & 63)) != 0
+        });
+    }
     let t0 = ctx.charge_rows(crate::P_D_DEDUP, t0, n);
     if sc.cand.is_empty() {
         return;
     }
 
-    // Traces order by fingerprint, then by position in the input. Drop the
-    // ones whose fingerprint turns out to be unique after all (they only
-    // shared a bitmap bit with another).
-    sc.cand.sort_unstable();
+    // Bring equal fingerprints together, and drop the traces whose fingerprint
+    // turns out to be unique after all.
+    sort_by_fp(&mut sc.cand, &mut sc.tmp, shift);
     let mut kept = 0;
     let mut i = 0;
     while i < sc.cand.len() {
@@ -173,60 +191,148 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
     ctx.charge_rows(crate::P_D_EMIT, t0, sc.cand.len());
 }
 
+/// Order traces by fingerprint (their bits from `shift` up): a stable LSD
+/// radix sort, 11 bits a pass.
+fn sort_by_fp(v: &mut Vec<u64>, tmp: &mut Vec<u64>, shift: u32) {
+    let n = v.len();
+    if n < 256 || shift < 20 {
+        v.sort_unstable();
+        return;
+    }
+    tmp.clear();
+    tmp.resize(n, 0);
+    let mut hist = [0u32; 2048];
+    let mut s = shift;
+    while s < 64 {
+        hist.fill(0);
+        for &w in v.iter() {
+            hist[(w >> s) as usize & 2047] += 1;
+        }
+        let mut total = 0u32;
+        for c in hist.iter_mut() {
+            let k = *c;
+            *c = total;
+            total += k;
+        }
+        for &w in v.iter() {
+            let c = &mut hist[(w >> s) as usize & 2047];
+            unsafe { *tmp.get_unchecked_mut(*c as usize) = w };
+            *c += 1;
+        }
+        std::mem::swap(v, tmp);
+        s += 11;
+    }
+}
+
 /// Read the lines of the traces in `sc.cand` again, into `sc.copies` (same
 /// order). The lines are scattered over the input and each valid copy needs a
-/// slot of the user table, so this works in small batches: fetch the lines,
-/// decode them while the table slots are fetched, then look the people up.
+/// slot of the user table, so this is a pipeline: a line is asked for (two
+/// cache lines) `AHEAD` traces before it is decoded, and the user's slot is
+/// asked for then and read `LAG` valid copies later.
 fn read_again(ctx: &Ctx, sc: &mut Scratch) {
-    const BATCH: usize = 32;
+    const AHEAD: usize = 32;
+    const LAG: usize = 32;
     let (shift, loc_mask) = (ctx.loc_bits, (1u64 << ctx.loc_bits) - 1);
+    let n = sc.cand.len();
     sc.copies.clear();
-    for traces in sc.cand.chunks(BATCH) {
-        sc.lines.clear();
-        for &t in traces {
-            let (data, start) = ctx.locate(t & loc_mask);
-            let p = unsafe { data.as_ptr().add(start) };
+    sc.copies.reserve(n);
+    sc.pending.clear();
+    let mut ring = [(std::ptr::null::<u8>(), 0usize, 0usize); AHEAD];
+    let mut done = 0usize;
+    let resolve = |copies: &mut Vec<Copy>, w: &Pending| {
+        let person = ctx.table.person(ctx.table.insert_at(w.home as usize, w.key)) as u64;
+        let copy = &mut copies[w.copy as usize];
+        copy.part = (person >> LOCAL_BITS) as u32;
+        copy.rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | w.ts as u64;
+    };
+    for j in 0..n + AHEAD {
+        let (p, start, len) = ring[j % AHEAD];
+        if j < n {
+            let (data, at) = ctx.locate(sc.cand[j] & loc_mask);
+            let q = unsafe { data.as_ptr().add(at) };
             unsafe {
-                _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64) as *const i8);
+                _mm_prefetch::<_MM_HINT_T0>(q as *const i8);
+                _mm_prefetch::<_MM_HINT_T0>(q.wrapping_add(64) as *const i8);
             }
-            sc.lines.push((p, start, data.len()));
+            ring[j % AHEAD] = (q, at, data.len());
         }
-        sc.pending.clear();
-        for (&t, &(p, start, len)) in traces.iter().zip(&sc.lines) {
-            let mut copy = Copy { fp: t >> shift, id: (p, 0), ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
-            let d = if can_decode(ctx, start, len) { unsafe { decode_event::<true>(ctx, p) } } else { TO_SCALAR_LINE };
-            if d.used != 0 {
-                copy.id = d.id;
-                copy.ingest = d.ingest_s * 1000;
-                copy.valid = d.valid;
-                copy.extra = d.extra;
-                if d.valid {
-                    let home = ctx.table.prefetch_home(d.user_key) as u32;
-                    sc.pending.push(Pending { copy: sc.copies.len() as u32, home, key: d.user_key, ts: (d.ts - ctx.t0) as u32 });
-                }
-            } else {
-                // The literal rules. Every trace was written for a line that
-                // parsed, so this cannot fail.
-                let line = unsafe { std::slice::from_raw_parts(p, len - start) };
-                let line = &line[..find_newline(line, 0).unwrap_or(line.len())];
-                if let Some(e) = parse_event(ctx, line) {
-                    copy.id = (e.id.as_ptr(), e.id.len());
-                    copy.ingest = e.ingest;
-                    copy.valid = e.valid;
-                    if e.valid {
-                        let (part, rec, extra) = event_records(ctx, &e);
-                        (copy.part, copy.rec, copy.extra) = (part as u32, rec, extra);
-                    }
+        if j < AHEAD {
+            continue;
+        }
+        let t = sc.cand[j - AHEAD];
+        let mut copy = Copy { fp: t >> shift, id: (p, 0), ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
+        let d = if can_decode(ctx, start, len) { unsafe { decode_event::<true>(ctx, p) } } else { TO_SCALAR_LINE };
+        if d.used != 0 {
+            copy.id = d.id;
+            copy.ingest = d.ingest_s * 1000;
+            copy.valid = d.valid;
+            copy.extra = d.extra;
+            if d.valid {
+                let home = ctx.table.prefetch_home(d.user_key) as u32;
+                sc.pending.push(Pending { copy: sc.copies.len() as u32, home, key: d.user_key, ts: (d.ts - ctx.t0) as u32 });
+            }
+        } else {
+            // The literal rules. Every trace was written for a line that
+            // parsed, so this cannot fail.
+            let line = unsafe { std::slice::from_raw_parts(p, len - start) };
+            let line = &line[..find_newline(line, 0).unwrap_or(line.len())];
+            if let Some(e) = parse_event(ctx, line) {
+                copy.id = (e.id.as_ptr(), e.id.len());
+                copy.ingest = e.ingest;
+                copy.valid = e.valid;
+                if e.valid {
+                    let (part, rec, extra) = event_records(ctx, &e);
+                    (copy.part, copy.rec, copy.extra) = (part as u32, rec, extra);
                 }
             }
-            sc.copies.push(copy);
         }
-        for w in &sc.pending {
-            let person = ctx.table.person(ctx.table.insert_at(w.home as usize, w.key)) as u64;
-            let copy = &mut sc.copies[w.copy as usize];
-            copy.part = (person >> LOCAL_BITS) as u32;
-            copy.rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | w.ts as u64;
+        sc.copies.push(copy);
+        if sc.pending.len() - done > LAG {
+            resolve(&mut sc.copies, &sc.pending[done]);
+            done += 1;
+        }
+    }
+    while done < sc.pending.len() {
+        resolve(&mut sc.copies, &sc.pending[done]);
+        done += 1;
+    }
+}
+
+/// Whether two copies have the same event_id.
+#[inline(always)]
+fn same_id(a: &Copy, b: &Copy) -> bool {
+    let n = a.id.1;
+    if n != b.id.1 {
+        return false;
+    }
+    if n == 0 || n > 16 {
+        return a.id() == b.id();
+    }
+    // A line that parsed has more than 16 bytes from the start of its
+    // event_id (its ingest_ts alone is 20).
+    unsafe {
+        let x = _mm_loadu_si128(a.id.0 as *const __m128i);
+        let y = _mm_loadu_si128(b.id.0 as *const __m128i);
+        let differ = !(_mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) as u32);
+        differ & ((1u32 << n) - 1) == 0
+    }
+}
+
+/// Copies of one event: cancel every valid one that is not the kept one.
+#[inline(always)]
+fn cancel(copies: &[Copy], out: &mut Cancels) {
+    let mut kept = 0;
+    for (at, c) in copies.iter().enumerate() {
+        if c.ingest < copies[kept].ingest {
+            kept = at;
+        }
+    }
+    for (at, c) in copies.iter().enumerate() {
+        if at != kept && c.valid {
+            out.events.push((c.part, c.rec | CANCEL));
+            if c.extra != 0 {
+                out.purchases.push((c.part, [c.rec | CANCEL, c.extra]));
+            }
         }
     }
 }
@@ -242,27 +348,22 @@ fn settle(copies: &mut [Copy], out: &mut Cancels) {
         }
         let group = &mut copies[a..b];
         a = b;
-        // Stable: copies of one event stay in input order.
-        if group.len() > 2 || (group.len() == 2 && group[0].id() != group[1].id()) {
-            group.sort_by(|x, y| x.id().cmp(y.id()));
+        if group.len() == 2 {
+            if same_id(&group[0], &group[1]) {
+                cancel(group, out);
+            }
+            continue;
         }
+        // Stable: copies of one event stay in input order.
+        group.sort_by(|x, y| x.id().cmp(y.id()));
         let mut i = 0;
         while i < group.len() {
             let mut j = i + 1;
-            let mut kept = i;
-            while j < group.len() && group[j].id() == group[i].id() {
-                if group[j].ingest < group[kept].ingest {
-                    kept = j;
-                }
+            while j < group.len() && same_id(&group[j], &group[i]) {
                 j += 1;
             }
-            for (at, c) in group[i..j].iter().enumerate() {
-                if i + at != kept && c.valid {
-                    out.events.push((c.part, c.rec | CANCEL));
-                    if c.extra != 0 {
-                        out.purchases.push((c.part, [c.rec | CANCEL, c.extra]));
-                    }
-                }
+            if j - i >= 2 {
+                cancel(&group[i..j], out);
             }
             i = j;
         }

@@ -9,6 +9,8 @@ mod parse;
 mod part;
 mod pass2;
 mod pass3;
+#[cfg(feature = "probe")]
+mod probe;
 mod prof;
 mod slow;
 mod sys;
@@ -26,7 +28,7 @@ use lookup::{Campaigns, Products};
 use parquet::{Column, Kind};
 use part::{BlockPool, PartWriter};
 use pass2::Cancels;
-use pass3::CampCell;
+use pass3::CampAcc;
 use sys::FileMap;
 use table::Table;
 use util::{DAY_MS, REACH_MS};
@@ -85,6 +87,9 @@ pub struct Ctx {
     pub file_base: Vec<u64>,
     /// Event files in order of position: (base, file index).
     event_files: Vec<(u64, u32)>,
+    /// For each megabyte of trace positions, the index in `event_files` of the
+    /// file that holds its first byte.
+    loc_file: Vec<u32>,
     /// Bits of a trace that hold the position; the rest hold the fingerprint.
     pub loc_bits: u32,
     pub fp_mask: u64,
@@ -103,7 +108,7 @@ pub struct Ctx {
     s: Vec<Shared<PartWriter>>,
     psw: Vec<Shared<PartWriter>>,
     x: Vec<Shared<Cancels>>,
-    acc: Vec<Shared<Vec<CampCell>>>,
+    acc: Vec<Shared<CampAcc>>,
     barrier: Barrier,
     /// Per profiled section, summed over threads (SS_TIMING only): CPU
     /// nanoseconds, the four performance counters, input rows, kernel
@@ -178,7 +183,12 @@ impl Ctx {
     /// The event file that holds trace position `loc`, and the offset in it.
     #[inline]
     pub fn locate(&self, loc: u64) -> (&[u8], usize) {
-        let at = self.event_files.partition_point(|f| f.0 <= loc) - 1;
+        // The file that holds the megabyte's first byte, then onward: files
+        // are rarely smaller than that.
+        let mut at = self.loc_file[(loc >> 20) as usize] as usize;
+        while at + 1 < self.event_files.len() && self.event_files[at + 1].0 <= loc {
+            at += 1;
+        }
         let (base, file) = self.event_files[at];
         (self.files[file as usize].slice(), (loc - base) as usize)
     }
@@ -543,13 +553,15 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize) {
 fn write_campaign_daily(ctx: &Ctx) {
     let ncamp = ctx.campaigns().ids.len();
     let ndays = ctx.ndays;
-    let mut total = vec![CampCell::default(); ncamp * ndays];
+    let mut total = CampAcc { assisted: vec![0; ncamp * ndays], credit: vec![Default::default(); ncamp * ndays] };
     for t in 0..ctx.nthreads {
         let acc = unsafe { &*ctx.acc[t].0.get() };
-        for (a, b) in total.iter_mut().zip(acc.iter()) {
+        for (a, b) in total.assisted.iter_mut().zip(&acc.assisted) {
+            *a += b;
+        }
+        for (a, b) in total.credit.iter_mut().zip(&acc.credit) {
             a.sessions += b.sessions;
             a.purchasing += b.purchasing;
-            a.assisted += b.assisted;
             a.revenue += b.revenue;
         }
     }
@@ -558,8 +570,9 @@ fn write_campaign_daily(ctx: &Ctx) {
     let mut revenue = Vec::<i64>::new();
     for camp in 0..ncamp {
         for d in 0..ndays {
-            let cell = &total[camp * ndays + d];
-            if cell.sessions == 0 && cell.assisted == 0 {
+            let cell = &total.credit[camp * ndays + d];
+            let assists = total.assisted[camp * ndays + d];
+            if cell.sessions == 0 && assists == 0 {
                 continue;
             }
             for (buf, s) in [(&mut ids, &ctx.campaigns().ids[camp]), (&mut channels, &ctx.campaigns().channels[camp])] {
@@ -570,7 +583,7 @@ fn write_campaign_daily(ctx: &Ctx) {
             sessions.push(cell.sessions as i64);
             purchasing.push(cell.purchasing as i64);
             revenue.push(cell.revenue as i64);
-            assisted.push(cell.assisted as i64);
+            assisted.push(assists as i64);
         }
     }
     let columns = [
@@ -675,6 +688,16 @@ fn main() {
     // A trace holds the position of its line among all event bytes; the rest
     // of the word is the fingerprint of the event ID.
     let loc_bits = (64 - (events_bytes.max(2) as u64 - 1).leading_zeros()).max(1);
+    let mut loc_file: Vec<u32> = Vec::with_capacity((events_bytes >> 20) + 2);
+    {
+        let mut at = 0usize;
+        for mb in 0..=(events_bytes >> 20) as u64 {
+            while at + 1 < event_files.len() && event_files[at + 1].0 <= mb << 20 {
+                at += 1;
+            }
+            loc_file.push(at as u32);
+        }
+    }
     // Block pool: address space for the worst case (every line as short as a
     // line can be); real data needs about a fifth of it. `pool_floor` is what
     // to settle for if the kernel will not reserve that much.
@@ -712,6 +735,7 @@ fn main() {
         pool: BlockPool::new(pool_blocks, pool_floor),
         files,
         file_base,
+        loc_file,
         event_files,
         loc_bits,
         fp_mask: u64::MAX >> loc_bits,
@@ -729,7 +753,7 @@ fn main() {
         s: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         psw: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         x: (0..nthreads).map(|_| Shared::new(Cancels::default())).collect(),
-        acc: (0..nthreads).map(|_| Shared::new(Vec::new())).collect(),
+        acc: (0..nthreads).map(|_| Shared::new(CampAcc::default())).collect(),
         barrier: Barrier::new(nthreads),
         prof: Default::default(),
         bail: AtomicBool::new(false),
