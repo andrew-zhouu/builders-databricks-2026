@@ -32,6 +32,10 @@ case "$cmd" in
   log)
     name="$1"; lines="${2:-40}"
     "${SSH[@]}" "cd $REMOTE_DIR && tail -n $lines out/logs/$name.log; tmux has-session -t $name 2>/dev/null && echo '[still running]' || echo '[finished]'" ;;
+  export)
+    # remote.sh export REV DIR: a clean export of a committed revision (as the scorer clones it)
+    rev="$1"; dir="$2"
+    git -C "$PROJ" archive "$rev" | "${SSH[@]}" "rm -rf $dir && mkdir -p $dir && tar -x -C $dir && echo exported $rev to $dir" ;;
   get)
     scp -q -i "$REMOTE_KEY" -o ControlPath="/tmp/ss-remote-%r@%h" "$REMOTE_USER@$REMOTE_HOST:$1" "$2" ;;
   *) echo "unknown command $cmd"; exit 2 ;;
