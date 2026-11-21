@@ -184,6 +184,11 @@ impl PartWriter {
         self.words[p] as usize
     }
 
+    /// Every block this writer filled (valid after `finalize`).
+    pub fn all_blocks(&self) -> &[u32] {
+        &self.pblocks
+    }
+
     #[inline]
     pub fn part_blocks(&self, p: usize) -> &[u32] {
         &self.pblocks[self.pstart[p] as usize..self.pstart[p + 1] as usize]

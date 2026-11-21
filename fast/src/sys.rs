@@ -10,6 +10,22 @@ extern "C" {
     pub fn _exit(code: c_int) -> !;
 }
 
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+extern "C" {
+    fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
+}
+
+/// CPU time consumed by the calling thread, in nanoseconds.
+pub fn thread_cpu_ns() -> u64 {
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    unsafe { clock_gettime(3, &mut ts) };
+    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+}
+
 const PROT_READ: c_int = 1;
 const PROT_WRITE: c_int = 2;
 const MAP_PRIVATE: c_int = 2;
