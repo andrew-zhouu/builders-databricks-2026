@@ -295,6 +295,57 @@ fn input(data_dir: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// What writing the output costs: `mb` megabytes to a new file in the output
+/// directory, in 1 MB writes (then removed again).
+fn output_file(dir: &Path, name: &str, mb: usize, sync: bool) -> String {
+    use std::io::Write;
+    let path = dir.join(name);
+    let buf = vec![0x5Au8; MB];
+    let t = Instant::now();
+    let mut f = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => return format!("output {name}: cannot create ({e})"),
+    };
+    let create_ms = ms(t);
+    let t = Instant::now();
+    for _ in 0..mb {
+        if let Err(e) = f.write_all(&buf) {
+            return format!("output {name}: write failed ({e})");
+        }
+    }
+    let write_ms = ms(t);
+    let t = Instant::now();
+    let synced = if sync { f.sync_data().is_ok() } else { false };
+    let sync_ms = ms(t);
+    let t = Instant::now();
+    drop(f);
+    let close_ms = ms(t);
+    let t = Instant::now();
+    let _ = std::fs::remove_file(&path);
+    format!(
+        "output {name}: create {create_ms:.2} ms, write {mb} MB {write_ms:.1} ms ({:.0} MB/s){}, close {close_ms:.2} ms, remove {:.2} ms",
+        mb as f64 * 1e3 / write_ms.max(1e-3),
+        if sync { format!(", fdatasync {sync_ms:.1} ms (ok: {synced})") } else { String::new() },
+        ms(t)
+    )
+}
+
+/// The output directory: how fast it takes data, alone and from all threads,
+/// and what forcing it to the device costs (a guide to what happens when the
+/// container is torn down with unwritten output).
+pub fn output(dir: &Path, threads: usize, out: &mut Vec<String>) {
+    out.push(output_file(dir, ".probe-a", 8, false));
+    out.push(output_file(dir, ".probe-b", 64, false));
+    let t = Instant::now();
+    std::thread::scope(|s| {
+        for i in 0..threads {
+            s.spawn(move || output_file(dir, &format!(".probe-t{i}"), 16, false));
+        }
+    });
+    out.push(format!("output: {threads} threads writing 16 MB each: {:.1} ms in all", ms(t)));
+    out.push(output_file(dir, ".probe-c", 16, true));
+}
+
 pub fn run(data_dir: &Path, threads: usize, out: &mut Vec<String>) {
     clocks(threads, out);
     memory(threads, out);

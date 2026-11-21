@@ -332,7 +332,7 @@ unsafe fn link_fast(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
     nl + 1
 }
 
-const RING: usize = 8;
+const RING: usize = 32;
 
 /// Links on their way into the union-find, two stages behind the parser so
 /// that each memory access has been prefetched: first the two home slots
