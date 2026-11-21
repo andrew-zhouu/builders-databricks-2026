@@ -5,7 +5,7 @@
 //! with a counting sort (two passes straight over the partition's blocks), then
 //! each person's timestamps are sorted on their own.
 
-use crate::parse::{CAMPAIGN_BITS, CANCEL, LOCAL_BITS, TS_MASK};
+use crate::parse::{CAMPAIGN_BITS, CANCEL, CLICK_SHIFT, LOCAL_BITS, TS_MASK};
 use crate::util::{DAY_MS, GAP_MS, REACH_MS};
 use crate::Ctx;
 
@@ -362,7 +362,7 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     // Purchases by (person, ts), a person's cancellations after their
     // purchases; clicks by (person, ts, campaign).
     sort_pairs(&mut pu, &mut sc.b, &mut sc.h, 31);
-    sort_pairs(&mut cl, &mut sc.b, &mut sc.h, 52);
+    sort_pairs(&mut cl, &mut sc.b, &mut sc.h, CLICK_SHIFT);
     {
         let pu = pairs(&mut pu);
         let cl = pairs(&mut cl);
@@ -402,11 +402,11 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
             let mut purchases = &pu[pi..pj];
             pi = pj;
             let local = local as u64;
-            while ci < cl.len() && cl[ci][0] >> 52 < local {
+            while ci < cl.len() && cl[ci][0] >> CLICK_SHIFT < local {
                 ci += 1;
             }
             let mut cj = ci;
-            while cj < cl.len() && cl[cj][0] >> 52 == local {
+            while cj < cl.len() && cl[cj][0] >> CLICK_SHIFT == local {
                 cj += 1;
             }
             let clicks = &cl[ci..cj];
