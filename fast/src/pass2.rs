@@ -101,9 +101,7 @@ struct Pending {
 
 #[derive(Default)]
 pub struct Scratch {
-    recs: Vec<u64>,
     seen: Vec<u64>,
-    again: Vec<u64>,
     cand: Vec<u64>,
     copies: Vec<Copy>,
     pending: Vec<Pending>,
@@ -112,58 +110,66 @@ pub struct Scratch {
 
 pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
     let t0 = ctx.now();
-    sc.recs.clear();
-    for t in 0..ctx.nthreads {
-        ctx.k(t).copy_part(&ctx.pool, p, &mut sc.recs);
-    }
-    let recs = &sc.recs[..];
-    let n = recs.len();
+    let n: usize = (0..ctx.nthreads).map(|t| ctx.k(t).part_words(p)).sum();
     if n < 2 {
         return;
     }
-    let t0 = ctx.charge_rows(crate::P_D_GATHER, t0, n);
 
-    // Which fingerprints occur more than once? Indexed by the fingerprint's low
-    // bits, at 8 bits per trace, so few unrelated traces share a bit.
-    let bits = (8 * n).next_power_of_two().max(4096);
+    // Which fingerprints occur more than once? A table of two bits per slot,
+    // "seen" and "seen again", indexed by the fingerprint's low bits, with 8
+    // slots per trace so that few unrelated traces share one. The traces are
+    // read where the parser left them, twice.
+    let slots = (8 * n).next_power_of_two().max(4096);
     sc.seen.clear();
-    sc.seen.resize(bits / 64, 0);
-    sc.again.clear();
-    sc.again.resize(bits / 64, 0);
-    let (seen, again) = (&mut sc.seen[..], &mut sc.again[..]);
-    let (shift, mask) = (ctx.loc_bits, bits as u64 - 1);
-    for &r in recs {
-        let i = (r >> shift) & mask;
-        let (w, b) = ((i >> 6) as usize, 1u64 << (i & 63));
-        unsafe {
-            *again.get_unchecked_mut(w) |= *seen.get_unchecked(w) & b;
-            *seen.get_unchecked_mut(w) |= b;
-        }
+    sc.seen.resize(slots / 32, 0);
+    let tab = &mut sc.seen[..];
+    let (shift, mask) = (ctx.loc_bits, slots as u64 - 1);
+    for t in 0..ctx.nthreads {
+        ctx.k(t).for_each_run(&ctx.pool, p, |run| {
+            for &r in run {
+                let i = (r >> shift) & mask;
+                let (w, b) = ((i >> 5) as usize, 1u64 << (2 * (i & 31)));
+                unsafe {
+                    let v = *tab.get_unchecked(w);
+                    *tab.get_unchecked_mut(w) = v | b | (v & b) << 1;
+                }
+            }
+        });
     }
+    // Collected without a branch: every trace is written, and the write
+    // position only moves on past the ones that are kept.
     sc.cand.clear();
-    for &r in recs {
-        let i = (r >> shift) & mask;
-        if unsafe { *again.get_unchecked((i >> 6) as usize) } & (1u64 << (i & 63)) != 0 {
-            sc.cand.push(r);
-        }
+    sc.cand.reserve(n);
+    let mut kept = 0usize;
+    for t in 0..ctx.nthreads {
+        ctx.k(t).for_each_run(&ctx.pool, p, |run| {
+            for &r in run {
+                let i = (r >> shift) & mask;
+                unsafe {
+                    let again = *tab.get_unchecked((i >> 5) as usize) >> (2 * (i & 31) + 1) & 1;
+                    *sc.cand.as_mut_ptr().add(kept) = r;
+                    kept += again as usize;
+                }
+            }
+        });
     }
-    // About half of those only share a bitmap bit with an unrelated trace. The
-    // same test again on other bits of the fingerprint removes nearly all of
-    // them, so that only true repeats are sorted and read again.
+    unsafe { sc.cand.set_len(kept) };
+    // About half of those only share a slot with an unrelated trace. The same
+    // test again on other bits of the fingerprint removes nearly all of them,
+    // so that only true repeats are sorted and read again.
     if ctx.fp_mask >> 14 != 0 && sc.cand.len() >= 2 {
-        let bits = (16 * sc.cand.len()).next_power_of_two().max(4096).min(64 * seen.len());
-        let (shift2, mask2) = (shift + 13, (bits as u64 - 1) & (ctx.fp_mask >> 13));
-        seen[..bits / 64].fill(0);
-        again[..bits / 64].fill(0);
+        let slots = (16 * sc.cand.len()).next_power_of_two().max(4096).min(32 * tab.len());
+        let (shift2, mask2) = (shift + 13, (slots as u64 - 1) & (ctx.fp_mask >> 13));
+        tab[..slots / 32].fill(0);
         for &r in &sc.cand {
             let i = (r >> shift2) & mask2;
-            let (w, b) = ((i >> 6) as usize, 1u64 << (i & 63));
-            again[w] |= seen[w] & b;
-            seen[w] |= b;
+            let (w, b) = ((i >> 5) as usize, 1u64 << (2 * (i & 31)));
+            let v = tab[w];
+            tab[w] = v | b | (v & b) << 1;
         }
         sc.cand.retain(|&r| {
             let i = (r >> shift2) & mask2;
-            again[(i >> 6) as usize] & (1u64 << (i & 63)) != 0
+            tab[(i >> 5) as usize] >> (2 * (i & 31) + 1) & 1 != 0
         });
     }
     let t0 = ctx.charge_rows(crate::P_D_DEDUP, t0, n);
