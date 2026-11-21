@@ -95,15 +95,15 @@ impl Scratch {
             starts: Vec::new(),
             sdays: Vec::new(),
             dfirst: Vec::new(),
-            stamp: vec![0; ctx.campaigns.ids.len()],
+            stamp: vec![0; ctx.campaigns().ids.len()],
             tag: 0,
-            cat_sum: vec![0; ctx.products.categories.len()],
+            cat_sum: vec![0; ctx.products().categories.len()],
             touched: Vec::new(),
             id_rec: [0; 16],
             id_len: 0,
             id_long: Vec::new(),
             rows: Rows::default(),
-            acc: vec![CampCell::default(); ctx.campaigns.ids.len() * ctx.ndays],
+            acc: vec![CampCell::default(); ctx.campaigns().ids.len() * ctx.ndays],
         }
     }
 }
@@ -266,7 +266,7 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u32], pu: &[[u64; 2]], c
         sc.id_len = usize::MAX;
     }
     let ndays = ctx.ndays;
-    let organic = ctx.campaigns.organic as usize;
+    let organic = ctx.campaigns().organic as usize;
     let n = ev.len();
     let nc = cl.len();
     // With many sessions and many clicks, per-session scans of the click window
@@ -408,7 +408,7 @@ fn flush_day(ctx: &Ctx, sc: &mut Scratch, day: u32, sessions: i32, events: i32, 
     }
     if best != u32::MAX {
         *r.valid.last_mut().unwrap() |= 1 << (r.n & 7);
-        r.cats.extend_from_slice(&ctx.cat_recs[best as usize]);
+        r.cats.extend_from_slice(&ctx.cat_recs()[best as usize]);
     }
     r.n += 1;
 }
