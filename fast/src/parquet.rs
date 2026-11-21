@@ -48,18 +48,23 @@ pub fn pack_indices(values: impl Iterator<Item = u32>, count: usize, width: u32)
     let bytes = groups * width as usize;
     // Room for whole-word writes past the end.
     out.resize(start + bytes + 8, 0);
-    let (mut acc, mut nbits, mut at) = (0u64, 0u32, start);
-    for v in values {
-        acc |= (v as u64) << nbits;
-        nbits += width;
-        if nbits >= 32 {
-            out[at..at + 4].copy_from_slice(&(acc as u32).to_le_bytes());
-            at += 4;
-            acc >>= 32;
-            nbits -= 32;
+    // At most `count` values are taken, so the writes stay inside the buffer:
+    // 32 bits at a time while packing, and one last word of up to 8 bytes.
+    let (mut acc, mut nbits) = (0u64, 0u32);
+    unsafe {
+        let mut at = out.as_mut_ptr().add(start);
+        for v in values.take(count) {
+            acc |= (v as u64) << nbits;
+            nbits += width;
+            if nbits >= 32 {
+                (at as *mut u32).write_unaligned(acc as u32);
+                at = at.add(4);
+                acc >>= 32;
+                nbits -= 32;
+            }
         }
+        (at as *mut u64).write_unaligned(acc);
     }
-    out[at..at + 8].copy_from_slice(&acc.to_le_bytes());
     out.truncate(start + bytes);
     out
 }
@@ -70,25 +75,27 @@ pub fn index_width(n: usize) -> u32 {
 }
 
 /// A dictionary for small non-negative integers: the distinct values in order
-/// of first appearance, and each value's index. `None` if a value is negative
-/// or too large for a direct table.
+/// of first appearance, and a table from value to index. `None` if a value is
+/// negative or too large for a direct table.
 pub fn small_dict(values: &[i32]) -> Option<(Vec<i32>, Vec<u32>)> {
-    let max = *values.iter().max()?;
-    if max >= 1 << 22 || values.iter().any(|&v| v < 0) {
+    let (mut min, mut max) = (i32::MAX, i32::MIN);
+    for &v in values {
+        min = min.min(v);
+        max = max.max(v);
+    }
+    if values.is_empty() || min < 0 || max >= 1 << 22 {
         return None;
     }
     let mut index = vec![u32::MAX; max as usize + 1];
     let mut dict = Vec::new();
-    let mut out = Vec::with_capacity(values.len());
     for &v in values {
-        let slot = &mut index[v as usize];
+        let slot = unsafe { index.get_unchecked_mut(v as usize) };
         if *slot == u32::MAX {
             *slot = dict.len() as u32;
             dict.push(v);
         }
-        out.push(*slot);
     }
-    Some((dict, out))
+    Some((dict, index))
 }
 
 struct Thrift {
