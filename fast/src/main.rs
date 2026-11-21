@@ -8,6 +8,7 @@ mod parse;
 mod part;
 mod pass2;
 mod pass3;
+mod slow;
 mod sys;
 mod table;
 mod util;
@@ -299,11 +300,17 @@ fn write_campaign_daily(ctx: &Ctx) {
 
 fn main() {
     let t_start = Instant::now();
-    let args: Vec<String> = std::env::args().collect();
+    let all_args: Vec<String> = std::env::args().collect();
+    let force_slow = all_args.iter().any(|a| a == "--slow") || std::env::var("SLOW").is_ok();
+    let args: Vec<String> = all_args.into_iter().filter(|a| !a.starts_with("--")).collect();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data_dir = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| env("DATA_DIR", "/data")));
     let out_dir = PathBuf::from(args.get(2).cloned().unwrap_or_else(|| env("OUTPUT_DIR", "/output")));
     let timing = std::env::var("TIMING").is_ok();
+    if force_slow {
+        slow::run(&data_dir, &out_dir);
+        unsafe { sys::_exit(0) }
+    }
     let nthreads = std::env::var("NCPU")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -366,8 +373,9 @@ fn main() {
         && cap < (1 << parse::PERSON_BITS)
         && campaigns.ids.len() < (1 << parse::CAMPAIGN_BITS);
     if !fits {
-        eprintln!("input does not fit the fast path");
-        std::process::exit(3);
+        eprintln!("input does not fit the fast path: using the plain implementation");
+        slow::run(&data_dir, &out_dir);
+        unsafe { sys::_exit(0) }
     }
 
     let ctx = Ctx {
@@ -432,8 +440,10 @@ fn main() {
         worker(&ctx, 0);
     });
     if ctx.failed() {
-        eprintln!("fast path bailed out");
-        std::process::exit(3);
+        // Nothing has been written yet: the flags are only raised while parsing.
+        eprintln!("fast path bailed out: using the plain implementation");
+        slow::run(&data_dir, &ctx.out_dir);
+        unsafe { sys::_exit(0) }
     }
     write_campaign_daily(&ctx);
     if timing {
