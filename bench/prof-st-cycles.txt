@@ -1,0 +1,127 @@
+# cycles samples, m5, ncpu=1, load 10.05
+[    2.27 ms] setup: 1 threads, events 392 MB, clicks 57 MB, links 4 MB, table 1032192 slots, pd 256, ps 252
+[   64.17 ms] links parsed
+[   72.80 ms] people resolved
+[  813.60 ms] events and clicks parsed
+[  919.37 ms] deduplicated
+[ 1217.58 ms] sessions built, user_daily written
+    section            cpu ms     %   sys ms  faults      rows  instr/row cycles/row   IPC brmiss/row llcmiss/row
+    parse events       625.52  53.0%   124.00    6323   5345927      514.9      276.9  1.86      1.229       2.009
+    parse clicks       116.25   9.8%    27.72    1228   1276632      352.9      207.5  1.70      1.148       1.451
+    dedup gather        13.27   1.1%     0.03     127   5492379        0.1        6.6  0.02      0.001       0.275
+    dedup table         51.46   4.4%     0.00      78   5492379       31.4       27.2  1.15      0.373       0.020
+    dedup emit          40.28   3.4%     0.03      54   5492379       36.0       20.0  1.80      0.260       0.007
+    sessions gather     81.51   6.9%     0.29     707   4892446       52.7       46.0  1.15      0.004       0.337
+    sessions sort       35.08   3.0%    11.78       2   1402529      142.3       68.9  2.07      0.714       0.024
+    sessions people    164.49  13.9%     6.99    5179   4892446       87.5       86.4  1.01      1.121       0.240
+    write user_daily    15.19   1.3%    11.34       0    566797        0.0        0.3  0.10      0.001       0.004
+    links               28.46   2.4%    12.81     115    222421      238.0      212.0  1.12      1.934       3.694
+    resolve people       8.59   0.7%     0.00       0         0        0.0        0.0  0.98      0.000       0.000
+    sections: cpu 1180.4 ms (sys 195.0 ms, 13862 faults), 4.54 G instr, 2.86 G user cycles; process: user 979.4 ms, sys 228.8 ms, 15844 faults
+total instructions: 5,486   (not in disassembly: 14)
+input lines: events 0  clicks 0  links 0
+
+-- by top-level symbol
+         2,800  51.0%  Svo_8sessions5parse12events_chunk
+         1,473  26.9%  Svo_8sessions6worker
+           540   9.8%  Svo_8sessions5parse12clicks_chunk
+           140   2.6%  kUfppBMPy7_4core5slice4sort8unstable9quicksort9quicksortAyj2_NCINvMB8_SB17_20sort_unstable_by_keyyNCNvNtCshPeiEMK7Svo_8sessions5pass33runs0_0E0EB1T_
+           133   2.4%  memcpy
+           117   2.1%  Svo_8sessions6lookupNtB2_7IdIndex3get
+            99   1.8%  Svo_8sessions5parse11links_chunk
+            52   0.9%  Svo_8sessions5pass39flush_day
+            26   0.5%  kUfppBMPy7_4core5slice4sort8unstable9quicksort9quicksortyNvYyNtNtBa_3cmp10PartialOrd2ltECshPeiEMK7Svo_8sessions
+            19   0.3%  kUfppBMPy7_4core5slice4sort6shared9smallsort12sort8_stableAyj2_NCINvMB8_SB19_20sort_unstable_by_keyyNCNvNtCshPeiEMK7Svo_8sessions5pass33runs0_0E0EB1V_
+            13   0.2%  memset
+            10   0.2%  kUfppBMPy7_4core5slice4sort6shared5pivot11median3_recAyj2_NCINvMB8_SB14_20sort_unstable_by_keyyNCNvNtCshPeiEMK7Svo_8sessions5pass33runs0_0E0EB1Q_
+             9   0.2%  Svo_8sessions5parse10event_line
+             6   0.1%  _NtCshPeiEMK7Svo_8sessions4partNtB5_10PartWriter10take_block
+
+-- by source function (inlined code under its own name)
+         1,334  24.3%  std:core/src                      
+           807  14.7%  parse::event_fast                 
+           489   8.9%  pass3::person                     
+           373   6.8%  parse::push                       
+           327   6.0%  table::insert                     
+           281   5.1%  pass2::run                        
+           198   3.6%  pass3::run                        
+           182   3.3%  parse::click_fast                 
+           171   3.1%  parse::masks64                    
+           161   2.9%  pass3::scatter                    
+           133   2.4%  other:memcpy.s                    
+           111   2.0%  lookup::get                       
+           110   2.0%  parse::quotes                     
+            95   1.7%  std:alloc/src                     
+            78   1.4%  parse::datetime                   
+            60   1.1%  part::push1                       
+            59   1.1%  parse::timestamp                  
+            48   0.9%  table::home                       
+            45   0.8%  part::flush                       
+            42   0.8%  part::push2                       
+            38   0.7%  pass3::assists_by_campaign        
+            34   0.6%  parse::pack9                      
+            26   0.5%  parse::events_chunk               
+            24   0.4%  pass3::flush_day                  
+            23   0.4%  table::find                       
+            17   0.3%  parse::digits16                   
+            17   0.3%  lookup::by_number                 
+            15   0.3%  parse::link_fast                  
+            15   0.3%  parse::emit                       
+            14   0.3%  table::prefetch                   
+            13   0.2%  other:memset.s                    
+            11   0.2%  table::compress                   
+            11   0.2%  pass3::click_ts                   
+            11   0.2%  parse::clicks_chunk               
+            11   0.2%  table::person                     
+            10   0.2%  table::slot                       
+             8   0.1%  util::split                       
+             8   0.1%  pass3::click_campaign             
+             7   0.1%  parse::ingest_field               
+             4   0.1%  pass3::prefix                     
+
+-- hottest source lines
+           365   6.7%  parse.rs:482   parse::push
+           258   4.7%  table.rs:89    table::insert
+           244   4.4%  parse.rs:621   parse::event_fast
+           235   4.3%  mod.rs:574   std:core/src
+           171   3.1%  parse.rs:239   parse::masks64
+           152   2.8%  parse.rs:616   parse::event_fast
+           146   2.7%  mut_ptr.rs:971   std:core/src
+           134   2.4%  pass3.rs:362   pass3::person
+           110   2.0%  pass3.rs:142   pass3::scatter
+           108   2.0%  lookup.rs:65    lookup::get
+           104   1.9%  parse.rs:625   parse::event_fast
+            87   1.6%  pass2.rs:54    pass2::run
+            80   1.5%  pass3.rs:346   pass3::person
+            78   1.4%  sse.rs:1946  std:core/src
+            78   1.4%  memcpy.s:18    other:memcpy.s
+            63   1.1%  parse.rs:118   parse::datetime
+            60   1.1%  parse.rs:254   parse::quotes
+            59   1.1%  atomic.rs:4303  std:core/src
+            57   1.0%  pass2.rs:60    pass2::run
+            57   1.0%  mod.rs:635   std:alloc/src
+            56   1.0%  parse.rs:787   parse::click_fast
+            55   1.0%  parse.rs:801   parse::click_fast
+            49   0.9%  parse.rs:650   parse::event_fast
+            48   0.9%  table.rs:52    table::home
+            48   0.9%  parse.rs:256   parse::quotes
+            48   0.9%  parse.rs:592   parse::event_fast
+            47   0.9%  part.rs:129   part::push1
+            47   0.9%  uint_macros.rs:2719  std:core/src
+            45   0.8%  index.rs:232   std:core/src
+            40   0.7%  sse2.rs:387   std:core/src
+            39   0.7%  pass3.rs:141   pass3::scatter
+            39   0.7%  memcpy.s:20    other:memcpy.s
+            38   0.7%  index.rs:219   std:core/src
+            38   0.7%  pass3.rs:202   pass3::run
+            36   0.7%  avx.rs:1934  std:core/src
+            34   0.6%  pass3.rs:258   pass3::person
+            34   0.6%  pass3.rs:455   pass3::assists_by_campaign
+            34   0.6%  parse.rs:220   parse::pack9
+            34   0.6%  parse.rs:773   parse::click_fast
+            32   0.6%  sse41.rs:1048  std:core/src
+            32   0.6%  bmi2.rs:69    std:core/src
+            31   0.6%  uint_macros.rs:2758  std:core/src
+            31   0.6%  part.rs:143   part::flush
+            30   0.5%  cmp.rs:2215  std:core/src
+            30   0.5%  pass3.rs:307   pass3::person

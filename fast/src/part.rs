@@ -71,7 +71,8 @@ struct Line([u64; 8]);
 pub struct PartWriter {
     pub nparts: usize,
     wc: Vec<Line>,
-    fill: Vec<u8>,
+    /// Where each partition's next word goes, inside its line of `wc`.
+    wp: Vec<*mut u64>,
     cur: Vec<*mut u64>,
     lines: Vec<u32>,
     log: Vec<(u32, u32)>,
@@ -89,10 +90,12 @@ unsafe impl Sync for PartWriter {}
 
 impl PartWriter {
     pub fn new(nparts: usize) -> PartWriter {
+        let mut wc = vec![Line([0; 8]); nparts];
+        let base = wc.as_mut_ptr() as *mut u64;
         PartWriter {
             nparts,
-            wc: vec![Line([0; 8]); nparts],
-            fill: vec![0; nparts],
+            wp: (0..nparts).map(|p| unsafe { base.add(8 * p) }).collect(),
+            wc,
             cur: vec![std::ptr::null_mut(); nparts],
             lines: vec![0; nparts],
             log: Vec::new(),
@@ -105,35 +108,54 @@ impl PartWriter {
         }
     }
 
+    /// The write pointers, for `push1_at` / `push2_at`: a loop that keeps this
+    /// in a register saves reloading it for every record.
+    #[inline(always)]
+    pub fn cursors(&mut self) -> *mut *mut u64 {
+        self.wp.as_mut_ptr()
+    }
+
     /// Append a two-word record to partition `p`.
     #[inline(always)]
     pub fn push2(&mut self, pool: &BlockPool, p: usize, a: u64, b: u64) {
-        unsafe {
-            let n = *self.fill.get_unchecked(p) as usize;
-            let line = self.wc.get_unchecked_mut(p);
-            *line.0.get_unchecked_mut(n) = a;
-            *line.0.get_unchecked_mut(n + 1) = b;
-            if n == 6 {
-                self.flush(pool, p);
-                *self.fill.get_unchecked_mut(p) = 0;
-            } else {
-                *self.fill.get_unchecked_mut(p) = (n + 2) as u8;
-            }
-        }
+        let wp = self.wp.as_mut_ptr();
+        unsafe { self.push2_at(wp, pool, p, a, b) }
     }
 
     /// Append a one-word record to partition `p`. Do not mix with `push2`.
     #[inline(always)]
     pub fn push1(&mut self, pool: &BlockPool, p: usize, a: u64) {
-        unsafe {
-            let n = *self.fill.get_unchecked(p) as usize;
-            *self.wc.get_unchecked_mut(p).0.get_unchecked_mut(n) = a;
-            if n == 7 {
-                self.flush(pool, p);
-                *self.fill.get_unchecked_mut(p) = 0;
-            } else {
-                *self.fill.get_unchecked_mut(p) = (n + 1) as u8;
-            }
+        let wp = self.wp.as_mut_ptr();
+        unsafe { self.push1_at(wp, pool, p, a) }
+    }
+
+    /// `push2` with the result of `cursors()`.
+    #[inline(always)]
+    pub unsafe fn push2_at(&mut self, wp: *mut *mut u64, pool: &BlockPool, p: usize, a: u64, b: u64) {
+        let slot = wp.add(p);
+        let c = *slot;
+        *c = a;
+        *c.add(1) = b;
+        let c = c.add(2);
+        *slot = c;
+        // Lines are 64-byte aligned: the pointer is at a boundary when its line is full.
+        if (c as usize) & 63 == 0 {
+            self.flush(pool, p);
+            *slot = c.sub(8);
+        }
+    }
+
+    /// `push1` with the result of `cursors()`.
+    #[inline(always)]
+    pub unsafe fn push1_at(&mut self, wp: *mut *mut u64, pool: &BlockPool, p: usize, a: u64) {
+        let slot = wp.add(p);
+        let c = *slot;
+        *c = a;
+        let c = c.add(1);
+        *slot = c;
+        if (c as usize) & 63 == 0 {
+            self.flush(pool, p);
+            *slot = c.sub(8);
         }
     }
 
@@ -172,11 +194,12 @@ impl PartWriter {
     pub fn finalize(&mut self, pool: &BlockPool) {
         self.words = vec![0; self.nparts];
         for p in 0..self.nparts {
-            let n = self.fill[p];
-            self.words[p] = self.lines[p] * 8 + n as u32;
+            let line = self.wc[p].0.as_mut_ptr();
+            let n = unsafe { self.wp[p].offset_from(line) } as u32;
+            self.words[p] = self.lines[p] * 8 + n;
             if n > 0 {
                 unsafe { self.flush(pool, p) };
-                self.fill[p] = 0;
+                self.wp[p] = line;
             }
         }
         unsafe { _mm_sfence() };

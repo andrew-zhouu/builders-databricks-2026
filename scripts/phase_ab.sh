@@ -4,7 +4,7 @@
 # A variant is a space-free env assignment list separated by commas, e.g.
 #   X=1                 (no-op: the current build)
 #   SSBIN=old           (the binary saved as bin/old by snap.sh)
-#   SSBIN=old,NOZAP=1
+#   SSBIN=old,SS_NOZAP=1
 # Prints min and median of the timestamp for each variant. Interleaving makes
 # the comparison fair on a machine whose load drifts.
 . "$(dirname "${BASH_SOURCE[0]}")/../scripts/env.sh"
@@ -18,7 +18,7 @@ for r in $(seq "$rounds"); do
     bin="$BIN"
     for kv in $envs; do case "$kv" in SSBIN=*) bin="$PROJ/bin/${kv#SSBIN=}";; esac; done
     rm -rf "$out"; mkdir -p "$out"
-    t=$(env $envs NCPU="${NCPU:-8}" TIMING=1 "$bin" "$PROJ/data/$name" "$out" 2>&1 | grep -E "$label" | head -1 | sed 's/^\[ *\([0-9.]*\) ms.*/\1/')
+    t=$(env $envs NCPU="${NCPU:-8}" SS_TIMING=1 "$bin" "$PROJ/data/$name" "$out" 2>&1 | grep -E "$label" | head -1 | sed 's/^\[ *\([0-9.]*\) ms.*/\1/')
     vals[$v]="${vals[$v]:-} $t"
   done
 done

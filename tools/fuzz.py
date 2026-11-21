@@ -164,7 +164,10 @@ def main():
             cur_user = user()
             t = ws + R.randrange(max(1, wlen // 1000)) * 1000 + (R.randrange(1000) if R.random() < 0.1 else 0)
         elif r < 0.35:
-            t += R.choice([1_800_000, 1_800_001, 1_799_999, 0, 0, 1, 999, 1000])
+            # the session gap to the millisecond, and the sessionizer's internal
+            # 2^20 ms slot width (pass3.rs) to the millisecond
+            t += R.choice([1_800_000, 1_800_001, 1_799_999, 0, 0, 1, 999, 1000,
+                           1_048_575, 1_048_576, 1_048_577, 751_424, 751_425, 2_097_152])
         elif r < 0.40:
             t = (t // DAY + 1) * DAY - R.choice([1, 1000, 60_000, 0])   # around midnight
         else:
@@ -203,6 +206,16 @@ def main():
                 events.append(copy)
             if R.random() < 0.3:
                 events.append(list(R.choice(events[-3:])))   # an identical copy (same ingest)
+        # an event whose earliest copy is invalid: every later, valid copy must go with
+        # it, which can leave a person with purchases but no events at all
+        if R.random() < 0.04:
+            ing = ingest_for(ts_ms)
+            lone = "u" + reg("", 8)
+            bad = [new_eid(), lone, bad_ts(ts_ms), f1(ing), "purchase", "p1", "500"]
+            events.append(bad)
+            for k in range(R.randint(1, 3)):
+                events.append([bad[0], lone if R.random() < 0.7 else user(), good_ts(ts_ms), f1(ing + (k + 1) * 60000),
+                               R.choice(["purchase", "purchase", "view"]), "p1", "500"])
 
     # identical copies must stay identical; copies with equal ingest and different
     # content are not allowed by the rules: keep the first row per (id, ingest)

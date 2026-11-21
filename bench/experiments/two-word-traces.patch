@@ -1,0 +1,434 @@
+diff --git a/fast/src/ids.rs b/fast/src/ids.rs
+index bdb71e8..cbf5a70 100644
+--- a/fast/src/ids.rs
++++ b/fast/src/ids.rs
+@@ -62,14 +62,12 @@ pub fn raw_len(key: u64) -> usize {
+ pub fn event_hash(b: &[u8]) -> u64 {
+     let n = b.len();
+     if n <= 9 {
+-        // The usual shape, a letter and up to 8 more bytes: the bytes after the
+-        // first are the hash input (IDs that differ only in their first byte
+-        // share a hash, which is allowed).
++        // The usual shape, a letter and up to 8 more bytes.
+         let mut w = [0u8; 8];
+         if n > 1 {
+             w[..n - 1].copy_from_slice(&b[1..]);
+         }
+-        return mix9(u64::from_le_bytes(w));
++        return hash9(if n > 0 { b[0] } else { 0 }, u64::from_le_bytes(w));
+     }
+     let mut buf = [0u8; 16];
+     let head = n.min(16);
+@@ -86,10 +84,15 @@ pub fn event_hash(b: &[u8]) -> u64 {
+     h
+ }
+ 
+-/// The hash of an ID of at most 9 bytes: `x` holds its bytes after the first,
+-/// little-endian and zero-padded.
++/// The hash of an ID of at most 9 bytes: its first byte, and the bytes after
++/// it little-endian and zero-padded.
+ #[inline(always)]
+-pub fn mix9(x: u64) -> u64 {
++pub fn hash9(first: u8, rest: u64) -> u64 {
++    mix9(rest ^ (first as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93))
++}
++
++#[inline(always)]
++fn mix9(x: u64) -> u64 {
+     // One multiplication: its high half is well mixed, and folding that into
+     // the low half is enough for a partition number (from the top) and a
+     // fingerprint (from the bottom) that say different things.
+diff --git a/fast/src/parse.rs b/fast/src/parse.rs
+index 1e604aa..aa44a24 100644
+--- a/fast/src/parse.rs
++++ b/fast/src/parse.rs
+@@ -25,7 +25,7 @@
+ 
+ use core::arch::x86_64::*;
+ 
+-use crate::ids::{event_hash, mix9, raw_key_fast};
++use crate::ids::{event_hash, hash9, raw_key_fast};
+ use crate::lookup::ABSENT;
+ use crate::part::PartWriter;
+ use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
+@@ -33,11 +33,36 @@ use crate::{Chunk, Ctx};
+ 
+ pub const PERSON_BITS: u32 = 27;
+ pub const TS_MASK: u64 = (1 << 31) - 1;
+-pub const LOCAL_BITS: u32 = 12;
+-pub const CAMPAIGN_BITS: u32 = 21;
++pub const LOCAL_BITS: u32 = 13;
++/// A click's first word is `person_local | ts_rel_ms(31) | campaign`: the
++/// campaign gets the bits the other two leave.
++pub const CAMPAIGN_BITS: u32 = 33 - LOCAL_BITS;
++/// Where `person_local` starts in a click's first word.
++pub const CLICK_SHIFT: u32 = 31 + CAMPAIGN_BITS;
+ /// Marks a cancellation among event and purchase records.
+ pub const CANCEL: u64 = 1 << (31 + LOCAL_BITS);
+ 
++/// The second word of a trace: what the parser did with the line. Zero for a
++/// line that failed validation (nothing was written for it); else `T_VALID`,
++/// `T_PURCHASE` if it is a purchase, four more bits of the event_id's hash,
++/// the person (27 bits from bit 31) and `ts_rel_ms` (31 bits).
++pub const T_VALID: u64 = 1 << 63;
++pub const T_PURCHASE: u64 = 1 << 62;
++
++/// The trace's second word for a valid event of `person` at `ts_rel`.
++#[inline(always)]
++pub fn trace_valid(h4: u64, person: u64, ts_rel: u64) -> u64 {
++    T_VALID | (h4 & 15) << 58 | person << 31 | ts_rel
++}
++
++/// From a valid trace's second word: the event's person partition and its
++/// event record (the word the parser wrote there).
++#[inline(always)]
++pub fn trace_record(w2: u64) -> (u32, u64) {
++    let person = w2 >> 31 & ((1 << PERSON_BITS) - 1);
++    ((person >> LOCAL_BITS) as u32, (person & ((1 << LOCAL_BITS) - 1)) << 31 | (w2 & TS_MASK))
++}
++
+ /// Bytes that must be readable after a line start for the fast paths.
+ const MARGIN: usize = 256;
+ /// Lines this close to the file start use the scalar path (backward loads).
+@@ -473,15 +498,19 @@ pub fn event_records(ctx: &Ctx, e: &Event) -> (usize, u64, u64) {
+ #[inline(never)]
+ fn event_line(ctx: &Ctx, out: &mut EventOut, line: &[u8], loc: u64) {
+     let Some(e) = parse_event(ctx, line) else { return };
+-    let (pk, trace) = trace_of(ctx, event_hash(e.id));
+-    out.k.push1(&ctx.pool, pk, trace | loc);
++    let h = event_hash(e.id);
++    let (pk, trace) = trace_of(ctx, h);
++    let mut w2 = 0;
+     if e.valid {
+         let (sp, rec, extra) = event_records(ctx, &e);
+         out.s.push1(&ctx.pool, sp, rec);
++        w2 = trace_valid(h >> 40, (sp as u64) << LOCAL_BITS | rec >> 31, rec & TS_MASK);
+         if e.purchase {
+             out.ps.push2(&ctx.pool, sp, rec, extra);
++            w2 |= T_PURCHASE;
+         }
+     }
++    out.k.push2(&ctx.pool, pk, trace | loc, w2);
+ }
+ 
+ /// What the SIMD path made of one event line.
+@@ -661,7 +690,8 @@ struct Stage {
+     /// Bytes 0..7: the offsets of the line's six commas and its newline; byte
+     /// 7: bit `k` is set if field `k` is quoted.
+     sep: [u64; NB],
+-    /// The trace word, and the trace partition.
++    /// The trace's first word; `pk` is its partition, with four more bits of
++    /// the hash from bit 16 (for the second word).
+     trace: [u64; NB],
+     /// The user's key; 0 = no user.
+     key: [u64; NB],
+@@ -856,9 +886,10 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize
+         // The trace: a hash of the event_id's bytes after the first (1 to 9
+         // bytes in all; see ids::event_hash).
+         let n0 = ln(0);
+-        let x = _bzhi_u64((at(0).add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
+-        let h = mix9(x);
+-        *st.pk.get_unchecked_mut(i) = (((h >> 32) * pd) >> 32) as u32;
++        let a0 = at(0);
++        let x = _bzhi_u64((a0.add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
++        let h = hash9(*a0, x);
++        *st.pk.get_unchecked_mut(i) = (((h >> 32) * pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16;
+         *st.trace.get_unchecked_mut(i) = (h & fp_mask) << loc_bits | loc0.wrapping_add(p as u64);
+ 
+         // The user: `u` and 1 to 8 ASCII bytes, none of them NUL, is its own
+@@ -963,17 +994,21 @@ unsafe fn stage_emit(ctx: &Ctx, out: &mut EventOut, st: &Stage, n: usize) {
+         if fl & F_DEAD != 0 {
+             continue;
+         }
+-        out.k.push1_at(kw, pool, *st.pk.get_unchecked(i) as usize, *st.trace.get_unchecked(i));
+-        if fl & F_VALID == 0 {
+-            continue;
+-        }
+-        let person = table.person_at(*st.home.get_unchecked(i) as usize, *st.key.get_unchecked(i)) as u64;
+-        let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | *st.ts.get_unchecked(i) as u64;
+-        let sp = (person >> LOCAL_BITS) as usize;
+-        out.s.push1_at(sw, pool, sp, rec);
+-        if fl & F_PURCHASE != 0 {
+-            out.ps.push2_at(pw, pool, sp, rec, *st.extra.get_unchecked(i));
++        let pk = *st.pk.get_unchecked(i) as u64;
++        let mut w2 = 0;
++        if fl & F_VALID != 0 {
++            let person = table.person_at(*st.home.get_unchecked(i) as usize, *st.key.get_unchecked(i)) as u64;
++            let ts = *st.ts.get_unchecked(i) as u64;
++            let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | ts;
++            let sp = (person >> LOCAL_BITS) as usize;
++            out.s.push1_at(sw, pool, sp, rec);
++            w2 = trace_valid(pk >> 16, person, ts);
++            if fl & F_PURCHASE != 0 {
++                out.ps.push2_at(pw, pool, sp, rec, *st.extra.get_unchecked(i));
++                w2 |= T_PURCHASE;
++            }
+         }
++        out.k.push2_at(kw, pool, pk as usize & 0xFFFF, *st.trace.get_unchecked(i), w2);
+     }
+ }
+ 
+@@ -1041,7 +1076,7 @@ pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
+ 
+ #[inline(always)]
+ fn click_words(person: u64, tc: u64) -> (usize, u64) {
+-    ((person >> LOCAL_BITS) as usize, (person & ((1 << LOCAL_BITS) - 1)) << 52 | tc)
++    ((person >> LOCAL_BITS) as usize, (person & ((1 << LOCAL_BITS) - 1)) << CLICK_SHIFT | tc)
+ }
+ 
+ /// The literal rules for one click line.
+diff --git a/fast/src/part.rs b/fast/src/part.rs
+index 7b796cc..5de1353 100644
+--- a/fast/src/part.rs
++++ b/fast/src/part.rs
+@@ -27,9 +27,11 @@ impl BlockPool {
+     /// (worst-case input), so if the kernel refuses it, settle for less, down
+     /// to `floor` blocks.
+     pub fn new(nblocks: usize, floor: usize) -> BlockPool {
++        // Experiment switch: SS_POOL4K = ordinary pages for the pool.
++        let huge = std::env::var("SS_POOL4K").is_err();
+         let mut n = nblocks;
+         loop {
+-            if let Some(base) = crate::sys::try_map_anon(n * BLOCK_BYTES, true) {
++            if let Some(base) = crate::sys::try_map_anon(n * BLOCK_BYTES, huge) {
+                 return BlockPool { base, nblocks: n, next: AtomicUsize::new(0) };
+             }
+             if n <= floor {
+diff --git a/fast/src/pass2.rs b/fast/src/pass2.rs
+index 2e8e210..2165b1c 100644
+--- a/fast/src/pass2.rs
++++ b/fast/src/pass2.rs
+@@ -4,10 +4,16 @@
+ //! ever repeated, and left a trace (fingerprint of the ID, position of the
+ //! line) for every well-formed event line. Here, per trace partition:
+ //!
+-//! 1. Find the fingerprints that occur more than once, with two bitmaps
+-//!    ("seen" and "seen again") that fit in the L1 cache. Most partitions'
+-//!    traces are read twice and nothing else happens to them.
+-//! 2. For each such fingerprint, read its lines again from the input and parse
++//! 1. Find the fingerprints that occur more than once, with a small table of
++//!    "seen" and "seen again" bits. Most partitions' traces are read twice
++//!    and nothing else happens to them.
++//! 1b. The usual repeat is settled from the traces alone: a trace also says
++//!    whether its line passed validation and, if so, for whom and when. When
++//!    every copy did, for the same person and time, the copies wrote identical
++//!    records and all but one are cancelled, without reading anything. (Two
++//!    different event IDs would have to share 47 bits of hash and their
++//!    person, timestamp and validity to be taken for copies here.)
++//! 2. For every other repeated fingerprint, read its lines again and parse
+ //!    them by the literal rules. Lines whose IDs really are equal are copies
+ //!    of one event: the copy with the smallest ingest_ts is the kept one
+ //!    (copies with equal ingest_ts are identical, so any of them will do).
+@@ -19,7 +25,7 @@
+ 
+ use core::arch::x86_64::{_bzhi_u64, _mm_prefetch, _MM_HINT_T0};
+ 
+-use crate::parse::{can_decode, decode_event, event_records, parse_event, Decoded, CANCEL, LOCAL_BITS};
++use crate::parse::{can_decode, decode_event, event_records, parse_event, trace_record, Decoded, CANCEL, LOCAL_BITS, T_PURCHASE};
+ use crate::util::find_newline;
+ use crate::Ctx;
+ 
+@@ -102,15 +108,18 @@ struct Pending {
+ #[derive(Default)]
+ pub struct Scratch {
+     seen: Vec<u64>,
+-    cand: Vec<u64>,
++    cand: Vec<[u64; 2]>,
++    tmp: Vec<[u64; 2]>,
++    /// The first words of the traces whose lines must be read again.
++    reread: Vec<u64>,
+     copies: Vec<Copy>,
+     pending: Vec<Pending>,
+-    tmp: Vec<u64>,
+ }
+ 
+ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
+     let t0 = ctx.now();
+-    let n: usize = (0..ctx.nthreads).map(|t| ctx.k(t).part_words(p)).sum();
++    // A trace is two words (parse::T_VALID and friends describe the second).
++    let n: usize = (0..ctx.nthreads).map(|t| ctx.k(t).part_words(p)).sum::<usize>() / 2;
+     if n < 2 {
+         return;
+     }
+@@ -126,8 +135,8 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
+     let (shift, mask) = (ctx.loc_bits, slots as u64 - 1);
+     for t in 0..ctx.nthreads {
+         ctx.k(t).for_each_run(&ctx.pool, p, |run| {
+-            for &r in run {
+-                let i = (r >> shift) & mask;
++            for r in run.chunks_exact(2) {
++                let i = (r[0] >> shift) & mask;
+                 let (w, b) = ((i >> 5) as usize, 1u64 << (2 * (i & 31)));
+                 unsafe {
+                     let v = *tab.get_unchecked(w);
+@@ -143,11 +152,11 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
+     let mut kept = 0usize;
+     for t in 0..ctx.nthreads {
+         ctx.k(t).for_each_run(&ctx.pool, p, |run| {
+-            for &r in run {
+-                let i = (r >> shift) & mask;
++            for r in run.chunks_exact(2) {
++                let i = (r[0] >> shift) & mask;
+                 unsafe {
+                     let again = *tab.get_unchecked((i >> 5) as usize) >> (2 * (i & 31) + 1) & 1;
+-                    *sc.cand.as_mut_ptr().add(kept) = r;
++                    *sc.cand.as_mut_ptr().add(kept) = [r[0], r[1]];
+                     kept += again as usize;
+                 }
+             }
+@@ -156,19 +165,19 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
+     unsafe { sc.cand.set_len(kept) };
+     // About half of those only share a slot with an unrelated trace. The same
+     // test again on other bits of the fingerprint removes nearly all of them,
+-    // so that only true repeats are sorted and read again.
++    // so that only true repeats are sorted.
+     if ctx.fp_mask >> 14 != 0 && sc.cand.len() >= 2 {
+         let slots = (16 * sc.cand.len()).next_power_of_two().max(4096).min(32 * tab.len());
+         let (shift2, mask2) = (shift + 13, (slots as u64 - 1) & (ctx.fp_mask >> 13));
+         tab[..slots / 32].fill(0);
+-        for &r in &sc.cand {
+-            let i = (r >> shift2) & mask2;
++        for r in &sc.cand {
++            let i = (r[0] >> shift2) & mask2;
+             let (w, b) = ((i >> 5) as usize, 1u64 << (2 * (i & 31)));
+             let v = tab[w];
+             tab[w] = v | b | (v & b) << 1;
+         }
+-        sc.cand.retain(|&r| {
+-            let i = (r >> shift2) & mask2;
++        sc.cand.retain(|r| {
++            let i = (r[0] >> shift2) & mask2;
+             tab[(i >> 5) as usize] >> (2 * (i & 31) + 1) & 1 != 0
+         });
+     }
+@@ -177,47 +186,63 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, p: usize) {
+         return;
+     }
+ 
+-    // Bring equal fingerprints together, and drop the traces whose fingerprint
+-    // turns out to be unique after all.
++    // Bring equal fingerprints together. A fingerprint that turns out to be
++    // unique after all is done with. So is the usual repeat, which the traces
++    // settle by themselves: every copy valid, of the same person at the same
++    // time (and not a purchase, whose price the trace does not hold). Those
++    // copies wrote identical records, one of which stays whichever copy is the
++    // kept one. And copies that all failed validation wrote nothing. Only what
++    // is left needs its lines read again: `sc.reread`, groups together.
+     sort_by_fp(&mut sc.cand, &mut sc.tmp, shift);
+-    let mut kept = 0;
++    sc.reread.clear();
++    let cand = &sc.cand[..];
+     let mut i = 0;
+-    while i < sc.cand.len() {
+-        let fp = sc.cand[i] >> shift;
++    while i < cand.len() {
++        let fp = cand[i][0] >> shift;
++        let w2 = cand[i][1];
++        let mut same = true;
+         let mut j = i + 1;
+-        while j < sc.cand.len() && sc.cand[j] >> shift == fp {
++        while j < cand.len() && cand[j][0] >> shift == fp {
++            same &= cand[j][1] == w2;
+             j += 1;
+         }
+         if j - i >= 2 {
+-            sc.cand.copy_within(i..j, kept);
+-            kept += j - i;
++            if same & (w2 & T_PURCHASE == 0) {
++                if w2 != 0 {
++                    let (part, rec) = trace_record(w2);
++                    for _ in i + 1..j {
++                        out.events.push((part, rec | CANCEL));
++                    }
++                }
++            } else {
++                sc.reread.extend(cand[i..j].iter().map(|r| r[0]));
++            }
+         }
+         i = j;
+     }
+-    sc.cand.truncate(kept);
+     let t0 = ctx.charge_rows(crate::P_D_GROUP, t0, sc.cand.len());
+     read_again(ctx, sc);
+-    let t0 = ctx.charge_rows(crate::P_D_READ, t0, sc.cand.len());
++    let t0 = ctx.charge_rows(crate::P_D_READ, t0, sc.reread.len());
+     settle(&mut sc.copies, out);
+-    ctx.charge_rows(crate::P_D_EMIT, t0, sc.cand.len());
++    ctx.charge_rows(crate::P_D_EMIT, t0, sc.reread.len());
+ }
+ 
+-/// Order traces by fingerprint (their bits from `shift` up): a stable LSD
+-/// radix sort, 11 bits a pass.
+-fn sort_by_fp(v: &mut Vec<u64>, tmp: &mut Vec<u64>, shift: u32) {
++/// Order traces by fingerprint (the bits of their first word from `shift`
++/// up): a stable LSD radix sort, 11 bits a pass.
++fn sort_by_fp(v: &mut Vec<[u64; 2]>, tmp: &mut Vec<[u64; 2]>, shift: u32) {
+     let n = v.len();
+     if n < 256 || shift < 20 {
+-        v.sort_unstable();
++        v.sort_unstable_by_key(|r| r[0] >> shift);
+         return;
+     }
+     tmp.clear();
+-    tmp.resize(n, 0);
++    tmp.resize(n, [0; 2]);
+     let mut hist = [0u32; 2048];
+     let mut s = shift;
+     while s < 64 {
+         hist.fill(0);
+-        for &w in v.iter() {
+-            hist[(w >> s) as usize & 2047] += 1;
++        for r in v.iter() {
++            hist[(r[0] >> s) as usize & 2047] += 1;
+         }
+         let mut total = 0u32;
+         for c in hist.iter_mut() {
+@@ -225,9 +250,9 @@ fn sort_by_fp(v: &mut Vec<u64>, tmp: &mut Vec<u64>, shift: u32) {
+             *c = total;
+             total += k;
+         }
+-        for &w in v.iter() {
+-            let c = &mut hist[(w >> s) as usize & 2047];
+-            unsafe { *tmp.get_unchecked_mut(*c as usize) = w };
++        for r in v.iter() {
++            let c = &mut hist[(r[0] >> s) as usize & 2047];
++            unsafe { *tmp.get_unchecked_mut(*c as usize) = *r };
+             *c += 1;
+         }
+         std::mem::swap(v, tmp);
+@@ -235,7 +260,7 @@ fn sort_by_fp(v: &mut Vec<u64>, tmp: &mut Vec<u64>, shift: u32) {
+     }
+ }
+ 
+-/// Read the lines of the traces in `sc.cand` again, into `sc.copies` (same
++/// Read the lines of the traces in `sc.reread` again, into `sc.copies` (same
+ /// order). The lines are scattered over the input and each valid copy needs a
+ /// slot of the user table, so this is a pipeline: a line is asked for (two
+ /// cache lines) `AHEAD` traces before it is decoded, and the user's slot is
+@@ -244,7 +269,7 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
+     const AHEAD: usize = 32;
+     const LAG: usize = 32;
+     let (shift, loc_mask) = (ctx.loc_bits, (1u64 << ctx.loc_bits) - 1);
+-    let n = sc.cand.len();
++    let n = sc.reread.len();
+     sc.copies.clear();
+     sc.copies.reserve(n);
+     sc.pending.clear();
+@@ -259,7 +284,7 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
+     for j in 0..n + AHEAD {
+         let (p, start, len) = ring[j % AHEAD];
+         if j < n {
+-            let (data, at) = ctx.locate(sc.cand[j] & loc_mask);
++            let (data, at) = ctx.locate(sc.reread[j] & loc_mask);
+             let q = unsafe { data.as_ptr().add(at) };
+             unsafe {
+                 _mm_prefetch::<_MM_HINT_T0>(q as *const i8);
+@@ -272,7 +297,7 @@ fn read_again(ctx: &Ctx, sc: &mut Scratch) {
+         if j < AHEAD {
+             continue;
+         }
+-        let t = sc.cand[j - AHEAD];
++        let t = sc.reread[j - AHEAD];
+         let mut copy = Copy { fp: t >> shift, id: (p, 0), head: [0; 2], ingest: 0, valid: false, part: 0, rec: 0, extra: 0 };
+         let d = if can_decode(ctx, start, len) { unsafe { decode_event::<true>(ctx, p) } } else { TO_SCALAR_LINE };
+         if d.used != 0 {

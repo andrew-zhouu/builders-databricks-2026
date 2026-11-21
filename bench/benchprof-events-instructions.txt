@@ -1,0 +1,148 @@
+bench events:  32.8 ns/line   477.5 instr/line   159.1 cycles/line  IPC 3.00  0.683 brmiss/line  0.003 llcmiss/line  (6807 lines)
+total instructions: 4,104   (not in disassembly: 1)
+input lines: events 0  clicks 0  links 0
+
+-- by top-level symbol
+         3,544  86.4%  Svo_8sessions5parse12events_chunk
+           424  10.3%  _NtCshPeiEMK7Svo_8sessions5parseNtB5_10EventBatch5flush
+            45   1.1%  Svo_8sessions6lookupNtB2_7IdIndex3get
+            20   0.5%  _NtCshPeiEMK7Svo_8sessions4partNtB5_10PartWriter8finalize
+             9   0.2%  __libc_free
+             9   0.2%  alloc_slot
+             9   0.2%  __libc_malloc_impl
+             8   0.2%  nontrivial_free
+             7   0.2%  Svo_8sessions5parse11parse_event
+             5   0.1%  memcpy
+             3   0.1%  _NtCshPeiEMK7Svo_8sessions4partNtB5_10PartWriter10take_block
+             3   0.1%  bcmp
+             3   0.1%  memcmp
+             2   0.0%  calloc
+
+-- by source function (inlined code under its own name)
+         1,165  28.4%  parse::event_fast                 
+         1,158  28.2%  std:core/src                      
+           340   8.3%  parse::quotes                     
+           319   7.8%  parse::masks64                    
+           186   4.5%  parse::add                        
+           131   3.2%  part::push1                       
+           119   2.9%  parse::datetime                   
+           110   2.7%  table::insert_at                  
+            80   1.9%  parse::timestamp                  
+            68   1.7%  part::flush                       
+            55   1.3%  parse::flush                      
+            46   1.1%  parse::digits16                   
+            36   0.9%  ids::raw_key_fast                 
+            33   0.8%  lookup::get                       
+            27   0.7%  std:alloc/src                     
+            27   0.7%  parse::events_chunk               
+            23   0.6%  parse::prefetch_input             
+            23   0.6%  other:meta.h                      
+            20   0.5%  table::slot                       
+            15   0.4%  table::person                     
+            14   0.3%  parse::trace_of                   
+            12   0.3%  part::push2                       
+            12   0.3%  table::home                       
+            10   0.2%  util::parse_price                 
+             9   0.2%  ids::finish                       
+             8   0.2%  ids::mix16                        
+             8   0.2%  other:malloc.c                    
+             5   0.1%  lookup::canonical                 
+             5   0.1%  other:memcpy.s                    
+             4   0.1%  util::split                       
+             4   0.1%  other:free.c                      
+             3   0.1%  part::finalize                    
+             3   0.1%  parse::parse_event                
+             3   0.1%  other:bcmp.c                      
+             3   0.1%  other:memcmp.c                    
+             2   0.0%  table::prefetch_home              
+             2   0.0%  other:calloc.c                    
+             2   0.0%  other:memset.s                    
+             1   0.0%  main::bench                       
+             1   0.0%  part::take_block                  
+
+-- hottest source lines
+           319   7.8%  parse.rs:233   parse::masks64
+           231   5.6%  parse.rs:582   parse::event_fast
+           210   5.1%  parse.rs:250   parse::quotes
+           173   4.2%  parse.rs:599   parse::event_fast
+           167   4.1%  parse.rs:497   parse::add
+           145   3.5%  parse.rs:552   parse::event_fast
+           133   3.2%  uint_macros.rs:2719  std:core/src
+           128   3.1%  parse.rs:248   parse::quotes
+           100   2.4%  parse.rs:146   parse::datetime
+            99   2.4%  part.rs:129   part::push1
+            94   2.3%  mut_ptr.rs:971   std:core/src
+            92   2.2%  mod.rs:574   std:core/src
+            79   1.9%  uint_macros.rs:85    std:core/src
+            78   1.9%  parse.rs:577   parse::event_fast
+            73   1.8%  uint_macros.rs:178   std:core/src
+            67   1.6%  sse41.rs:1048  std:core/src
+            67   1.6%  parse.rs:590   parse::event_fast
+            65   1.6%  index.rs:232   std:core/src
+            59   1.4%  sse2.rs:1570  std:core/src
+            55   1.3%  parse.rs:625   parse::event_fast
+            54   1.3%  sse2.rs:387   std:core/src
+            52   1.3%  parse.rs:197   parse::timestamp
+            48   1.2%  parse.rs:544   parse::event_fast
+            46   1.1%  parse.rs:180   parse::digits16
+            44   1.1%  sse2.rs:232   std:core/src
+            41   1.0%  part.rs:143   part::flush
+            40   1.0%  table.rs:103   table::insert_at
+            38   0.9%  parse.rs:559   parse::event_fast
+            37   0.9%  avx.rs:1934  std:core/src
+            37   0.9%  parse.rs:594   parse::event_fast
+            36   0.9%  parse.rs:555   parse::event_fast
+            36   0.9%  bmi2.rs:43    std:core/src
+            34   0.8%  ids.rs:49    ids::raw_key_fast
+            32   0.8%  bmi2.rs:69    std:core/src
+            32   0.8%  parse.rs:565   parse::event_fast
+            32   0.8%  sse41.rs:430   std:core/src
+            32   0.8%  macros.rs:188   std:core/src
+            31   0.8%  parse.rs:588   parse::event_fast
+            30   0.7%  lookup.rs:65    lookup::get
+            29   0.7%  index.rs:219   std:core/src
+            28   0.7%  sse2.rs:111   std:core/src
+            26   0.6%  table.rs:117   table::insert_at
+            26   0.6%  parse.rs:553   parse::event_fast
+            25   0.6%  mod.rs:635   std:alloc/src
+            25   0.6%  part.rs:142   part::flush
+
+-- parse.rs, line by line (samples; share of all)
+        14   0.3%     59: ((((h >> 32) * ctx.pd as u64) >> 32) as usize, (h & ctx.fp_mask) << ctx.loc_bits)
+        18   0.4%    124: let row = *dt.row.get_unchecked((y >> 24 & 15) as usize) as usize;
+       100   2.4%    146: let days = *dt.days.get_unchecked(row).get_unchecked(x as usize & 511);
+        46   1.1%    180: (_mm_testc_si128(isdigit, keep) != 0, (x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32))
+        10   0.2%    192: if (n == 20) | (n == 25) {
+        52   1.3%    197: let mut suffix = *a.add(19) == b'Z';
+       319   7.8%    233: (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c)) as u32 as u64)
+       128   3.1%    248: let f = _pext_u64(q >> 1, d) << 1 | (q & 1);
+       210   5.1%    250: ((f ^ l) | (q.count_ones() as u64 ^ 2 * f.count_ones() as u64), f)
+        23   0.6%    270: if ctx.prefetch_ahead != 0 {
+       167   4.1%    497: *self.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
+        10   0.2%    499: *self.extra.get_unchecked_mut(i) = extra;
+        20   0.5%    510: let person = ctx.table.person(ctx.table.insert_at(self.home[i] as usize, self.key[i])) as u64;
+        20   0.5%    511: let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | self.ts[i] as u64;
+         9   0.2%    512: let sp = (person >> LOCAL_BITS) as usize;
+         9   0.2%    535: let mut bad = (nm.trailing_zeros() as usize <= c2) as u64;
+        12   0.3%    536: let (qbad, fa) = quotes(qm & 1u64.wrapping_shl(c2 as u32).wrapping_sub(1), cm ^ cm3);
+        48   1.2%    544: let cmb = cm & below;
+        21   0.5%    548: let cmb2 = cmb1 & cmb1.wrapping_sub(1);
+       145   3.5%    552: bad |= ((nl == 64) | (cmb2 == 0) | (cmb3 != 0)) as u64;
+        26   0.6%    553: let (qbad, fb) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
+        36   0.9%    555: if bad != 0 {
+        38   0.9%    559: let q = |f: u64, i: u32| (f >> i & 1) as usize;
+        32   0.8%    565: let (a3, n3) = (p2.add(q3), c3 - 2 * q3);
+        78   1.9%    577: if (n0 > 16) | !(user_ok | (n1 == 0)) | (n3 != 20) {
+       231   5.6%    582: if !ts_decided {
+        22   0.5%    587: let purchase = (n4 == 8) & (w == u64::from_le_bytes(*b"purchase"));
+        31   0.8%    588: let view = (n4 == 4) & ((w as u32 == u32::from_le_bytes(*b"view")) | (w as u32 == u32::from_le_bytes(*b"cart")
+        67   1.6%    590: if valid {
+        37   0.9%    594: let day = ((ts - dt.first_day_ms) as u64 / DAY_MS as u64) as usize;
+       173   4.2%    599: if (_mm_movemask_epi8(same) & 0x3FF != 0x3FF) | (*a3.add(19) != b'Z') {
+         9   0.2%    601: if !(shape & known & cal & (*a3.add(19) == b'Z')) {
+        12   0.3%    608: if valid & purchase {
+        16   0.4%    621: let lo = _bzhi_u64((a0 as *const u64).read_unaligned(), 8 * n0 as u32);
+        20   0.5%    622: let hi = _bzhi_u64((a0.add(8) as *const u64).read_unaligned(), 8 * (n0 as u32).saturating_sub(8));
+        21   0.5%    624: out.k.push1(&ctx.pool, pk, trace | loc);
+        55   1.3%    625: if valid {
+        19   0.5%    644: pos += used;

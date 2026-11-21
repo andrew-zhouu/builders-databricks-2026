@@ -21,7 +21,7 @@ cat "$PROJ"/data/"$name"/*/*.csv > /dev/null   # warm the page cache
 for i in $(seq "$runs"); do
   rm -rf "$out"; mkdir -p "$out"
   s=$(date +%s%N)
-  NCPU=8 TIMING=1 taskset -c "$cpus" "$BIN" "$PROJ/data/$name" "$out" 2>"$out.log"
+  NCPU=8 SS_TIMING=1 taskset -c "$cpus" "$BIN" "$PROJ/data/$name" "$out" 2>"$out.log"
   e=$(date +%s%N)
   echo "run $i: wall $(( (e - s) / 1000000 )) ms   $(grep -E 'people resolved|events and clicks|deduplicated|sessions built' "$out.log" | sed 's/^\[ *\([0-9.]*\) ms\] \(.*\)/\2 @\1/' | tr '\n' ';')  busy now $(busy)%"
 done

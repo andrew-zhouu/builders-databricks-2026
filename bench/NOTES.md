@@ -1,5 +1,67 @@
 # Benchmark notes
 
+## After the first official score (0.85 s)
+
+Method. Other jobs on the machine make wall time unreliable, so comparisons are
+interleaved (`scripts/abx.sh`) and read off hardware counters where possible:
+instructions are deterministic and user-mode cycles depend on load far less than wall
+time. `PIN=0-7` pins 8 threads to 4 cores x 2 hyperthreads, the scorer's shape; in
+that configuration the scored binary takes 0.69 s (best) to 0.85 s (median) on the 20M
+set, matching its official 0.85 s.
+
+Profile of the scored design, 5M events (`scripts/cyc.sh`, `scripts/prof.sh`):
+
+| Section | instr/row | cycles/row, 1 thread | notes |
+| --- | --- | --- | --- |
+| parse events | 512 to 515 | 200 to 270 | 160 to 170 in the cache-resident micro-benchmark |
+| parse clicks | 353 | 160 to 195 | |
+| dedup gather / table / emit | 0.2 / 31 / 36 | 7 / 27 / 20 | |
+| sessions gather / people | 53 / 88 | 42 / 56 to 77 | before this round |
+| sort clicks and purchases | 142 | 62 | before this round |
+| links | 238 | 180 to 230 | 3.6 cache misses per line |
+
+Kernel time on the development machine (5M, 8 threads): about 0.5 s of 2.0 s CPU, the
+same within noise for mmap or pread, with or without huge pages, with or without
+releasing input pages or the parallel teardown (`scripts/sysvar.sh`, medians of 7).
+On the 1M set it is 58 ms with 4 threads and 130 to 165 ms with 8.
+
+Changes and their measured effect (5M, 1 thread, min of 3 unless noted):
+
+| Change | Effect |
+| --- | --- |
+| Prefetch distance for user-table slots 8 -> 16 -> 32 lines | parse events 214 -> 206 -> 206 cycles/row at 5M; at 20M (8 threads) total user cycles 13237 -> 13069 -> 12941 M (min) |
+| User table slots per ID 2 -> 1.25 | worse: parse events 214 -> 225 cycles/row, +8 instr/row |
+| User table slots per ID 2 -> 3 or 4 | parse events -3 to -6%, total unchanged (more partitions downstream) |
+| Sessions: 2-pass sort by (person, 2^20 ms slot) instead of 4-pass by (person, ts) | gather 42 -> 20 cycles/row, people 56 -> 65; net about -14 cycles per event |
+| Clicks and purchases: counting sort per person instead of comparison sort | 142 -> 109 instr/row, cycles unchanged within noise |
+| Input prefetch distance 1 KB / 2 KB / 4 KB | no difference |
+
+Candidate (`dev`) against the scored binary (`scripts/abx.sh`, interleaved, 8 threads
+pinned to 0-7, min / median):
+
+| Data, rounds, load | wall ms scored | wall ms candidate | user Mcycles scored | user Mcycles candidate | Minstr scored / candidate |
+| --- | --- | --- | --- | --- | --- |
+| 20M, 7, about 4 | 688 / 849 | 668 / 785 | 13622 / 14468 | 12941 / 13374 | 17854 / 17482 |
+| 20M, 9, about 11 | 796 / 933 | 858 / 934 | 13674 / 14624 | 13912 / 14724 | 17854 / 17482 |
+| 20M, 9, about 12 | 815 / 897 | 764 / 893 | 13351 / 14201 | 13332 / 14218 | 17853 / 17482 |
+| 5M, 11, about 7 | 206 / 222 | 204 / 211 | 2688 / 2870 | 2646 / 2780 | 4563 / 4471 |
+| 5M, 11, about 13 | 223 / 330 | 216 / 308 | 3328 / 3476 | 3199 / 3411 | 4562 / 4470 |
+| 1M, 15, about 13 | 150 / 196 | 148 / 192 | 686 / 714 | 645 / 703 | 955 / 937 |
+
+Reading: 2.1% fewer instructions, always. Fewer cycles on a quiet machine (5 to 8% at
+20M in the one quiet series), nothing measurable under load. Not promoted to `main`.
+
+In the container with the scorer's flags (`scripts/docker_ab.sh`, 20M, 5 interleaved
+rounds, load about 26, time to done min / median): default 1879 / 2254 ms; no huge
+pages 2432 / 3012; 4 threads 2505 / 2615; no input release and no parallel teardown
+1366 / 2036 with kernel time 1294 / 1301 ms against 1538 / 1981. The last one is an
+open lead, not yet a decision (see HANDOFF.md).
+
+A lesson about the method: single-thread cycle counts (`scripts/cyc.sh`) showed these
+changes as worth 4 to 5%, and they mostly evaporated at 8 threads on 4 cores. Changes
+have to be judged in the scorer's shape (`PIN=0-7`, 20M), and anything under about 5%
+needs a quiet machine and many rounds to see at all.
+
 All local numbers come from a shared development machine (i7-11700, 8 cores / 16
 threads, WSL2) that other jobs kept at a load average of 15 to 50 for the whole
 period. Absolute times are therefore pessimistic and noisy; only interleaved A/B

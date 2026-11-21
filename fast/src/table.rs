@@ -1,14 +1,17 @@
 //! The global user table: user key -> slot, and a lock-free union-find over
 //! slots that joins linked IDs into people.
 //!
-//! A slot is 16 bytes: the key and the slot's parent side by side, so finding a
-//! user and the person they belong to is a single cache miss.
+//! A slot is 16 bytes: the key and the slot's parent side by side. Four slots
+//! make a cache line, and a key's probe sequence starts at the first slot of a
+//! line, so the keys that share a home fill that line in order: finding a user
+//! and the person they belong to is a single cache miss (the one `prefetch_home`
+//! asks for), unless more than four keys share the home.
 //!
 //! A person is the slot of the root of their set. Roots are always the
 //! byte-wise smallest ID of the set (unions point the larger root at the
 //! smaller), so the root's key is the person's name.
 
-use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+use core::arch::x86_64::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::sys::map_anon;
@@ -24,7 +27,10 @@ struct Slot {
 
 pub struct Table {
     slots: *mut Slot,
+    /// Slots: a multiple of four.
     pub cap: usize,
+    /// Cache lines of four slots.
+    lines: usize,
     pub overflow: AtomicBool,
     /// Linked IDs in the table once `compress` has run (diagnostics).
     pub used: std::sync::atomic::AtomicUsize,
@@ -34,9 +40,12 @@ unsafe impl Sync for Table {}
 
 impl Table {
     pub fn new(cap: usize) -> Table {
+        let cap = (cap & !3).max(8);
         Table {
+            // (Anonymous mappings are page-aligned, so slots 4k..4k+3 share a cache line.)
             slots: map_anon(cap * 16, true) as *mut Slot,
             cap,
+            lines: cap / 4,
             overflow: AtomicBool::new(false),
             used: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -49,7 +58,7 @@ impl Table {
 
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128 * self.cap as u128) >> 64) as usize
+        ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128 * self.lines as u128) >> 64) as usize * 4
     }
 
     /// Bring the home slot of `key` into cache.
@@ -78,10 +87,49 @@ impl Table {
         }
     }
 
+    /// Bring the home slot of `key` into cache and return it, for `insert_at`.
+    #[inline(always)]
+    pub fn prefetch_home(&self, key: u64) -> usize {
+        let home = self.home(key);
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.slots.add(home) as *const i8) };
+        home
+    }
+
+    /// The slot of `key`, whose home slot is `home`, and the person it belongs
+    /// to (valid once `compress` has run). The same as `insert_at` and
+    /// `person`, laid out for the usual case: the key is in its home line,
+    /// whose four keys are compared at once. (Another thread may be claiming a
+    /// slot of the line meanwhile; a key not seen here is looked for again, and
+    /// inserted if need be, by `insert_at`.)
+    #[inline(always)]
+    pub fn person_at(&self, home: usize, key: u64) -> u32 {
+        unsafe {
+            let line = self.slots.add(home) as *const __m256i;
+            let k = _mm256_set1_epi64x(key as i64);
+            let a = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_loadu_si256(line), k))) as u32;
+            let b = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_loadu_si256(line.add(1)), k))) as u32;
+            // Bits 0, 2, 4 and 6: the keys (the others compare the parents).
+            let found = (a | b << 4) & 0x55;
+            let slot = if found != 0 { (home + (found.trailing_zeros() as usize >> 1)) as u32 } else { self.insert_at(home, key) };
+            let p = (*self.slots.add(slot as usize)).parent.load(Relaxed);
+            if p == 0 {
+                slot
+            } else {
+                p - 1
+            }
+        }
+    }
+
     /// The slot of `key`, inserting it if new. Safe to call from many threads.
     #[inline(always)]
     pub fn insert(&self, key: u64) -> u32 {
-        let mut i = self.home(key);
+        self.insert_at(self.home(key), key)
+    }
+
+    /// `insert` with the key's home slot already computed.
+    #[inline(always)]
+    pub fn insert_at(&self, home: usize, key: u64) -> u32 {
+        let mut i = home;
         let mut probes = 0usize;
         loop {
             let slot = unsafe { &(*self.slots.add(i)).key };
