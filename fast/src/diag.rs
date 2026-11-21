@@ -139,6 +139,17 @@ pub fn run(data_dir: &std::path::Path) -> ! {
         key.push(line);
     }
     eprintln!("== diag: summary");
+    // Was the container held back by its CPU quota while all this ran?
+    for f in ["/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpu/cpu.stat", "/sys/fs/cgroup/cpu,cpuacct/cpu.stat"] {
+        if std::path::Path::new(f).exists() {
+            show(f, &|l| l.contains("throttled") || l.starts_with("nr_periods") || l.starts_with("usage_usec"), 6);
+        }
+    }
+    show("/sys/fs/cgroup/cpu.max", &all, 1);
+    show("/proc/pressure/cpu", &all, 2);
+    if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
+        eprintln!("  processors visible: {}", text.lines().filter(|l| l.starts_with("processor")).count());
+    }
     show("/proc/cpuinfo", &|l| l.starts_with("model name"), 1);
     show("/proc/version", &all, 1);
     show("/sys/kernel/mm/transparent_hugepage/enabled", &all, 1);
