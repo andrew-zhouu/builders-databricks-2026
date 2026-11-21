@@ -8,7 +8,7 @@ measurements behind every statement here.
 | What | Commit | Where |
 | --- | --- | --- |
 | First official submission: **0.85 s**, 23rd of 130 (leader 0.59 s) | `f1459cc` | tip of `main`, tag `scored-0.85`. The fallback: never rewritten. |
-| Second candidate: validated, **not promoted** (no demonstrated advantage) | tip of `dev` | see "Second candidate" below |
+| Second candidate: validated, **not promoted** (no demonstrated advantage) | `5aa33bc` | on `dev` (later `dev` commits touch only scripts and documents); see "Second candidate" below |
 | Diagnostic image (fails on purpose, cannot score) | tip of `diag` | see "The diagnostic image" |
 
 `main` only ever moves forward, and only to a commit that has passed

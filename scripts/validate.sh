@@ -36,7 +36,8 @@ size=$(du -sb "$W/src" | cut -f1); files=$(find "$W/src" -type f | wc -l)
 big=$(find "$W/src" -type f -size +1M | wc -l)
 [ "$big" = 0 ] && ok "no file over 1 MB (no data or binaries checked in)" || bad "$big large files"
 if bash "$PROJ/scripts/secretscan.sh" "$W/src" >"$W/secrets.log" 2>&1; then ok "no addresses, keys or tokens in the tree"; else bad "possible secret in tree"; cat "$W/secrets.log"; fi
-if grep -rIlE '/home/[a-z]+/|/mnt/c/Users' "$W/src" >/dev/null; then bad "machine-specific path in tree"; else ok "no machine-specific paths in the tree"; fi
+# (bracketed so that this line does not match itself)
+if grep -rIlE '/home/[a-z]+/|/mnt/c/[U]sers' "$W/src" >"$W/paths.log"; then bad "machine-specific path in tree: $(tr '\n' ' ' < "$W/paths.log")"; else ok "no machine-specific paths in the tree"; fi
 
 # ---- 2. clean Docker build
 s=$(date +%s)
