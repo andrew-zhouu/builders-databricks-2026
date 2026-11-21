@@ -148,6 +148,15 @@ fn sort_pairs(v: &mut Vec<u64>, tmp: &mut Vec<u64>, hist: &mut [u32], shift: u32
     if n < 2 {
         return;
     }
+    if n < 1024 {
+        // Few records (a partition's purchases): the per-person tables below
+        // would cost more than sorting them outright: by person, then by the
+        // whole first word (a cancellation's flag is above the person's bits,
+        // so it must not lead). Records with equal first words may come out in
+        // any order; nothing depends on it.
+        pairs(v).sort_unstable_by_key(|r| ((r[0] >> shift) & (LOCALS as u64 - 1), r[0]));
+        return;
+    }
     let hist = &mut hist[..LOCALS];
     hist.iter_mut().for_each(|c| *c = 0);
     for r in v.chunks_exact(2) {
