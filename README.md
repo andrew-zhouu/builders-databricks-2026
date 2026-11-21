@@ -37,7 +37,7 @@ share lock-free structures.
    with `pext`; timestamps parsed with a few 128-bit multiply-adds and a table of valid
    dates. The fast path only accepts lines it can decide completely. Everything else
    (malformed or long lines, unusual IDs, timestamp shapes it cannot judge) goes to a
-   scalar parser that follows the rules step by step. Table probes are prefetched a few
+   scalar parser that follows the rules step by step. Table probes are prefetched 32
    lines ahead.
    * Events are radix-partitioned by event ID, **invalid ones too**: dedup comes before
      validation, so an invalid earliest copy must still beat a later valid one.
@@ -47,12 +47,17 @@ share lock-free structures.
 3. **Dedup** (`pass2.rs`). Per event partition, a small hash table keeps the copy with
    the smallest `ingest_ts`; survivors that are valid are scattered to person
    partitions.
-4. **Sessions and attribution** (`pass3.rs`). Per person partition, a 4-pass LSD radix
-   sort groups events by person in time order. One sweep per person builds sessions,
-   assigns purchases, finds the credited click with a two-pointer window (ties to the
-   smallest `click_id`) and counts assists. People with very many sessions and clicks
-   (shared devices, whales) count assists per campaign by merging 7-day intervals, so
-   nothing is quadratic.
+4. **Sessions and attribution** (`pass3.rs`). Per person partition, a 2-pass LSD radix
+   sort groups events by person and, within a person, by time slot (2^20 ms, about
+   17.5 minutes). Events are never fully sorted by time, because sessions do not need
+   it: two events in one slot are less than 30 minutes apart, so a session can only
+   break between two slots, and it does exactly when the earliest timestamp of the
+   later slot is more than 30 minutes after the latest timestamp of the earlier one.
+   One sweep per person builds sessions from the slots' minima and maxima, assigns
+   purchases, finds the credited click with a two-pointer window (ties to the smallest
+   `click_id`) and counts assists. People with very many sessions and clicks (shared
+   devices, whales) count assists per campaign by merging 7-day intervals, so nothing
+   is quadratic.
 5. **Output** (`parquet.rs`). Rows are rendered into Parquet PLAIN pages as they are
    produced; each thread writes one `user_daily` file, and the per-campaign counters
    are merged into one `campaign_daily` file.
@@ -77,8 +82,25 @@ docker run --rm --network none --read-only --user 1000:1000 \
 ```
 
 The binary reads `DATA_DIR` (default `/data`), writes `OUTPUT_DIR` (default `/output`)
-and uses `NCPU` threads. `SS_TIMING=1` prints phase times and a per-section CPU profile
-to stderr.
+and uses `NCPU` threads. Everything else it reads from the environment is an
+experiment or test switch prefixed `SS_`, none of which is set in the image:
+
+* `SS_TIMING=1` prints phase times and a per-section profile to stderr: CPU and kernel
+  time, page faults and, where the kernel allows `perf_event_open`, instructions,
+  cycles, branch misses and cache misses per input row (`prof.rs`).
+* `SS_PROF=cycles|instructions|branch-misses|cache-misses` with `SS_PROF_OUT=file`
+  samples the run; `scripts/perfprof.sh` turns the samples into a profile by source
+  function and line.
+* `SS_DIAG=1` reports the machine and kernel, runs the pipeline several ways with the
+  profile on, and then exits with a failure code on purpose (`diag.rs`).
+
+## Measuring
+
+The development machine is shared and noisy, so comparisons are interleaved and lean on
+hardware counters: `scripts/abx.sh` (whole runs of any binaries: wall time, user-mode
+cycles and instructions), `scripts/cyc.sh` (cycles and instructions per row for each
+section), `scripts/bench.sh` (cache-resident parser micro-benchmark). `bench/NOTES.md`
+records what was measured and decided; `HANDOFF.md` is the current state of the work.
 
 ## Testing
 
