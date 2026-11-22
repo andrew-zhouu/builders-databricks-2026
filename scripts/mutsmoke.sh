@@ -11,7 +11,8 @@ fails=0
 for seed in 5 6 7; do
   python3 -I tools/fuzz.py "$seed" "$W/base$seed" 600
   FUZZ_IDS=dense python3 -I tools/fuzz.py "$seed" "$W/dense$seed" 600
-  for base in "$W/base$seed" "$W/dense$seed"; do
+  FUZZ_IDS=long python3 -I tools/fuzz.py "$seed" "$W/long$seed" 600
+  for base in "$W/base$seed" "$W/dense$seed" "$W/long$seed"; do
     for name in $(python3 -I tools/mutate.py list) mix mix,mix none; do
       if ! python3 -I tools/mutate.py "$seed" "$base" "$W/out" "$name" > "$W/log" 2>&1; then
         echo "FAIL $name on $(basename "$base"): $(tail -3 "$W/log" | tr '\n' ' ')"; fails=$((fails + 1))

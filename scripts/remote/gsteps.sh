@@ -9,7 +9,9 @@
 #   KIND   mut    idxfuzz.sh (mutated generator sets; env MUTATION, EVENTS pass through)
 #          dense  fuzzidx.sh with FUZZ_IDS=dense
 #          plain  fuzzidx.sh with FUZZ_IDS=plain
-#   MODE   the SETTINGS of those scripts (plain, simd, split, wix, index)
+#          long   fuzzidx.sh with FUZZ_IDS=long
+#   MODE   the SETTINGS of those scripts (plain, v5, simd, split, wix, index)
+#   env SLOW_BIN, REF_EVERY, MUTATION, EVENTS, ONLY pass through to idxfuzz.sh
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 kind="$1"; bin="$2"; mode="$3"; first="$4"; count="$5"; step="${6:-4}"; rows="${7:-3000}"
 log="$(mktemp)"
@@ -18,10 +20,10 @@ while [ "$s" -lt "$last" ]; do
   n=$((last - s)); [ "$n" -gt "$step" ] && n="$step"
   case "$kind" in
     mut) cmd="SETTINGS=$mode bash scripts/remote/idxfuzz.sh $bin $n $s" ;;
-    dense|plain) cmd="SETTINGS=$mode FUZZ_IDS=$kind bash scripts/remote/fuzzidx.sh $bin $n $s $rows" ;;
+    dense|plain|long) cmd="SETTINGS=$mode FUZZ_IDS=$kind bash scripts/remote/fuzzidx.sh $bin $n $s $rows" ;;
     *) echo "unknown kind $kind"; exit 2 ;;
   esac
-  if tmux ls 2>/dev/null | grep -q '^w[0-9]'; then
+  if tmux ls 2>/dev/null | grep -q -E '^[a-z]+[0-9]+:'; then
     bash -c "$cmd" 2>&1 | tee -a "$log" | grep -v -E '^(idxfuzz|fuzzidx) .* 0 failing sets' | cut -c1-900
   else
     flock /tmp/ss-heavy.lock bash -c "$cmd" 2>&1 | tee -a "$log" | grep -v -E '^(idxfuzz|fuzzidx) .* 0 failing sets' | cut -c1-900

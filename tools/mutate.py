@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-Mutations of a generated data set, aimed at a pipeline that decodes event IDs
-to the generator's dense index (IDs are `e` + base 36 of a 40-bit bijection of
-the index), de-duplicates by index and builds sessions from events in index
-order. Every mutation makes input on which a shortcut of that kind could go
-wrong while the rules (rules.md) stay perfectly well defined.
+Mutations of a generated data set: input on which a pipeline's short cuts can
+go wrong while the rules (rules.md) stay perfectly well defined. Lines in
+every shape and length a splitter or a decoder that works by position has to
+cope with, copies of events that disagree, IDs of every kind (for version 5 of
+the generator, whose IDs are opaque and one in eight is a letter and 32 hex
+digits: that long form and everything near it, for events, users and clicks),
+times on the edges of sessions and of lateness, links added and removed.
+
+For data of the generator's earlier versions (IDs are `e` + base 36 of a
+40-bit bijection of a dense index that a pipeline could decode) the event key
+is inferred and events are taken in index order; otherwise a person's events
+are taken in time order.
 
 The output keeps what the rules promise about the data: ingest_ts is a valid
-F1 timestamp, copies of an event with equal ingest_ts are identical, clicks are
-untouched, no value holds a comma, a quote or a newline.
+F1 timestamp, copies of an event with equal ingest_ts are identical, copies of
+a click are identical, no value holds a comma, a quote or a newline.
 
 Usage: mutate.py SEED IN_DIR OUT_DIR NAME[,NAME...]
        mutate.py list
@@ -251,7 +258,13 @@ class Data:
         if self.index:
             order = sorted(self.index, key=self.index.get)
         else:
-            order = list(self.groups)
+            # No index to go by (version 5 of the generator: IDs are opaque):
+            # a person's events together, in time order, the ones without a
+            # time last.
+            def place_of(eid):
+                when = self.time_of(eid)
+                return (self.person(self.user_of(eid)), when is None, when or 0, eid)
+            order = sorted(self.groups, key=place_of)
         self.order = order
         self.runs = []
         run, last_person, last_index = [], None, None
@@ -271,6 +284,54 @@ class Data:
         if not self.users:
             self.users = ["u1"]
         R.shuffle(self.users)
+
+    def load_clicks(self):
+        """The click lines as Lines of four values (None for a malformed one)."""
+        if self.clicks is None:
+            self.clicks = [Line(raw, split_fields(raw, 4), number)
+                           for number, (_, _, lines) in enumerate(self.click_files) for raw in lines]
+        return self.clicks
+
+    def campaigns(self):
+        """The campaign IDs of campaigns.csv."""
+        with open(os.path.join(self.in_dir, "campaigns.csv"), "rb") as f:
+            lines = f.read().decode("latin-1").split("\n")[1:]
+        return [line.split(",")[0].strip('"') for line in lines if line] or ["c_1"]
+
+    def all_users(self):
+        """Every user ID in events, clicks and links."""
+        taken = set(self.users)
+        for line in self.load_clicks():
+            if line.f:
+                taken.add(line.f[1])
+        for entry in self.links:
+            f = split_fields(entry[1], 2)
+            if f:
+                taken.update(f)
+        return taken
+
+    def rename_users(self, mapping):
+        """The users of `mapping` under their new names, in events, clicks and links."""
+        R = self.R
+        for line in self.events:
+            if line.f and line.f[1] in mapping:
+                line.f[1] = mapping[line.f[1]]
+                line.changed = True
+        for line in self.load_clicks():
+            if line.f and line.f[1] in mapping:
+                line.f[1] = mapping[line.f[1]]
+                line.changed = True
+        for entry in self.links:
+            f = split_fields(entry[1], 2)
+            if f and (f[0] in mapping or f[1] in mapping):
+                f = [mapping.get(v, v) for v in f]
+                entry[1] = ",".join('"' + v + '"' if R.random() < 0.3 else v for v in f)
+
+    def link(self, a, b):
+        """A link line, either side quoted or not, in a random file."""
+        if self.link_files:
+            R = self.R
+            self.links.append([R.randrange(len(self.link_files)), ",".join('"' + v + '"' if R.random() < 0.3 else v for v in (a, b))])
 
     def user_of(self, eid):
         lines = self.groups.get(eid, [])
@@ -463,6 +524,11 @@ def idbytes(D):
         user = D.user_of(eid)
         for twin in twins:
             if not twin or len(twin) > 12 or any(ch in twin for ch in ',"\n') or twin in D.groups:
+                continue
+            # MUTATE_SKIP=nultail leaves out IDs of at most 9 bytes that end in
+            # a NUL: a known defect (such an ID is taken for the ID without the
+            # NULs) hides whatever else a data set would show.
+            if "nultail" in os.environ.get("MUTATE_SKIP", "") and len(twin) <= 9 and twin.endswith("\x00"):
                 continue
             ms = min(D.we - 1, when + R.choice([0, 1000, 60_000, GAP, GAP + 1]))
             D.new_event(twin, user=R.choice([user, user, None]), ms=ms, kind=R.choice(["view", "cart", "purchase"]))
@@ -1219,11 +1285,15 @@ def stretches(D):
             seen.add((f[0], f[3]))
             mask = 127 if style == "quoted" else None
             if style == "longest":
-                # As long as a line can be for a splitter with two 64-byte
-                # windows (third comma at byte 63, newline 64 bytes on), and
+                # As long as a line can be for a splitter with 64-byte windows
+                # (third comma at the last byte of a window, the first one the
+                # line's IDs leave room for; newline 64 bytes on, or 128), and
                 # now and then a byte more on either side.
                 mask = quote_mask(R, 7)
-                place(f, mask, R.choice([63, 63, 63, 63, 62, 64]), R.choice([64, 64, 64, 64, 63, 65]))
+                head = len(f[0]) + len(f[1]) + 15 + 2 * bin(mask & 7).count("1")
+                comma = next((m - 1 for m in (64, 128, 192, 256, 320) if m - 1 >= head), None)
+                if comma is not None:
+                    place(f, mask, comma + R.choice([0, 0, 0, 0, -1, 1]), R.choice([64, 64, 64, 64, 63, 65, 128, 127, 129]))
             for twin in clusters.get(key, [line]):
                 twin.f = list(f)
                 twin.changed = True
@@ -1256,9 +1326,20 @@ def place(f, mask, comma3, newline_after):
                 f[5] = f[5] + "y" * (newline_after - rest)
 
 
+def near_mark(R, least):
+    """A byte count next to a multiple of 64 (three below it to three above),
+    not below `least`: mostly next to the first multiple there is room for,
+    else next to any up to 320. None if `least` is beyond them all."""
+    options = [m + d for m in (64, 128, 192, 256, 320) for d in (-3, -2, -1, 0, 1, 2, 3) if m + d >= least]
+    if not options:
+        return None
+    return R.choice(options[:7]) if R.random() < 0.6 else R.choice(options)
+
+
 def splitter(D):
     """For a splitter that works on 64-byte blocks, eight lines at a step:
-    the third comma of a line at byte 61 to 66, the newline 62 to 66 bytes
+    the third comma of a line next to a multiple of 64 (the first one the
+    line's IDs leave room for, or a later one), the newline as many bytes
     after it, quotes on either side of those marks; runs of empty and of one-
     to seven-byte lines (more than eight line ends inside one block) among
     ordinary lines; lines with no comma, five, seven; lines of 9,000 to 20,000
@@ -1279,8 +1360,11 @@ def splitter(D):
         if any(l.f != f for l in lines):
             continue
         mask = quote_mask(R, 7)
-        place(f, mask, R.choice([61, 62, 63, 64, 65, 66, 125, 126, 127, 128, 129]),
-              R.choice([61, 62, 63, 64, 65, 66, 67, 127, 128, 129]))
+        # What the line needs at least before its third comma (a ts of 13
+        # digits) and from there to its newline.
+        head = len(f[0]) + len(f[1]) + 15 + 2 * bin(mask & 7).count("1")
+        tail = len(f[3]) + len(f[4]) + len(f[5]) + len(f[6]) + 5 + 2 * bin(mask >> 3).count("1")
+        place(f, mask, near_mark(R, head), near_mark(R, tail))
         for line in lines:
             line.f = list(f)
             line.changed = True
@@ -1415,8 +1499,8 @@ def clicksplit(D):
         # (No more than 4,000 digits: Python's own limit for a number's text is
         # 4,300, and the reference reads a ts with int(). Longer lines are made
         # of long IDs below.)
-        want = R.choice([60, 61, 62, 63, 64, 65, 66, 126, 127, 128, 129]) if at >= 3 else R.randint(1500, 4000)
         other = len(f[0]) + len(f[1]) + len(f[2]) + 3 + 2 * bin(mask).count("1")
+        want = (near_mark(R, other + 13) or 0) if at >= 3 else R.randint(1500, 4000)
         if want - other >= len(str(ms)):
             f[3] = str(ms).zfill(want - other)
         for line in lines:
@@ -1543,12 +1627,456 @@ def endings(D):
     D.notes.append("endings")
 
 
+# ------------------------------------------------------------------ long IDs
+#
+# Version 5 of the generator writes one distinct ID in eight (events, users,
+# clicks) as its prefix letter and 32 lowercase hex digits: 33 bytes. The
+# rules know no such form: IDs are opaque strings that compare byte by byte.
+# A pipeline with a short cut for the 33-byte form must take exactly that
+# form by it and nothing that looks like it.
+
+HEX = "0123456789abcdef"
+
+
+def is_long(value, prefix=None):
+    return len(value) == 33 and (prefix is None or value[0] == prefix) and all(c in HEX for c in value[1:])
+
+
+def sayable(value):
+    """No comma, quote or newline: the rules promise that of every value."""
+    return bool(value) and not any(c in value for c in ',"\n')
+
+
+class Longs:
+    """IDs of the long form and their near misses. A hex part now and then
+    shares its first 8, 16, 24 or 31 digits with one made before, or its last
+    16 or 31, or all but one, or has its two halves the other way round: a
+    table that hashes a part of the ID has its collisions."""
+
+    def __init__(self, R, seeds=()):
+        self.R = R
+        self.made = list(seeds)[:40]
+
+    def hex(self):
+        R = self.R
+        fresh = "".join(R.choice(HEX) for _ in range(32))
+        r = R.random()
+        if r < 0.03:
+            fresh = R.choice(["0" * 32, "f" * 32, "0" * 31 + "1", "0" * 16 + "f" * 16, "f" * 16 + "0" * 16, "1" + "0" * 31,
+                              "8" + "0" * 31, "7" + "f" * 31, "0" * 15 + "1" + "0" * 16])
+        elif r < 0.08:
+            # One half of the digits all zeros (a table of 128-bit values may
+            # keep zero for "empty"), or all but a digit.
+            fresh = R.choice(["0" * 16 + fresh[16:], fresh[:16] + "0" * 16, "0" * 15 + fresh[15:], fresh[:17] + "0" * 15,
+                              "0" * 16 + fresh[16:], fresh[:16] + "0" * 16])
+        elif self.made and r < 0.45:
+            base = R.choice(self.made)
+            keep = R.choice(["first8", "first16", "first16", "first24", "first31", "last16", "last16", "last31", "one", "swap"])
+            if keep.startswith("first"):
+                n = int(keep[5:])
+                fresh = base[:n] + fresh[n:]
+            elif keep.startswith("last"):
+                n = int(keep[4:])
+                fresh = fresh[:32 - n] + base[32 - n:]
+            elif keep == "one":
+                at = R.randrange(32)
+                fresh = base[:at] + R.choice(HEX) + base[at + 1:]
+            else:
+                fresh = base[16:] + base[:16]
+        self.made.append(fresh)
+        if len(self.made) > 60:
+            del self.made[R.randrange(30)]
+        return fresh
+
+    def near(self, prefix, s=None, text=False):
+        """An ID one step from the long form `prefix + s` that is not that ID:
+        32 or 34 bytes, a last character that is no hex digit, upper case,
+        another first letter, a NUL, a byte that is not ASCII (`text`: valid
+        UTF-8 only, for IDs that reach the output), a space, the ID's
+        beginning. (The caller checks that it is new.)"""
+        R = self.R
+        s = s or self.hex()
+        at = R.randrange(32)
+        kind = R.choice(["len32", "len32", "len34", "len34", "last", "last", "upper", "upper", "upper1", "prefix", "prefix",
+                         "prefixup", "nul", "nul", "utf8", "high", "odd", "flip", "space", "short", "short", "zero"])
+        if kind == "high" and text:
+            kind = "utf8"
+        if kind == "len32":
+            return prefix + R.choice([s[:31], s[1:]])
+        if kind == "len34":
+            return prefix + R.choice([s + R.choice(HEX), R.choice(HEX) + s, s + "0"])
+        if kind == "last":
+            return prefix + s[:31] + R.choice("gAF GZz:/`@")
+        if kind == "upper":
+            return prefix + s.upper()
+        if kind == "upper1":
+            letters = [i for i, c in enumerate(s) if c in "abcdef"]
+            if not letters:
+                return prefix + s[:31] + "A"
+            i = R.choice(letters)
+            return prefix + s[:i] + s[i].upper() + s[i + 1:]
+        if kind == "prefix":
+            return R.choice([c for c in "euk" if c != prefix] + ["x", "0", "g", "\x00"]) + s
+        if kind == "prefixup":
+            return prefix.upper() + s
+        if kind == "nul":
+            return prefix + s[:at] + "\x00" + s[at + 1:]
+        if kind == "utf8":
+            at = min(at, 30)
+            return prefix + s[:at] + "\xc3\xa9" + s[at + 2:]            # still 33 bytes
+        if kind == "high":
+            return prefix + s[:at] + R.choice(["\x80", "\xff", "\xe9", chr(ord(s[at]) | 0x80)]) + s[at + 1:]
+        if kind == "odd":
+            return prefix + s[:at] + R.choice("gG:/`@ xz-_.") + s[at + 1:]
+        if kind == "flip":
+            return prefix + s[:at] + chr(ord(s[at]) ^ R.choice([0x20, 0x40, 0x10])) + s[at + 1:]
+        if kind == "space":
+            return R.choice([prefix + s + " ", " " + prefix + s, prefix + " " + s, prefix + s + "\t"])
+        if kind == "short":
+            return prefix + s[:R.choice([1, 2, 7, 8, 9, 15, 16, 17, 24])]
+        return prefix + R.choice(["0" + s, s[:16], s[16:], s[:16] + s[:16]])
+
+
+def relatives(L, value):
+    """IDs that sort right next to `value`, on either side: its beginning, the
+    ID and more, another case, another last character, the same first 8, 16
+    or 31 digits. (Which of two IDs is the smaller, byte by byte, names a
+    person and settles a tie between clicks.)"""
+    R = L.R
+    out = []
+    if len(value) > 2:
+        out.append(value[:R.randrange(2, len(value))])
+        out.append(value[:-1])
+    out.append(value + R.choice(["0", "a", "f", "\x00", " ", "0" * 8]))
+    out.append(value[0] + value[1:].upper())
+    out.append(value[0].upper() + value[1:])
+    out.append(value[:-1] + R.choice(HEX + "gz"))
+    letters = [i for i, c in enumerate(value) if i and c.isalpha() and c.islower()]
+    if letters:
+        i = R.choice(letters)
+        out.append(value[:i] + value[i].upper() + value[i + 1:])
+    if is_long(value):
+        fresh = "".join(R.choice(HEX) for _ in range(32))
+        out += [value[:9] + fresh[8:], value[:17] + fresh[16:], value[:17] + fresh[16:], value[:32] + R.choice(HEX),
+                value[0] + fresh[:16] + value[17:], value[:R.choice([2, 8, 9, 10, 17])],
+                # A short ID that is the long one's first eight digits, or next to them.
+                value[:9], value[:9], value[:8] + R.choice(HEX + "gz"), value[:8] + chr(ord(value[8]) + 1),
+                value[:8] + chr(ord(value[8]) - 1), value[:9] + "0"]
+    else:
+        out += [value[0] + L.hex(), (value + L.hex())[:33], value + L.hex()]
+    return [v for v in out if v != value and sayable(v)]
+
+
+def broken(R, value):
+    """A field that holds `value` with a quote where no quote may be: the
+    whole line is malformed by the rules. (A reader of standard CSV takes a
+    doubled quote inside a quoted field for a quote in the value.)"""
+    at = R.randrange(1, len(value)) if len(value) > 1 else 0
+    return R.choice([
+        '"' + value[:at] + '""' + value[at:] + '"',     # a doubled quote inside quotes
+        '"' + value + '""',                              # ... at the end
+        '""' + value + '"',                              # ... at the start
+        value[:-1] + '"',                                # a quote for the last character
+        value + '"', '"' + value,                        # closed, never opened; opened, never closed
+        value[:at] + '"' + value[at:],                   # a quote inside
+        '"' + value[:at] + '"' + value[at:] + '"',       # quoted, with a quote inside
+        value[:at] + '""' + value[at:],                  # a doubled quote without quotes around
+    ])
+
+
+def longusers(D):
+    """Users under IDs of the long form and its near misses, everywhere alike
+    (events, clicks, both sides of links): the same people under other names.
+    Then people with more names than one: a long ID linked to a short one,
+    either way round and to itself; the beginning of an ID (which sorts before
+    it), the ID and more (after it), the ID in upper case (before every lower-
+    case one), linked to it, so that the smallest, which the output reports,
+    is now a long one and now a short one; some of the new names with rows of
+    their own."""
+    R = D.R
+    L = Longs(R, [u[1:] for u in D.users if is_long(u, "u")])
+    taken = D.all_users()
+    # A fifth of the users; now and then all of them (most IDs long: a table
+    # sized for the usual share of long IDs runs full).
+    share = R.choice([5, 5, 5, 5, 2, 1])
+    chosen = R.sample(D.users, min(len(D.users), max(40, len(D.users) // share)))
+    mapping = {}
+    before = None
+    # Now and then a family: tens or hundreds of users whose long IDs have the
+    # same first 16 digits, or the same last 16, or differ in one digit.
+    family = R.choice([0, 0, 50, 200, 600])
+    stem = L.hex()
+    style = R.choice(["first16", "first16", "last16", "one", "first24"])
+    for number, user in enumerate(chosen):
+        r = R.random()
+        if number < family:
+            fresh = "".join(R.choice(HEX) for _ in range(32))
+            at = R.randrange(32)
+            new = "u" + {"first16": stem[:16] + fresh[16:], "last16": fresh[:16] + stem[16:], "first24": stem[:24] + fresh[24:],
+                         "one": stem[:at] + R.choice(HEX) + stem[at + 1:]}[style]
+        elif before is None or r < 0.35:
+            new = "u" + L.hex()
+        elif r < 0.60:
+            new = R.choice(relatives(L, before))
+        else:
+            new = L.near("u", text=True)
+        if not sayable(new) or new in taken:
+            continue
+        taken.add(new)
+        mapping[user] = new
+        if is_long(new, "u"):
+            before = new
+    D.rename_users(mapping)
+    users = [mapping.get(u, u) for u in D.users]
+    aliases = 0
+    for name in R.sample(users, min(len(users), max(40, len(users) // 8))):
+        for _ in range(R.choice([1, 1, 2, 3])):
+            r = R.random()
+            if r < 0.25:
+                alias = "u" + L.hex()
+            elif r < 0.75:
+                alias = R.choice(relatives(L, name))
+            elif is_long(name, "u"):
+                alias = L.near("u", name[1:], text=True)
+            else:
+                alias = L.near("u", text=True)
+            if not sayable(alias) or alias == name:
+                continue
+            if R.random() < 0.5:
+                D.link(alias, name)
+            else:
+                D.link(name, alias)
+            if R.random() < 0.2:
+                D.link(alias, alias)
+            if R.random() < 0.15:
+                D.link(name, alias)
+            if R.random() < 0.3 and alias not in taken:
+                D.new_event("e" + L.hex(), user=alias)
+            taken.add(alias)
+            aliases += 1
+    # Now and then thousands of long IDs that no row uses, linked in pairs, in
+    # chains, to people who have rows: a table for long IDs fills up with them.
+    flood = R.choice([0, 0, 0, 500, 5000, 30000]) if D.link_files else 0
+    last = None
+    for _ in range(flood):
+        fresh = "u" + "".join(R.choice(HEX) for _ in range(32))
+        r = R.random()
+        D.links.append([R.randrange(len(D.link_files)), f"{fresh},{last}" if last and r < 0.5 else
+                        f"{R.choice(users)},{fresh}" if r < 0.6 else f"{fresh},u" + "".join(R.choice(HEX) for _ in range(32))])
+        last = fresh
+    # Link lines that are malformed by a quote in a long ID: they join nobody.
+    # (Taken as links they would join two people who both have rows.)
+    bad = 0
+    if D.link_files and len(users) > 1:
+        for _ in range(R.randint(10, 60)):
+            a, b = R.sample(users, 2)
+            if is_long(a, "u") or is_long(b, "u") or R.random() < 0.3:
+                sides = [broken(R, a), b] if R.random() < 0.5 else [a, broken(R, b)]
+                D.links.append([R.randrange(len(D.link_files)), ",".join(sides)])
+                bad += 1
+    D.notes.append(f"longusers {len(mapping)} renamed ({min(family, len(chosen))} in a family), {aliases} aliases, "
+                   f"{flood} unused, {bad} malformed links")
+
+
+def longevents(D):
+    """Event IDs of the long form and its near misses. Events renamed (all
+    copies alike); twins of long IDs, each a new event one step away from an
+    existing one (32 or 34 bytes, one character that is no lowercase hex
+    digit, another case, another first letter, the same first 8, 16 or 31
+    digits), so that a pipeline which takes the twin for the original loses an
+    event; families of hundreds of IDs with the same first 16 digits, the same
+    last 16, or one digit apart; copies of long-ID events under another user,
+    and an earlier copy with a bad ts that takes the event away."""
+    R = D.R
+    L = Longs(R, [e[1:] for e in list(D.groups)[:400] if is_long(e, "e")])
+    ids = [e for e in D.groups if e]
+    R.shuffle(ids)
+    names = set(D.groups)
+    lines_of = dict(D.groups)
+    renamed = 0
+    for eid in ids[:max(40, len(ids) // 10)]:
+        new = "e" + L.hex() if R.random() < 0.5 else L.near("e")
+        if not sayable(new) or new in names:
+            continue
+        names.add(new)
+        for line in lines_of[eid]:
+            line.f[0] = new
+            line.changed = True
+        lines_of[new] = lines_of.pop(eid)
+        renamed += 1
+
+    def first_of(eid):
+        return min(lines_of[eid], key=lambda l: l.f[3])
+
+    def time_of(eid):
+        ms = parse_ts(first_of(eid).f[2])
+        return ms if ms is not None and D.ws <= ms < D.we else None
+
+    def add(eid, user, ms, kind=None):
+        names.add(eid)
+        return D.new_event(eid, user=user, ms=ms, kind=kind)
+
+    longs = [e for e in lines_of if is_long(e, "e") and time_of(e) is not None]
+    R.shuffle(longs)
+    twins = 0
+    for eid in longs[:max(60, len(longs) // 5)]:
+        when, user = time_of(eid), first_of(eid).f[1]
+        options = relatives(L, eid) + [L.near("e", eid[1:]) for _ in range(4)]
+        for twin in R.sample(options, R.choice([1, 1, 2, 3])):
+            if not sayable(twin) or twin in names:
+                continue
+            add(twin, R.choice([user, user, None]), min(D.we - 1, when + R.choice([0, 1000, 60_000, GAP, GAP + 1])),
+                R.choice(["view", "cart", "purchase"]))
+            twins += 1
+    families = 0
+    for _ in range(R.randint(1, 3)):
+        stem = L.hex()
+        style = R.choice(["first16", "first16", "last16", "first31", "one", "first8"])
+        users = R.sample(D.users, min(len(D.users), R.choice([1, 3, 40])))
+        start = D.ws + R.randrange(max(1, (D.we - D.ws) // 1000 - 7200)) * 1000
+        for k in range(R.choice([20, 64, 150, 400])):
+            fresh = "".join(R.choice(HEX) for _ in range(32))
+            if style == "first16":
+                new = stem[:16] + fresh[16:]
+            elif style == "last16":
+                new = fresh[:16] + stem[16:]
+            elif style == "first31":
+                new = stem[:31] + HEX[k % 16] if k < 16 else stem[:30] + fresh[30:]
+            elif style == "one":
+                at = R.randrange(32)
+                new = stem[:at] + R.choice(HEX) + stem[at + 1:]
+            else:
+                new = stem[:8] + fresh[8:]
+            new = "e" + new
+            if new in names:
+                continue
+            add(new, R.choice(users), min(D.we - 1, start + R.choice([k * 1000, k * 60_000, R.randrange(7_200_000)])))
+        families += 1
+    copies_made = 0
+    for eid in longs[:max(30, len(longs) // 10)]:
+        first = first_of(eid)
+        used = {l.f[3] for l in lines_of[eid]}
+        for _ in range(R.choice([1, 1, 2])):
+            copy = list(first.f)
+            r = R.random()
+            if r < 0.15:
+                D.add_event(copy)                                   # an identical copy
+                continue
+            stamp = parse_ts(first.f[3]) + R.choice([-600, -1, 1, 60, 600]) * 1000
+            if f1(stamp) in used:
+                continue
+            used.add(f1(stamp))
+            copy[3] = f1(stamp)
+            if r < 0.55:
+                copy[1] = R.choice(D.users)                         # another user: counts only if it is the earlier copy
+            elif r < 0.85:
+                copy[2] = R.choice(BAD_TS)                          # earlier and bad: the event is gone
+            D.add_event(copy)
+            copies_made += 1
+    # Lines that are malformed by a quote in a long event ID: an earlier copy
+    # of a real event, which would take its place (under another user) if it
+    # were read; or a line of its own, which would be one event more.
+    bad = 0
+    for eid in longs[:max(30, len(longs) // 10)]:
+        first = first_of(eid)
+        copy = list(first.f)
+        copy[1] = R.choice(D.users)
+        copy[3] = f1(parse_ts(first.f[3]) - R.choice([1, 60, 3600]) * 1000)
+        copy[0] = broken(R, eid if R.random() < 0.6 else "e" + L.hex())
+        line = D.add_event(copy)
+        line.f = None
+        line.raw = ",".join(copy)
+        bad += 1
+    D.notes.append(f"longevents {renamed} renamed, {twins} twins, {families} families, {copies_made} copies, {bad} malformed")
+
+
+def longclicks(D):
+    """Click IDs of the long form and its near misses (all copies of a click
+    alike), and ties: at the very millisecond of an existing click, the same
+    person's click for another campaign, under an ID that sorts right next to
+    the first one's: long against long (same first 8, 16, 31 digits), long
+    against its own beginning, short against short, a change of case. The
+    smallest click_id, byte by byte, takes the session. Some ties are put at
+    the exact time of an event, where a session may start."""
+    R = D.R
+    clicks = D.load_clicks()
+    campaigns = D.campaigns()
+    groups = {}
+    for line in clicks:
+        if line.f and line.f[0]:
+            groups.setdefault(line.f[0], []).append(line)
+    L = Longs(R, [c[1:] for c in list(groups)[:400] if is_long(c, "k")])
+    ids = list(groups)
+    R.shuffle(ids)
+    names = set(ids)
+    renamed = 0
+    for cid in ids[:max(40, len(ids) // 8)]:
+        new = "k" + L.hex() if R.random() < 0.5 else L.near("k")
+        if not sayable(new) or new in names:
+            continue
+        names.add(new)
+        for line in groups[cid]:
+            line.f[0] = new
+            line.changed = True
+        groups[new] = groups.pop(cid)
+        renamed += 1
+    if not D.click_files:
+        D.notes.append("longclicks: no click files")
+        return
+
+    def add(cid, user, campaign, ts):
+        names.add(cid)
+        line = Line(None, [cid, user, campaign, ts], R.randrange(len(D.click_files)))
+        line.changed = True
+        clicks.insert(R.randrange(len(clicks) + 1), line)
+
+    def mate(user):
+        """The user, or another ID of the same person."""
+        return R.choice(D.aliases.get(D.person(user), [user]) + [user, user])
+
+    valid = [c for c, lines in groups.items() if lines[0].f[1] and parse_ts(lines[0].f[3]) is not None
+             and all(l.f == lines[0].f for l in lines)]
+    R.shuffle(valid)
+    ties = 0
+    for cid in valid[:max(80, len(valid) // 8)]:
+        f = groups[cid][0].f
+        options = relatives(L, cid)
+        for other in R.sample(options, min(len(options), R.choice([1, 1, 2, 3]))):
+            if other in names:
+                continue
+            add(other, mate(f[1]), R.choice(campaigns), same_instant(D, f[3]))
+            ties += 1
+    starts = 0
+    for run in D.some_runs(max(40, len(D.runs) // 10), least=1):
+        eid = R.choice(run)
+        when, user = D.time_of(eid), D.user_of(eid)
+        if when is None or not user:
+            continue
+        base = R.choice(["k" + L.hex(), "k" + L.hex(), "k" + "".join(R.choice(DIGITS) for _ in range(R.randint(1, 8)))])
+        family = [base] + R.sample(relatives(L, base), R.choice([1, 2, 3]))
+        for cid in family:
+            if cid in names:
+                continue
+            add(cid, mate(user), R.choice(campaigns), R.choice([str(when), same_instant(D, str(when))]))
+            starts += 1
+    # Lines that are malformed by a quote in a long click ID, at the time of a
+    # real click and for another campaign: read as clicks, they would be in
+    # the tie (a quote sorts before every letter and digit).
+    bad = 0
+    for cid in valid[:max(30, len(valid) // 20)]:
+        f = groups[cid][0].f
+        text = ",".join([broken(R, cid if is_long(cid, "k") and R.random() < 0.6 else "k" + L.hex()), f[1], R.choice(campaigns), f[3]])
+        clicks.insert(R.randrange(len(clicks) + 1), Line(text, None, R.randrange(len(D.click_files))))
+        bad += 1
+    D.notes.append(f"longclicks {renamed} renamed, {ties} ties, {starts} at event times, {bad} malformed")
+
+
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
                                      splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles,
-                                     idbytes]}
+                                     idbytes, longusers, longevents, longclicks]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
-           "idbytes", "idbytes",
+           "idbytes", "idbytes", "longusers", "longusers", "longevents", "longevents", "longclicks", "longclicks",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
            "splitter", "splitter", "clicksplit", "clicksplit", "interleave", "endings"]
 

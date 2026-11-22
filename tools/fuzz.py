@@ -76,6 +76,71 @@ def main():
               "user_id", "u1\r", "éé"]
     R.shuffle(users)
 
+    # FUZZ_IDS=long: IDs of the form version 5 of the generator gives one ID in
+    # eight (the prefix letter and 32 lowercase hex digits, 33 bytes), for
+    # events, users and clicks, and the IDs that must not be taken for it: 32
+    # and 34 bytes, a character that is no lowercase hex digit, upper case,
+    # another first letter, a NUL, a character that is not ASCII, a space;
+    # long IDs with the same first 8, 16, 24 or 31 digits, the same last 16,
+    # one digit apart; an ID and its own beginning (which sorts before it).
+    # (Without it, nothing here draws from R.)
+    longs = os.environ.get("FUZZ_IDS") == "long"
+    HEX = "0123456789abcdef"
+    hexes = []
+
+    def hex32():
+        fresh = "".join(R.choice(HEX) for _ in range(32))
+        r = R.random()
+        if r < 0.03:
+            fresh = R.choice(["0" * 32, "f" * 32, "0" * 31 + "1", "0" * 16 + "f" * 16, "f" * 16 + "0" * 16, "1" + "0" * 31])
+        elif hexes and r < 0.45:
+            base = R.choice(hexes)
+            n = R.choice([8, 16, 16, 24, 31])
+            how = R.randrange(4)
+            if how < 2:
+                fresh = base[:n] + fresh[n:]
+            elif how == 2:
+                fresh = fresh[:32 - n] + base[32 - n:]
+            else:
+                at = R.randrange(32)
+                fresh = base[:at] + R.choice(HEX) + base[at + 1:]
+        hexes.append(fresh)
+        return fresh
+
+    def near_long(prefix, s=None):
+        s = s or hex32()
+        at = R.randrange(30)
+        return R.choice([
+            prefix + s[:31], prefix + s[1:], prefix + s + R.choice(HEX), prefix + "0" + s,
+            prefix + s[:31] + R.choice("gAF Zz:/`@"), prefix + s.upper(), prefix + s[:at] + s[at:at + 1].upper() + s[at + 1:],
+            R.choice([c for c in "eukx0" if c != prefix]) + s, prefix.upper() + s,
+            prefix + s[:at] + "\x00" + s[at + 1:], prefix + s[:at] + "é" + s[at + 2:], prefix + s[:at] + R.choice("gG:/`@ _") + s[at + 1:],
+            prefix + s + " ", " " + prefix + s, prefix + s[:R.choice([1, 2, 7, 8, 9, 15, 16, 17])], prefix + s[:16] + s[:16],
+        ])
+
+    def related(x):
+        """An ID that sorts next to `x`: its beginning, the ID and more,
+        another case, another last character, the same first digits."""
+        options = [x + R.choice(["0", "a", " ", "f" * 8]), x[:1] + x[1:].upper(), x[:1].upper() + x[1:],
+                   x[:-1] + R.choice(HEX + "gz"), x[:1] + hex32()]
+        if len(x) > 2:
+            options += [x[:R.randrange(2, len(x))], x[:-1]]
+        if len(x) == 33:
+            fresh = "".join(R.choice(HEX) for _ in range(32))
+            options += [x[:9] + fresh[8:], x[:17] + fresh[16:], x[:17] + fresh[16:], x[:32] + R.choice(HEX)]
+        return R.choice(options)
+
+    if longs:
+        for i in range(len(users)):
+            r = R.random()
+            if r < 0.30:
+                users[i] = "u" + hex32()
+            elif r < 0.42:
+                users[i] = near_long("u")
+        for u in [u for u in users if len(u) == 33][::3]:
+            users.append(related(u))
+        R.shuffle(users)
+
     def user():
         r = R.random()
         if r < 0.02:
@@ -142,6 +207,14 @@ def main():
     def new_eid():
         nonlocal eid
         eid += 1
+        if longs:
+            r = R.random()
+            if r < 0.30:
+                return "e" + hex32()
+            if r < 0.42:
+                return near_long("e")
+            if r < 0.50 and events:
+                return related(R.choice(events[-20:])[0] or "e1")
         if dense:
             r = R.random()
             if r < 0.80:
@@ -264,6 +337,8 @@ def main():
         r = R.random()
         cid = "k" + reg("", R.choice([1, 2, 7, 8, 8])) if r < 0.9 else R.choice(
             [f"K{kid}", f"k{kid} ", f"k_{kid}", f"k{kid:012d}", "k", f"é{kid}", f" k{kid}"])
+        if longs and R.random() < 0.45:
+            cid = "k" + hex32() if R.random() < 0.7 else near_long("k")
         u = R.choice(users) if R.random() < 0.85 else user()
         base = ws + R.randrange(max(1, wlen // 1000)) * 1000
         delta = R.choice([0, 1, -1, 7 * DAY, 7 * DAY + 1, 7 * DAY - 1, 1000, 3600_000, 2 * DAY, 6 * DAY, 8 * DAY])
@@ -281,10 +356,27 @@ def main():
             kid += 1
             cid2 = "k" + reg("", R.choice([1, 2, 8])) if R.random() < 0.8 else f"K{kid}"
             clicks.setdefault(cid2, [cid2, u, R.choice(list(campaigns)), tsf if R.random() < 0.8 else good_ts(ms)])
+        if longs and R.random() < 0.35:
+            # ties between IDs that sort next to each other: the same person at
+            # the same millisecond, another campaign; the smallest ID wins
+            for _ in range(R.randint(1, 3)):
+                cid3 = related(cid)
+                if cid3:
+                    clicks.setdefault(cid3, [cid3, u, R.choice(list(campaigns)), tsf])
 
     # ---- links: trees, chains, stars, repeats, self-links, dirt
     links = []
     pool = users + [reg("u", 8) for _ in range(len(users) // 3)]
+    if longs:
+        # long IDs nobody uses in a row, near misses, and people named by an
+        # ID next to another of theirs: either way round, and linked to itself
+        pool += ["u" + hex32() for _ in range(len(users) // 4)] + [near_long("u") for _ in range(len(users) // 6)]
+        for a in R.sample(users, len(users) // 3):
+            b = related(a)
+            if a and b:
+                links.append([a, b] if R.random() < 0.5 else [b, a])
+                if R.random() < 0.2:
+                    links.append([b, b])
     for _ in range(len(users) // 2):
         a, b = R.choice(pool), R.choice(pool)
         links.append([a, b])
