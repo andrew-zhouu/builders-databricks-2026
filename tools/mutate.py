@@ -216,6 +216,8 @@ class Data:
         self.key = None
         self.identity = False
         self.endings = False
+        self.file_bytes = {}        # events file number -> the exact size it is written at (`onefile`)
+        self.straddle = None        # (events file number, style): what lies across byte 524,288 (`front`)
         self.prepare()
 
     # -- what the mutations need to know about the data
@@ -2332,6 +2334,186 @@ def grouping(D):
     D.notes.append("grouping " + "; ".join(notes))
 
 
+def linkstorm(D):
+    """Hundreds of thousands of link lines: every user of the events gets a
+    chain of 5 to 40 new IDs behind it (each linked to the one before, lines
+    in random order and direction), and users are joined in groups of 2 to
+    30 (people of many IDs, deep trees before any path is shortened). The
+    links then take a pipeline many times longer to read than usual: long
+    enough for whatever else it does at the same time to meet them."""
+    R = D.R
+    if not D.link_files:
+        D.notes.append("linkstorm: no link files")
+        return
+    want = int(os.environ.get("MUTATE_LINKS", "0")) or R.choice([100_000, 300_000, 600_000])
+    users = list(D.users)
+    R.shuffle(users)
+    taken = D.all_users()
+    lines = []
+    serial = 0
+
+    def fresh():
+        nonlocal serial
+        while True:
+            serial += 1
+            new = "u" + base36(serial).rjust(4, "w") + "".join(R.choice(DIGITS) for _ in range(4))
+            if new not in taken:
+                taken.add(new)
+                return new
+
+    at = 0
+    while len(lines) < want and users:
+        user = users[at % len(users)]
+        at += 1
+        chain = [user] + [fresh() for _ in range(R.randint(5, 40))]
+        lines += list(zip(chain, chain[1:]))
+        # ... and the user joined to the next few users, now and then.
+        if R.random() < 0.3:
+            for k in range(R.randint(1, 29)):
+                lines.append((user, users[(at + k) % len(users)]))
+    R.shuffle(lines)
+    files = len(D.link_files)
+    for a, b in lines:
+        if R.random() < 0.5:
+            a, b = b, a
+        D.links.append([R.randrange(files), f"{a},{b}"])
+    D.notes.append(f"linkstorm {len(lines)} links")
+
+
+REGION = 1 << 19        # a pipeline's trial run reads the first 512 KB of the largest events file
+LIMIT = 8 * REGION      # ... if that file has at least this many bytes
+
+
+def onefile(D):
+    """All event lines in one events file (the other files keep their header
+    only): a file of many megabytes, like the largest of a real data set,
+    which the generator's small sets never have. A pipeline that tries
+    something out on the head of its largest events file (if that file is
+    large enough) does so only then. Now and then the file is written at an
+    exact size instead, at the limit of 4 MiB, a byte or a block under it and
+    over it (the lines that do not fit go to the other files, a few malformed
+    lines fill the last bytes), or two or three files get the same size.
+    Put it after the mutations that change lines, and before `front`."""
+    R = D.R
+    if not D.event_files:
+        return
+    sizes = {}
+    for line in D.events:
+        sizes[line.file] = sizes.get(line.file, 0) + 1
+    big = max(sizes, key=sizes.get) if sizes else 0
+    total = 0
+    for line in D.events:
+        if line.members is None:
+            total += (len(line.raw) if line.raw is not None and not line.changed else sum(len(v) for v in (line.f or [])) + 8) + 1
+        line.file = big
+    style = R.choice(["all", "all", "all", "at", "at", "at", "equal"])
+    note = "all in one"
+    D.file_bytes = {}
+    if style == "at" and total > LIMIT * 0.9:
+        D.file_bytes[big] = LIMIT + R.choice([0, 0, 1, -1, -1, 2, 64, -64, 100, -100, 4096, -4096, REGION, -REGION])
+        note = f"largest file written at {D.file_bytes[big]} bytes"
+    elif style == "equal" and len(D.event_files) >= 3:
+        count = R.choice([2, 3])
+        size = R.choice([LIMIT, LIMIT + 1, LIMIT - 1, 5_000_000, total // count - 1000])
+        if total > count * size * 0.95 and size > 100_000:
+            others = [n for n in range(len(D.event_files)) if n != big]
+            for number in [big] + R.sample(others, count - 1):
+                D.file_bytes[number] = size
+            note = f"{count} files written at {size} bytes each"
+    D.notes.append(f"onefile: {note} (about {total} bytes of events)")
+
+
+def front(D):
+    """What a pipeline's trial run on the first 512 KB of the largest events
+    file meets, and may leave behind (users in its tables, records where they
+    do not belong): the lines of that file in another order, which changes
+    nothing in the answer, so that its head is all lines with long users, or
+    all purchases, or all users that are neither regular nor long, or the
+    longest lines, or the lines that are malformed / have a bad ts / are
+    copies, or event IDs with a NUL or of odd lengths, or users that occur in
+    links, or one user's lines (with identical copies of them until they fill
+    the head), or nothing but lines that are no events. And a chosen thing at
+    byte 524,288: a line that starts exactly there, one byte before, one that
+    ends exactly there, or a line of 9,000 to 20,000 bytes across it."""
+    R = D.R
+    sizes = {}
+    for at, line in enumerate(D.events):
+        if line.members is None and not line.held and not line.gone:
+            sizes.setdefault(line.file, []).append(at)
+    if not sizes:
+        return
+    target = max(sizes, key=lambda n: len(sizes[n]))
+    places = sizes[target]
+    lines = [D.events[at] for at in places]
+    linked = set()
+    for _, raw in D.links:
+        f = split_fields(raw, 2)
+        if f:
+            linked.update(f)
+    copies = {}
+    for line in lines:
+        if line.f:
+            copies[line.f[0]] = copies.get(line.f[0], 0) + 1
+
+    def regular(user):
+        return 2 <= len(user) <= 9 and user[0] == "u" and all(0 < ord(c) < 128 for c in user[1:])
+
+    def size(line):
+        return len(line.raw) if line.raw is not None and not line.changed else sum(len(v) for v in (line.f or [])) + 6
+
+    style = R.choice(["long", "purchases", "irregular", "longest", "odd", "ids", "linked", "whale", "junk", "junk", "purchases", "irregular"])
+    style = os.environ.get("MUTATE_FRONT") or style        # (to ask for one of them)
+    extra = []
+    if style == "long":
+        lines.sort(key=lambda l: (not (l.f and len(l.f[1]) == 33), not (l.f and len(l.f[0]) == 33)))
+    elif style == "purchases":
+        lines.sort(key=lambda l: not (l.f and l.f[4] == "purchase"))
+    elif style == "irregular":
+        lines.sort(key=lambda l: bool(l.f) and (regular(l.f[1]) or is_long(l.f[1], "u")))
+    elif style == "longest":
+        lines.sort(key=size, reverse=True)
+    elif style == "odd":
+        lines.sort(key=lambda l: (l.f is not None, bool(l.f) and parse_ts(l.f[2]) is not None, bool(l.f) and copies.get(l.f[0], 0) < 2))
+    elif style == "ids":
+        lines.sort(key=lambda l: not (l.f and ("\x00" in l.f[0] or len(l.f[0]) not in (33,) + tuple(range(2, 10)))))
+    elif style == "linked":
+        lines.sort(key=lambda l: not (l.f and l.f[1] in linked))
+    elif style == "whale":
+        count = {}
+        for line in lines:
+            if line.f and line.f[1]:
+                count[line.f[1]] = count.get(line.f[1], 0) + 1
+        if count:
+            whale = max(count, key=count.get)
+            lines.sort(key=lambda l: not (l.f and l.f[1] == whale))
+            own = [l for l in lines if l.f and l.f[1] == whale]
+            have = sum(size(l) + 1 for l in own)
+            # Identical copies (the same values, the same ingest_ts) until the head is full.
+            while own and have < REGION + 100_000:
+                source = R.choice(own)
+                copy = Line(source.raw, list(source.f), target)
+                copy.changed, copy.quotes = source.changed, source.quotes
+                extra.append(copy)
+                have += size(source) + 1
+    else:
+        model = next((l.f for l in lines if l.f and l.f[0]), None) or ["e1", "u1", "0", "2026-01-01T00:00:00Z", "view", "p1", ""]
+        body = ",".join(model)
+        have = 0
+        while have < REGION + R.choice([100_000, 600_000]):
+            text = R.choice(["", ",,,,,,", '"",' + ",".join(model[1:]), "," + ",".join(model[1:]), body + ",x", body.rsplit(",", 1)[0],
+                             '"' + body, body + '"', "x" * R.randint(1, 250), body.replace(",", ";"), ",".join(model[:3]),
+                             '"' + model[0] + '""' + "," + ",".join(model[1:]), ",,,,,,,", "a,b"])
+            extra.append(Line(text, None, target))
+            have += len(text) + 1
+    for at, line in zip(places, lines):
+        D.events[at] = line
+        line.new = False
+    if extra:
+        D.events[places[0]:places[0]] = extra
+    D.straddle = (target, R.choice(["none", "exact", "exact", "one before", "ends there", "long", "long"]))
+    D.notes.append(f"front: {style} first in file {target} ({len(extra)} lines added), at byte {REGION}: {D.straddle[1]}")
+
+
 def numbers(D):
     """Timestamps and prices as numbers, for a decoder that turns digits into
     values several lines at a time (multiplications by powers of ten in lanes,
@@ -2637,7 +2819,8 @@ def longlinks(D):
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
                                      splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles,
-                                     idbytes, longusers, longevents, longclicks, windows, grouping, longlinks, numbers]}
+                                     idbytes, longusers, longevents, longclicks, windows, grouping, longlinks, numbers,
+                                     onefile, front, linkstorm]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
            "idbytes", "idbytes", "longusers", "longusers", "longevents", "longevents", "longclicks", "longclicks",
            "windows", "windows", "grouping", "grouping", "longlinks", "longlinks", "numbers", "numbers",
@@ -2705,6 +2888,47 @@ def write(D, out_dir):
                 elif not member.gone:
                     emit(member, out)
         texts.append(out)
+
+    def head(number):
+        return len(D.event_files[number][1] or EVENT_HEADER) + 1
+
+    def filler(lines, at, gap):
+        """Lines that are no events, `gap` bytes in all with their newlines, at place `at`."""
+        while gap > 0:
+            k = min(gap, R.randint(1, 250))
+            lines.insert(at, "x" * (k - 1))
+            at += 1
+            gap -= k
+
+    # `front`: what lies at byte 524,288 of the file.
+    if D.straddle and D.straddle[1] != "none" and D.straddle[0] < len(texts):
+        number, style = D.straddle
+        lines = texts[number]
+        pos, at = head(number), 0
+        while at < len(lines) and pos + len(lines[at]) + 1 <= REGION:
+            pos += len(lines[at]) + 1
+            at += 1
+        if at < len(lines):
+            # Line `at` starts at `pos`, at the mark or before it, and ends after it.
+            if style == "long":
+                lines.insert(at, "x" * R.randint(9000, 20000) if R.random() < 0.5 else lines[at] + "," + "y" * R.randint(9000, 20000))
+            else:
+                filler(lines, at, REGION - pos + {"exact": 0, "one before": -1, "ends there": 1}[style])
+    # `onefile`: files of an exact size. What does not fit goes to the other
+    # files, from the end; what is missing is made up of lines that are no events.
+    for number, target in D.file_bytes.items():
+        if number >= len(texts):
+            continue
+        lines = texts[number]
+        size = head(number) + sum(len(l) + 1 for l in lines)
+        others = [n for n in range(len(texts)) if n not in D.file_bytes]
+        moved = 0
+        while size > target and lines and others:
+            last = lines.pop()
+            texts[others[moved % len(others)]].append(last)
+            moved += 1
+            size -= len(last) + 1
+        filler(lines, len(lines), target - size)
     if not D.drop_event_files:
         for (name, header, _), lines in zip(D.event_files, texts):
             with open(os.path.join(out_dir, "events", name), "wb") as f:

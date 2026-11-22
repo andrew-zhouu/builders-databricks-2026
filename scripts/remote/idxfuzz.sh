@@ -23,6 +23,10 @@
 #        SETTINGS=v5w    version 5 with the wide parser on by default: default, the base path
 #                        (SS_SIMD=0), SS_WSPLIT=0, SS_WEMIT=0, both self-checks, each with thread
 #                        counts, tiny chunks, chunk ends at the 64-byte marks, small partitions
+#        SETTINGS=cal    for a pipeline that chooses its parser instance by a timing on the
+#                        head of its largest events file: sets written as one events file
+#                        (mutations onefile, front), the default command many times over with
+#                        1, 2, 4 and 8 threads, SS_CALIBRATE=0, the fixed instances, chunk sizes
 #        SETTINGS=v5x    v5w, and the same again for the second wide instance (SS_SIMD=2)
 #        SETTINGS=w2     the second wide instance alone (22 settings, all with SS_SIMD=2)
 #        SLOW_BIN=name   the yardstick is bin/NAME --slow (default: the binary's own --slow);
@@ -87,6 +91,18 @@ if [ "$mode" = v5 ] || [ "$mode" = v5w ] || [ "$mode" = v5x ] || [ "$mode" = w2 
 fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
+if [ "$mode" = cal ]; then
+  # For a pipeline that tries its parser instances on the first 512 KB of the
+  # largest events file, if that file has 4 MiB or more: sets of 45K to 300K
+  # events written as one events file (`onefile`), with every kind of line at
+  # its head and a chosen thing at byte 524,288 (`front`).
+  sizes=(100000 150000 200000 300000 120000 60000 45000)
+  names=(onefile,front longusers,onefile,front idbytes,copies,onefile,front numbers,purchases,onefile,front
+         windows,shapes,onefile,front longusers,longevents,longclicks,onefile,front values,lateness,purchases,onefile,front
+         longlinks,longusers,onefile,front mix,onefile,front splitter,onefile,front onefile onefile,grouping
+         longusers,userlengths,irregular,onefile,front stretches,purchases,onefile,front longusers,endings,onefile,front
+         mix,mix,onefile,front)
+fi
 # The yardstick: the plain implementation of SLOW_BIN (a name in bin/), by
 # default the binary's own. With another binary's, the binary's own --slow is
 # one more thing that is compared.
@@ -147,6 +163,40 @@ for seed in $(seq "$first" $((first + count - 1))); do
   )
   case "$mode" in
     plain) settings=("${plain[@]}") ;;
+    cal) settings=(
+      # The instance is chosen by a timing at the start of the run, unless a
+      # switch names it: the same command several times (the choice may fall
+      # either way), with one, two and eight threads, and the fixed choices.
+      "default|NCPU=3 SS_TIMING=1"
+      "one|NCPU=1"
+      "oneb|NCPU=1"
+      "two|NCPU=2"
+      "twob|NCPU=2"
+      "twoc|NCPU=2"
+      "four|NCPU=4"
+      "eight|NCPU=8"
+      "eightb|NCPU=8"
+      "eightc|NCPU=8"
+      "eightd|NCPU=8"
+      "nocal|NCPU=4 SS_CALIBRATE=0"
+      "nocal1|NCPU=1 SS_CALIBRATE=0"
+      "nocal8|NCPU=8 SS_CALIBRATE=0"
+      "base|NCPU=4 SS_SIMD=0"
+      "wide|NCPU=4 SS_SIMD=1"
+      "w2|NCPU=4 SS_SIMD=2"
+      "w2one|NCPU=1 SS_SIMD=2"
+      "checks|NCPU=4 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1"
+      "nowsplit|NCPU=3 SS_WSPLIT=0"
+      "nowemit|NCPU=3 SS_WEMIT=0"
+      "chunk1m|NCPU=8 SS_CHUNK_BYTES=1000003"
+      "chunk300k|NCPU=2 SS_CHUNK_BYTES=300007"
+      "chunk64k|NCPU=5 SS_CHUNK_BYTES=65537"
+      "chunk512k|NCPU=8 SS_CHUNK_BYTES=524288"
+      "chunk512k1|NCPU=1 SS_CHUNK_BYTES=524289"
+      "tiny8|NCPU=8 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
+      "parts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))"
+      "parts2|NCPU=2 SS_PD_BYTES=$((seed % 300 + 64))"
+      "onepart|NCPU=5 SS_PD_BYTES=1000000000") ;;
     v5w|v5x|w2) settings=(
       # The wide parser is the default where the processor has it, the base
       # path (SS_SIMD=0) what runs elsewhere: both count.
@@ -312,6 +362,8 @@ for seed in $(seq "$first" $((first + count - 1))); do
     fi
     if [ "$label" = default ]; then
       sets=$((sets + 1)); grep -q 'event IDs indexed: true' "$o.log" && indexed=$((indexed + 1))
+      # What the run says about choosing its parser instance, and how large the set's largest events file is.
+      [ "$mode" = cal ] && echo "     seed $seed [$mutation]: largest events file $(ls -S "$d/data/events" | head -1 | xargs -I{} stat -c %s "$d/data/events/{}") bytes; $(grep -h 'parser instance' "$o.log" | tr -s ' ' | cut -c1-150 || true)"
     fi
     if ! "$PY" -I tools/cmp.py "$d/slow" "$o" > "$o.cmp" 2>&1; then
       echo "FAIL $tag setting $label ($vars): $(grep -m5 -E 'rows|A:|B:' "$o.cmp" | tr '\n' ' ' | cut -c1-400)"; bad="$bad $label"
