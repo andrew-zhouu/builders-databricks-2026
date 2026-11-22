@@ -341,8 +341,11 @@ macro_rules! split_batch_fn {
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<40>(_mm512_add_epi64(o, c5)));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<48>(len));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<56>(f));
-        _mm512_mask_compressstoreu_epi64(st.p.as_mut_ptr().add(n) as *mut _, keep, _mm512_add_epi64(start0, s));
-        _mm512_mask_compressstoreu_epi64(st.sep.as_mut_ptr().add(n) as *mut _, keep, sep);
+        // (Compressed in a register and stored whole, eight lanes: there is
+        // room for them, `n + 8 <= NB`. The compressing store to memory is
+        // the same thing on Intel and many times slower on AMD's Zen 4.)
+        _mm512_storeu_si512(st.p.as_mut_ptr().add(n) as *mut _, _mm512_maskz_compress_epi64(keep, _mm512_add_epi64(start0, s)));
+        _mm512_storeu_si512(st.sep.as_mut_ptr().add(n) as *mut _, _mm512_maskz_compress_epi64(keep, sep));
         n += keep.count_ones() as usize;
         i += take.count_ones() as usize;
         if odd != 0 {
@@ -467,8 +470,11 @@ macro_rules! split_clicks_batch_fn {
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<16>(_mm512_add_epi64(o, c2)));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<24>(len));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<56>(f));
-        _mm512_mask_compressstoreu_epi64(st.p.as_mut_ptr().add(n) as *mut _, keep, _mm512_add_epi64(start0, s));
-        _mm512_mask_compressstoreu_epi64(st.sep.as_mut_ptr().add(n) as *mut _, keep, sep);
+        // (Compressed in a register and stored whole, eight lanes: there is
+        // room for them, `n + 8 <= NB`. The compressing store to memory is
+        // the same thing on Intel and many times slower on AMD's Zen 4.)
+        _mm512_storeu_si512(st.p.as_mut_ptr().add(n) as *mut _, _mm512_maskz_compress_epi64(keep, _mm512_add_epi64(start0, s)));
+        _mm512_storeu_si512(st.sep.as_mut_ptr().add(n) as *mut _, _mm512_maskz_compress_epi64(keep, sep));
         n += keep.count_ones() as usize;
         i += take.count_ones() as usize;
         if odd != 0 {

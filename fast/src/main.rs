@@ -1100,15 +1100,7 @@ fn main() {
         bench(&ctx);
         unsafe { sys::_exit(0) }
     }
-    // SS_PREFAULT (experiment): a helper thread faults in this share (percent)
-    // of what the pool is expected to hold, ahead of the workers.
-    let prefault: usize = std::env::var("SS_PREFAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let prefault_bytes = (events_bytes / 100 * 22 + clicks_bytes / 100 * 35) / 100 * prefault;
     std::thread::scope(|scope| {
-        if prefault_bytes > 0 {
-            let ctx = &ctx;
-            scope.spawn(move || ctx.pool.prefault(prefault_bytes));
-        }
         for tid in 1..nthreads {
             let ctx = &ctx;
             scope.spawn(move || worker(ctx, tid));

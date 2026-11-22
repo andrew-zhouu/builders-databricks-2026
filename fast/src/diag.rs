@@ -142,14 +142,21 @@ pub fn run(data_dir: &std::path::Path, out_dir: &std::path::Path) -> ! {
     // The pipeline itself, several times: the first run shows a cold start (if
     // the page cache is cold), the rest the steady state and two variants.
     let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
-    let runs: [(&str, &[(&str, &str)]); 9] = [
+    // (Each parser instance where the processor has it; elsewhere the request
+    // falls back to the base path, and the times say so.)
+    let runs: [(&str, &[(&str, &str)]); 14] = [
         ("run 1 (default)", &[]),
         ("run 2 (default)", &[]),
+        ("base path (SS_SIMD=0)", &[("SS_SIMD", "0")]),
+        ("wide, VBMI2 (SS_SIMD=1)", &[("SS_SIMD", "1")]),
+        ("wide, plain 512-bit (SS_SIMD=2)", &[("SS_SIMD", "2")]),
+        ("base path, 2nd", &[("SS_SIMD", "0")]),
+        ("wide, VBMI2, 2nd", &[("SS_SIMD", "1")]),
+        ("wide, plain 512-bit, 2nd", &[("SS_SIMD", "2")]),
+        ("base path, 3rd", &[("SS_SIMD", "0")]),
+        ("wide, VBMI2, 3rd", &[("SS_SIMD", "1")]),
+        ("wide, plain 512-bit, 3rd", &[("SS_SIMD", "2")]),
         ("run 3 (default)", &[]),
-        ("wide parser asked for (SS_SIMD=1)", &[("SS_SIMD", "1")]),
-        ("wide parser refused (SS_SIMD=0)", &[("SS_SIMD", "0")]),
-        ("wide parser asked for, again", &[("SS_SIMD", "1")]),
-        ("wide parser refused, again", &[("SS_SIMD", "0")]),
         ("no huge pages", &[("SS_NOHUGE", "1")]),
         ("4 threads", &[("NCPU", "4")]),
     ];
