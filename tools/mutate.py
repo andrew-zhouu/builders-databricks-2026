@@ -147,7 +147,7 @@ def split_fields(line, count):
 
 
 class Line:
-    __slots__ = ("raw", "f", "file", "changed", "gone", "new")
+    __slots__ = ("raw", "f", "file", "changed", "gone", "new", "quotes")
 
     def __init__(self, raw, fields, file):
         self.raw = raw          # the text as read (written back for lines nobody touched)
@@ -156,6 +156,7 @@ class Line:
         self.changed = False    # the values differ from `raw`: written from `f`
         self.gone = False
         self.new = False        # not in the input: goes to a random place in its file
+        self.quotes = None      # which fields to quote when written from `f` (bit per field); None = at random
 
 
 def read_folder(path):
@@ -191,6 +192,8 @@ class Data:
         for number, (_, _, lines) in enumerate(self.link_files):
             for raw in lines:
                 self.links.append([number, raw])
+        self.click_files = read_folder(os.path.join(in_dir, "clicks"))
+        self.clicks = None      # read (as Lines of four values) by the mutation that wants them
         self.new_event_files = []   # (name, [field lists])
         self.drop_event_files = False
         self.notes = []
@@ -799,15 +802,158 @@ def noeventfiles(D):
     D.notes.append("noeventfiles")
 
 
+F2_OFFSETS = [-1439, -720, -600, -570, -300, -60, -1, 0, 0, 1, 60, 330, 345, 525, 720, 840, 1439]
+LENGTHS = [61, 62, 63, 64, 65, 66, 67, 95, 96, 97, 120, 125, 126, 127, 128, 129, 130, 131, 135, 160, 191, 192, 193, 200,
+           255, 256, 257, 300, 513, 1000, 4097]
+
+
+def same_instant(D, text, pad_to=None):
+    """Another spelling of a valid ts: F1, F2 at any offset (the local date may
+    be another day, even one outside the window), F3 with leading zeros."""
+    R = D.R
+    ms = parse_ts(text)
+    if ms is None or ms < 0 or ms >= 10 ** 15:
+        return text
+    r = R.random()
+    if pad_to:
+        return str(ms).zfill(pad_to)
+    if ms % 1000 == 0 and r < 0.25:
+        return f1(ms)
+    if ms % 1000 == 0 and r < 0.60:
+        new = f2(ms, R.choice(F2_OFFSETS))
+        return new[:19] + "-00:00" if new.endswith("+00:00") and R.random() < 0.5 else new
+    if r < 0.80:
+        return str(ms)
+    return str(ms).zfill(R.choice([13, 14, 15, 16, 17, 18, 19, 20, 21, 24, 25, 26, 30, 40, 64, 100]))
+
+
+def quote_mask(R, count):
+    style = R.choice(["all", "all", "none", "alternate", "random", "first", "last", "outer"])
+    full = (1 << count) - 1
+    return {"all": full, "none": 0, "alternate": 0x55 & full, "random": R.randrange(full + 1), "first": 1,
+            "last": 1 << (count - 1), "outer": 1 | 1 << (count - 1)}[style]
+
+
+def shapes(D):
+    """The same events written in every shape a line can take: quotes around
+    all fields or none, each ts as F1, F2 at any offset and F3 with leading
+    zeros, prices with leading zeros, event IDs of every length, and lines
+    of exactly 63, 64, 65, 127, 128, 129 ... bytes and far longer. Nothing an
+    event means changes (an ID is lengthened in all its copies alike), so a
+    decoder that works by position has every chance to slip."""
+    R = D.R
+    # Longer event IDs: zeros after the `e` (no generated ID has one there).
+    ids = [e for e in D.groups if len(e) > 1 and e[0] == "e" and e[1] != "0"]
+    R.shuffle(ids)
+    renamed = 0
+    for eid in ids[:len(ids) // 8]:
+        new = "e" + "0" * R.choice([1, 1, 1, 2, 2, 3, 8, 20, 60, 130]) + eid[1:]
+        for line in D.groups[eid]:
+            line.f[0] = new
+            line.changed = True
+        renamed += 1
+    # Copies with equal ingest_ts must stay identical: they change together.
+    clusters = {}
+    for line in D.events:
+        if line.f and line.f[0]:
+            clusters.setdefault((line.f[0], line.f[3]), []).append(line)
+    keys = list(clusters)
+    R.shuffle(keys)
+    done = 0
+    for key in keys[:max(60, len(keys) // 3)]:
+        lines = clusters[key]
+        f = list(lines[0].f)
+        if any(l.f != f for l in lines):
+            continue
+        purchase = f[4] == "purchase"
+        f[2] = same_instant(D, f[2])
+        if purchase:
+            if f[6] and all(c in "0123456789" for c in f[6]) and R.random() < 0.5:
+                f[6] = "0" * R.choice([1, 2, 3, 8, 13, 20, 40]) + f[6]
+        else:
+            if R.random() < 0.5:
+                f[6] = R.choice(["", "0", "7", "00000000000000000000001", "abc", "-1", "9" * 30, "1.5", " ", "x" * 70])
+        mask = quote_mask(R, 7)
+        if R.random() < 0.6:
+            # A line of an exact length: the padding goes where it means nothing.
+            length = sum(len(v) for v in f) + 6 + 2 * bin(mask).count("1")
+            target = R.choice([t for t in LENGTHS if t > length] or [length])
+            pad = target - length
+            if purchase:
+                if f[6] and all(c in "0123456789" for c in f[6]):
+                    f[6] = "0" * pad + f[6]
+            elif f[5]:
+                f[5] = f[5] + "x" * pad
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask if R.random() < 0.8 else quote_mask(R, 7)
+        done += 1
+    D.notes.append(f"shapes {done} lines, {renamed} ids lengthened")
+
+
+def clickshapes(D):
+    """Click lines in every shape: quotes, each ts as F1, F2 and F3 with
+    leading zeros (the same in all copies of a click), exact line lengths."""
+    R = D.R
+    if D.clicks is None:
+        D.clicks = [Line(raw, split_fields(raw, 4), number)
+                    for number, (_, _, lines) in enumerate(D.click_files) for raw in lines]
+    groups = {}
+    for line in D.clicks:
+        if line.f and line.f[0]:
+            groups.setdefault(line.f[0], []).append(line)
+    ids = list(groups)
+    R.shuffle(ids)
+    done = 0
+    for cid in ids[:max(40, len(ids) // 3)]:
+        lines = groups[cid]
+        f = list(lines[0].f)
+        if any(l.f != f for l in lines):
+            continue
+        mask = quote_mask(R, 4)
+        f[3] = same_instant(D, f[3])
+        if R.random() < 0.4 and parse_ts(f[3]) is not None:
+            length = sum(len(v) for v in f[:3]) + 3 + 2 * bin(mask).count("1")
+            target = R.choice([t for t in LENGTHS if t > length + 13] or [length + 13])
+            f[3] = same_instant(D, f[3], pad_to=target - length)
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask if R.random() < 0.8 else quote_mask(R, 4)
+        done += 1
+    D.notes.append(f"clickshapes {done}")
+
+
+def linkshapes(D):
+    """Link lines quoted in every way, and links between new IDs of every length."""
+    R = D.R
+    done = 0
+    for entry in D.links:
+        f = split_fields(entry[1], 2)
+        if f and R.random() < 0.3:
+            mask = R.randrange(4)
+            entry[1] = ",".join('"' + v + '"' if mask >> i & 1 else v for i, v in enumerate(f))
+            done += 1
+    if D.link_files:
+        for k in range(R.randint(5, 60)):
+            a = "u" + "".join(R.choice(DIGITS) for _ in range(R.choice([1, 2, 7, 8, 9, 10, 15, 16, 17, 31, 32, 33, 62, 70, 130])))
+            b = R.choice([a + "z", "u" + base36(k) + "q" * R.choice([1, 8, 9, 40]), R.choice(D.users)]) if R.random() < 0.9 else a
+            D.links.append([R.randrange(len(D.link_files)), ",".join('"' + v + '"' if R.random() < 0.4 else v for v in (a, b))])
+    D.notes.append(f"linkshapes {done}")
+
+
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
-                                     purchases, identityids, emptyevents, noeventfiles]}
+                                     purchases, shapes, clickshapes, linkshapes, identityids, emptyevents, noeventfiles]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
-           "purchases"]
+           "purchases", "shapes", "shapes", "clickshapes", "linkshapes"]
 
 
 # ------------------------------------------------------------------ writing
 
-def encode(D, fields):
+def encode(D, fields, quotes=None):
+    if quotes is not None:
+        return ",".join('"' + v + '"' if quotes >> i & 1 else v for i, v in enumerate(fields))
     return ",".join('"' + v + '"' if D.R.random() < 0.2 else v for v in fields)
 
 
@@ -832,7 +978,7 @@ def write(D, out_dir):
             if line.f is None:
                 out.append(line.raw)
                 continue
-            text = encode(D, line.f) if line.changed or line.raw is None else line.raw
+            text = encode(D, line.f, line.quotes) if line.changed or line.raw is None else line.raw
             if line.f[0]:
                 key = (line.f[0], line.f[3])
                 if seen.setdefault(key, line.f) != line.f:
@@ -859,7 +1005,16 @@ def write(D, out_dir):
     for (name, header, _), lines in zip(D.link_files, link_lines):
         with open(os.path.join(out_dir, "links", name), "wb") as f:
             f.write(((header or "user_id_a,user_id_b") + "\n" + "".join(l + "\n" for l in lines)).encode("latin-1"))
-    shutil.copytree(os.path.join(D.in_dir, "clicks"), os.path.join(out_dir, "clicks"))
+    if D.clicks is None:
+        shutil.copytree(os.path.join(D.in_dir, "clicks"), os.path.join(out_dir, "clicks"))
+    else:
+        os.makedirs(os.path.join(out_dir, "clicks"), exist_ok=True)
+        click_lines = [[] for _ in D.click_files]
+        for line in D.clicks:
+            click_lines[line.file].append(encode(D, line.f, line.quotes) if line.f is not None and line.changed else line.raw)
+        for (name, header, _), lines in zip(D.click_files, click_lines):
+            with open(os.path.join(out_dir, "clicks", name), "wb") as f:
+                f.write(((header or "click_id,user_id,campaign_id,ts") + "\n" + "".join(l + "\n" for l in lines)).encode("latin-1"))
     for name in ("products.csv", "campaigns.csv", "manifest.json"):
         shutil.copy(os.path.join(D.in_dir, name), os.path.join(out_dir, name))
 
