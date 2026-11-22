@@ -78,6 +78,11 @@ pub struct Ctx {
     pub scalar_only: bool,
     /// Software prefetch distance in bytes for the parsers' input (0 = off).
     pub prefetch_ahead: usize,
+    /// The batch splitter of parse::splitw (processors with AVX-512 VBMI2;
+    /// SS_WSPLIT=0 turns it off), and its check against the line splitter
+    /// (SS_SPLIT_CHECK=1).
+    pub wide_split: bool,
+    pub split_check: bool,
     /// Unmap the big memory regions from all threads before exiting.
     zap: bool,
     /// A thread writes its user_daily rows out whenever it holds about this
@@ -1009,6 +1014,8 @@ fn main() {
         dates: parse::DateTab::new(ws, day0, ndays),
         scalar_only: std::env::var("SS_SCALAR").is_ok(),
         prefetch_ahead: std::env::var("SS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
+        wide_split: !std::env::var("SS_WSPLIT").is_ok_and(|v| v == "0") && parse::splitw::available(),
+        split_check: std::env::var("SS_SPLIT_CHECK").is_ok_and(|v| v == "1"),
         zap: std::env::var("SS_NOZAP").is_err(),
         // SS_OUT_CHUNK (experiment): bytes of rows per user_daily file.
         out_chunk: std::env::var("SS_OUT_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512 << 10),
