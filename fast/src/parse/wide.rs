@@ -1,127 +1,110 @@
 //! The decode stage on processors with AVX-512 (`super::wide`): the same
-//! results as `super::stage_decode`, four lines at a time.
+//! results as `super::stage_decode`, eight lines at a time.
 //!
-//! Each 64-bit lane of a 256-bit register holds one line's value. A line's
+//! Each 64-bit lane of a 512-bit register holds one line's value. A line's
 //! bytes are fetched with gathers, eight at a time, from wherever its fields
-//! are; everything after that is the one-line loop's arithmetic on four lanes.
-//! Nothing here is a branch on the data: all three timestamp forms are
+//! are; everything after that is the one-line loop's arithmetic on eight
+//! lanes. Nothing here is a branch on the data: all three timestamp forms are
 //! computed and the right one is selected, where the one-line loop mispredicts
 //! on every other line.
 //!
-//! The registers stay 256 bits wide. (512-bit registers lower the clock even
-//! on the processors that take this path, and the gathers, which set the pace,
-//! would not get faster.)
+//! What bounds this loop is the number of vector instructions per line, not
+//! the gathers (seven fewer of them changed nothing): hence the full width.
 
 use super::*;
 
-/// Whether `id_trace4` computes the traces of four event IDs in vector
+/// Whether `id_trace8` computes the traces of eight event IDs in vector
 /// registers (which must then mirror `super::id_trace` exactly; SS_SIMD_CHECK=1
 /// compares them), or calls `super::id_trace` for each line.
 const ID_TRACE_WIDE: bool = true;
 
 const LOW: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
+/// Lines per step.
+const W: usize = 8;
 
 macro_rules! v {
     ($x:expr) => {
-        _mm256_set1_epi64x(($x) as i64)
+        _mm512_set1_epi64(($x) as i64)
     };
 }
 macro_rules! and {
     ($a:expr, $b:expr) => {
-        _mm256_and_si256($a, $b)
+        _mm512_and_si512($a, $b)
     };
 }
 macro_rules! or {
     ($a:expr, $b:expr) => {
-        _mm256_or_si256($a, $b)
+        _mm512_or_si512($a, $b)
     };
 }
 macro_rules! xor {
     ($a:expr, $b:expr) => {
-        _mm256_xor_si256($a, $b)
+        _mm512_xor_si512($a, $b)
     };
 }
 macro_rules! add {
     ($a:expr, $b:expr) => {
-        _mm256_add_epi64($a, $b)
+        _mm512_add_epi64($a, $b)
     };
 }
 macro_rules! sub {
     ($a:expr, $b:expr) => {
-        _mm256_sub_epi64($a, $b)
+        _mm512_sub_epi64($a, $b)
     };
 }
 macro_rules! srl {
     ($a:expr, $n:literal) => {
-        _mm256_srli_epi64::<$n>($a)
+        _mm512_srli_epi64::<$n>($a)
     };
 }
 macro_rules! sll {
     ($a:expr, $n:literal) => {
-        _mm256_slli_epi64::<$n>($a)
+        _mm512_slli_epi64::<$n>($a)
     };
 }
 /// The product of the low 32 bits of each lane (both below 2^32 wherever this
 /// is used, so it is the product).
 macro_rules! mul {
     ($a:expr, $b:expr) => {
-        _mm256_mul_epu32($a, $b)
+        _mm512_mul_epu32($a, $b)
     };
 }
 /// Eight bytes of each line, `$off` bytes from the lane's address.
 macro_rules! gather {
     ($addr:expr, $off:expr) => {
-        _mm256_i64gather_epi64::<1>(($off as isize) as *const i64, $addr)
+        _mm512_i64gather_epi64::<1>($addr, ($off as isize) as *const i64)
     };
 }
 
-/// `super::id_trace` for four lines: partitions (one per lane), first trace
+/// `super::id_trace` for eight lines: partitions (one per lane), first trace
 /// words without the positions, and the lanes whose ID is not regular.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
 #[inline]
-unsafe fn id_trace4(idp: &IdParams, first: __m256i, rest: __m256i, n: __m256i) -> (__m256i, __m256i, __mmask8) {
+unsafe fn id_trace8(idp: &IdParams, first: __m512i, rest: __m512i, n: __m512i) -> (__m512i, __m512i, __mmask8) {
     if ID_TRACE_WIDE {
         // ids::hash9, then as `id_trace`.
-        let x = xor!(rest, _mm256_mullo_epi64(first, v!(0xD6E8_FEB8_6659_FD93u64)));
-        let a = _mm256_mullo_epi64(x, v!(0x9E37_79B9_7F4A_7C15u64));
+        let x = xor!(rest, _mm512_mullo_epi64(first, v!(0xD6E8_FEB8_6659_FD93u64)));
+        let a = _mm512_mullo_epi64(x, v!(0x9E37_79B9_7F4A_7C15u64));
         let h = xor!(a, srl!(a, 32));
         let pk = or!(srl!(mul!(srl!(h, 32), v!(idp.pd)), 32), sll!(and!(srl!(h, 40), v!(15)), 16));
-        let trace = _mm256_sll_epi64(and!(h, v!(idp.fp_mask)), _mm_cvtsi32_si128(idp.loc_bits as i32));
-        (pk, trace, _mm256_cmpgt_epu64_mask(n, v!(9)))
+        let trace = _mm512_sll_epi64(and!(h, v!(idp.fp_mask)), _mm_cvtsi32_si128(idp.loc_bits as i32));
+        (pk, trace, _mm512_cmpgt_epu64_mask(n, v!(9)))
     } else {
-        let (mut f, mut r, mut len) = ([0u64; 4], [0u64; 4], [0u64; 4]);
-        _mm256_storeu_si256(f.as_mut_ptr() as *mut __m256i, first);
-        _mm256_storeu_si256(r.as_mut_ptr() as *mut __m256i, rest);
-        _mm256_storeu_si256(len.as_mut_ptr() as *mut __m256i, n);
-        let (mut pk, mut trace, mut dead) = ([0u64; 4], [0u64; 4], 0u8);
-        for j in 0..4 {
+        let (mut f, mut r, mut len) = ([0u64; W], [0u64; W], [0u64; W]);
+        _mm512_storeu_si512(f.as_mut_ptr() as *mut _, first);
+        _mm512_storeu_si512(r.as_mut_ptr() as *mut _, rest);
+        _mm512_storeu_si512(len.as_mut_ptr() as *mut _, n);
+        let (mut pk, mut trace, mut dead) = ([0u64; W], [0u64; W], 0u8);
+        for j in 0..W {
             let (p, t, d) = id_trace(idp, f[j] as u8, r[j], len[j]);
             pk[j] = p as u64;
             trace[j] = t;
             dead |= (d as u8) << j;
         }
-        (_mm256_loadu_si256(pk.as_ptr() as *const __m256i), _mm256_loadu_si256(trace.as_ptr() as *const __m256i), dead)
+        (_mm512_loadu_si512(pk.as_ptr() as *const _), _mm512_loadu_si512(trace.as_ptr() as *const _), dead)
     }
 }
-
-/// For each set of lanes: 0xFF in the bytes of those lanes' numbers, for
-/// picking them out of a packed word.
-static PICK: [u32; 16] = {
-    let mut t = [0u32; 16];
-    let mut m = 0;
-    while m < 16 {
-        let mut j = 0;
-        while j < 4 {
-            if m >> j & 1 != 0 {
-                t[m] |= 0xFF << (8 * j);
-            }
-            j += 1;
-        }
-        m += 1;
-    }
-    t
-};
 
 /// Decode the batch's lines: `super::stage_decode`, on this path.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
@@ -135,15 +118,15 @@ pub(super) unsafe fn decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> u
     if wide_check() {
         return checked(ctx, st, n, loc0);
     }
-    decode4(ctx, st, n, loc0)
+    decode8(ctx, st, n, loc0)
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
 #[inline]
-unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
+unsafe fn decode8(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
     let dt = &ctx.dates;
     let idp = IdParams::new(ctx);
-    let zero = _mm256_setzero_si256();
+    let zero = _mm512_setzero_si512();
     let ones = v!(u64::MAX);
     let byte = v!(0xFF);
     let (ws, t0, span) = (v!(ctx.ws), v!(ctx.t0), v!((ctx.we - ctx.ws) as u64));
@@ -162,34 +145,32 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
     macro_rules! day_of {
         ($q0:expr, $q1:expr) => {{
             let t = xor!(and!($q1, v!(0xFFFFu64)), v!(0x3030u64));
-            let digits = _mm256_testn_epi64_mask(or!(add!(t, v!(0x7676u64)), t), v!(0x8080u64));
+            let digits = _mm512_testn_epi64_mask(or!(add!(t, v!(0x7676u64)), t), v!(0x8080u64));
             let dd = add!(mul!(and!(t, byte), v!(10)), srl!(t, 8));
-            let (ka, kb) = (_mm256_cmpeq_epi64_mask($q0, ym_a), _mm256_cmpeq_epi64_mask($q0, ym_b));
-            let set = _mm256_mask_mov_epi64(_mm256_maskz_mov_epi64(ka, days_a), kb, days_b);
-            let base = _mm256_mask_mov_epi64(_mm256_maskz_mov_epi64(ka, base_a), kb, base_b);
-            (digits & _mm256_test_epi64_mask(_mm256_srlv_epi64(set, dd), v!(1)), add!(base, mul!(dd, v!(DAY_MS))))
+            let (ka, kb) = (_mm512_cmpeq_epi64_mask($q0, ym_a), _mm512_cmpeq_epi64_mask($q0, ym_b));
+            let set = _mm512_mask_mov_epi64(_mm512_maskz_mov_epi64(ka, days_a), kb, days_b);
+            let base = _mm512_mask_mov_epi64(_mm512_maskz_mov_epi64(ka, base_a), kb, base_b);
+            (digits & _mm512_test_epi64_mask(_mm512_srlv_epi64(set, dd), v!(1)), add!(base, mul!(dd, v!(DAY_MS))))
         }};
     }
-    let swap = _mm256_setr_epi8(
-        7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
-    );
+    let swap = _mm512_broadcast_i32x4(_mm_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8));
     let mut nmore = 0usize;
     let mut i = 0usize;
     while i < n {
         // The last group may be short: its missing lines are copies of its
         // first one (their results are stored like the others, past the end
         // of the batch, where nobody looks).
-        let live: u8 = if n - i >= 4 { 0xF } else { (1u8 << (n - i)) - 1 };
-        let mut p = _mm256_loadu_si256(st.p.as_ptr().add(i) as *const __m256i);
-        let mut s = _mm256_loadu_si256(st.sep.as_ptr().add(i) as *const __m256i);
-        if live != 0xF {
-            p = _mm256_mask_blend_epi64(live, _mm256_broadcastq_epi64(_mm256_castsi256_si128(p)), p);
-            s = _mm256_mask_blend_epi64(live, _mm256_broadcastq_epi64(_mm256_castsi256_si128(s)), s);
+        let live: u8 = if n - i >= W { 0xFF } else { (1u8 << (n - i)) - 1 };
+        let mut p = _mm512_loadu_si512(st.p.as_ptr().add(i) as *const _);
+        let mut s = _mm512_loadu_si512(st.sep.as_ptr().add(i) as *const _);
+        if live != 0xFF {
+            p = _mm512_mask_blend_epi64(live, _mm512_broadcastq_epi64(_mm512_castsi512_si128(p)), p);
+            s = _mm512_mask_blend_epi64(live, _mm512_broadcastq_epi64(_mm512_castsi512_si128(s)), s);
         }
 
         // `super::fields`: byte `k` of `start` is where field `k` starts in
         // its line, of `len` its length. (The quoted bits are bits 56 to 62.)
-        let quoted = and!(_mm256_multishift_epi64_epi8(v!(0x3F3E_3D3C_3B3A_3938u64), s), v!(0x0001_0101_0101_0101u64));
+        let quoted = and!(_mm512_multishift_epi64_epi8(v!(0x3F3E_3D3C_3B3A_3938u64), s), v!(0x0001_0101_0101_0101u64));
         let seps = and!(s, v!(0x00FF_FFFF_FFFF_FFFFu64));
         let start = add!(add!(sll!(seps, 8), v!(0x0001_0101_0101_0100u64)), quoted);
         let len = sub!(sub!(seps, start), quoted);
@@ -198,7 +179,7 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
                 add!(p, and!(start, byte))
             };
             ($k:literal) => {
-                add!(p, and!(_mm256_srli_epi64::<{ 8 * $k }>(start), byte))
+                add!(p, and!(_mm512_srli_epi64::<{ 8 * $k }>(start), byte))
             };
         }
         macro_rules! ln {
@@ -206,30 +187,30 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
                 and!(len, byte)
             };
             ($k:literal) => {
-                and!(_mm256_srli_epi64::<{ 8 * $k }>(len), byte)
+                and!(_mm512_srli_epi64::<{ 8 * $k }>(len), byte)
             };
         }
 
         // event_id: its first byte, and the rest (up to 8 bytes) zero-padded.
         let (a0, n0) = (at!(0), ln!(0));
         let first = srl!(gather!(a0, -7), 56);
-        let rest = and!(gather!(a0, 1), _mm256_srlv_epi64(ones, sub!(v!(72), sll!(n0, 3))));
-        let (pk, trace, dead_id) = id_trace4(&idp, first, rest, n0);
-        _mm_storeu_si128(st.pk.as_mut_ptr().add(i) as *mut __m128i, _mm256_cvtepi64_epi32(pk));
-        _mm256_storeu_si256(st.trace.as_mut_ptr().add(i) as *mut __m256i, or!(trace, add!(v!(loc0), p)));
+        let rest = and!(gather!(a0, 1), _mm512_srlv_epi64(ones, sub!(v!(72), sll!(n0, 3))));
+        let (pk, trace, dead_id) = id_trace8(&idp, first, rest, n0);
+        _mm256_storeu_si256(st.pk.as_mut_ptr().add(i) as *mut __m256i, _mm512_cvtepi64_epi32(pk));
+        _mm512_storeu_si512(st.trace.as_mut_ptr().add(i) as *mut _, or!(trace, add!(v!(loc0), p)));
 
         // user_id: `u` and 1 to 8 ASCII bytes, none of them NUL, is its own key.
         let (a1, n1) = (at!(1), ln!(1));
         let ufirst = srl!(gather!(a1, -7), 56);
         let raw = gather!(a1, 1);
-        let keep1 = _mm256_srlv_epi64(ones, sub!(v!(72), sll!(n1, 3)));
-        let odd = and!(and!(or!(_mm256_andnot_si256(raw, sub!(raw, v!(LOW))), raw), v!(HIGH)), keep1);
-        let user_bad = _mm256_cmpneq_epi64_mask(odd, zero)
-            | _mm256_cmpneq_epi64_mask(ufirst, v!(b'u'))
-            | _mm256_cmpgt_epu64_mask(sub!(n1, v!(2)), v!(7));
-        let key = _mm256_maskz_mov_epi64(!user_bad, _mm256_shuffle_epi8(and!(raw, keep1), swap));
-        _mm256_storeu_si256(st.key.as_mut_ptr().add(i) as *mut __m256i, key);
-        for j in 0..4 {
+        let keep1 = _mm512_srlv_epi64(ones, sub!(v!(72), sll!(n1, 3)));
+        let odd = and!(and!(or!(_mm512_andnot_si512(raw, sub!(raw, v!(LOW))), raw), v!(HIGH)), keep1);
+        let user_bad = _mm512_cmpneq_epi64_mask(odd, zero)
+            | _mm512_cmpneq_epi64_mask(ufirst, v!(b'u'))
+            | _mm512_cmpgt_epu64_mask(sub!(n1, v!(2)), v!(7));
+        let key = _mm512_maskz_mov_epi64(!user_bad, _mm512_shuffle_epi8(and!(raw, keep1), swap));
+        _mm512_storeu_si512(st.key.as_mut_ptr().add(i) as *mut _, key);
+        for j in 0..W {
             *st.home.get_unchecked_mut(i + j) = ctx.table.prefetch_home(*st.key.get_unchecked(i + j)) as u32;
         }
 
@@ -238,78 +219,78 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
         // (the last one is looked at for a field of no known form).
         let (a2, n2) = (at!(2), ln!(2));
         let (g0, g1, g2) = (gather!(a2, 0), gather!(a2, 8), gather!(a2, 16));
-        let kf1 = _mm256_cmpeq_epi64_mask(n2, v!(20));
-        let kf2 = _mm256_cmpeq_epi64_mask(n2, v!(25));
-        let kf3 = _mm256_cmplt_epu64_mask(sub!(n2, v!(1)), v!(16));
-        let gx = gather!(_mm256_mask_mov_epi64(add!(a2, n2), kf2, add!(a2, v!(25))), -8);
+        let kf1 = _mm512_cmpeq_epi64_mask(n2, v!(20));
+        let kf2 = _mm512_cmpeq_epi64_mask(n2, v!(25));
+        let kf3 = _mm512_cmplt_epu64_mask(sub!(n2, v!(1)), v!(16));
+        let gx = gather!(_mm512_mask_mov_epi64(add!(a2, n2), kf2, add!(a2, v!(25))), -8);
 
         // F1 and F2 (see `super::event_ts`): the date is one of the table's
         // days, then `T`, then the time of day. (The table's unused entries
         // are sixteen 0xFF bytes at day start 0, which eleven 0xFF bytes for
         // a date match: so they do here.)
         let (in_table, day_ms) = day_of!(g0, g1);
-        let all_ff = _mm256_cmpeq_epi64_mask(g0, ones)
-            & _mm256_cmpeq_epi64_mask(and!(g1, v!(0xFF_FFFFu64)), v!(0xFF_FFFFu64));
-        let date_ok = (in_table & _mm256_cmpeq_epi64_mask(and!(srl!(g1, 16), byte), v!(b'T'))) | all_ff;
+        let all_ff = _mm512_cmpeq_epi64_mask(g0, ones)
+            & _mm512_cmpeq_epi64_mask(and!(g1, v!(0xFF_FFFFu64)), v!(0xFF_FFFFu64));
+        let date_ok = (in_table & _mm512_cmpeq_epi64_mask(and!(srl!(g1, 16), byte), v!(b'T'))) | all_ff;
         let d = xor!(or!(srl!(g1, 24), sll!(g2, 40)), v!(0x3030_3A30_303A_3030u64));
         let over = and!(or!(add!(d, v!(0x767A_7F76_7A7F_767Du64)), d), v!(HIGH));
         let y = add!(add!(d, sll!(d, 9)), sll!(d, 11)); // d * 0xA01
         let hh = and!(srl!(y, 8), byte);
         let secs = add!(add!(mul!(hh, v!(3600)), mul!(and!(srl!(y, 32), byte), v!(60))), srl!(y, 56));
-        let ms1 = add!(_mm256_maskz_mov_epi64(!all_ff, day_ms), mul!(secs, v!(1000)));
-        let bad1 = !date_ok | _mm256_cmpneq_epi64_mask(over, zero) | _mm256_cmpgt_epu64_mask(hh, v!(23));
+        let ms1 = add!(_mm512_maskz_mov_epi64(!all_ff, day_ms), mul!(secs, v!(1000)));
+        let bad1 = !date_ok | _mm512_cmpneq_epi64_mask(over, zero) | _mm512_cmpgt_epu64_mask(hh, v!(23));
         let sfx = and!(srl!(g2, 24), byte);
         // F2's offset: bytes 20 to 24 are bytes 3 to 7 of `gx`.
-        let u = and!(_mm256_sub_epi8(gx, v!(0x3030_3A30_3000_0000u64)), v!(0xFFFF_FFFF_FF00_0000u64));
+        let u = and!(_mm512_sub_epi8(gx, v!(0x3030_3A30_3000_0000u64)), v!(0xFFFF_FFFF_FF00_0000u64));
         let lim = v!(0x0909_0009_0900_0000u64);
         let y2 = add!(add!(u, sll!(u, 9)), sll!(u, 11));
         let (oh, om) = (and!(srl!(y2, 32), byte), srl!(y2, 56));
-        let minus = _mm256_cmpeq_epi64_mask(sfx, v!(b'-'));
-        let ok2 = (_mm256_cmpeq_epi64_mask(sfx, v!(b'+')) | minus)
-            & _mm256_cmpeq_epi64_mask(_mm256_max_epu8(u, lim), lim)
-            & _mm256_cmple_epu64_mask(oh, v!(23))
-            & _mm256_cmple_epu64_mask(om, v!(59));
+        let minus = _mm512_cmpeq_epi64_mask(sfx, v!(b'-'));
+        let ok2 = (_mm512_cmpeq_epi64_mask(sfx, v!(b'+')) | minus)
+            & _mm512_cmpeq_epi64_mask(_mm512_max_epu8(u, lim), lim)
+            & _mm512_cmple_epu64_mask(oh, v!(23))
+            & _mm512_cmple_epu64_mask(om, v!(59));
         let off = mul!(add!(mul!(oh, v!(60)), om), v!(60_000));
-        let ms2 = _mm256_mask_add_epi64(sub!(ms1, off), minus, ms1, off);
+        let ms2 = _mm512_mask_add_epi64(sub!(ms1, off), minus, ms1, off);
 
         // F3 (see `super::digits16`): 1 to 16 digits. They are in `g0` and
         // `g1`; moved up by `16 - n2` bytes they are the sixteen bytes that
         // end where the field ends, with zeros before the field's start
         // (which, like whatever is really there, are not looked at).
         let up = sll!(sub!(v!(16), n2), 3);
-        let hi8 = _mm256_sllv_epi64(g0, up);
+        let hi8 = _mm512_sllv_epi64(g0, up);
         let lo8 = or!(
-            _mm256_sllv_epi64(g1, up),
-            or!(_mm256_srlv_epi64(g0, sub!(v!(64), up)), _mm256_sllv_epi64(g0, sub!(up, v!(64))))
+            _mm512_sllv_epi64(g1, up),
+            or!(_mm512_srlv_epi64(g0, sub!(v!(64), up)), _mm512_sllv_epi64(g0, sub!(up, v!(64))))
         );
-        let n2lo = _mm256_min_epu64(n2, v!(8));
-        let keep_lo = _mm256_sllv_epi64(ones, sub!(v!(64), sll!(n2lo, 3)));
-        let keep_hi = _mm256_sllv_epi64(ones, sub!(v!(64), sll!(sub!(n2, n2lo), 3)));
-        let (c0, c9) = (_mm256_set1_epi8(b'0' as i8), _mm256_set1_epi8(9));
-        let (th, tl) = (_mm256_sub_epi8(hi8, c0), _mm256_sub_epi8(lo8, c0));
+        let n2lo = _mm512_min_epu64(n2, v!(8));
+        let keep_lo = _mm512_sllv_epi64(ones, sub!(v!(64), sll!(n2lo, 3)));
+        let keep_hi = _mm512_sllv_epi64(ones, sub!(v!(64), sll!(sub!(n2, n2lo), 3)));
+        let (c0, c9) = (_mm512_set1_epi8(b'0' as i8), _mm512_set1_epi8(9));
+        let (th, tl) = (_mm512_sub_epi8(hi8, c0), _mm512_sub_epi8(lo8, c0));
         let not_digit = or!(
-            _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_min_epu8(th, c9), th), keep_hi),
-            _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_min_epu8(tl, c9), tl), keep_lo)
+            _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(th, c9), keep_hi),
+            _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(tl, c9), keep_lo)
         );
-        let (w10, w100) = (_mm256_set1_epi16(0x010A), _mm256_set1_epi32(0x0001_0064));
-        let qh = _mm256_madd_epi16(_mm256_maddubs_epi16(and!(th, keep_hi), w10), w100);
-        let ql = _mm256_madd_epi16(_mm256_maddubs_epi16(and!(tl, keep_lo), w10), w100);
+        let (w10, w100) = (_mm512_set1_epi16(0x010A), _mm512_set1_epi32(0x0001_0064));
+        let qh = _mm512_madd_epi16(_mm512_maddubs_epi16(and!(th, keep_hi), w10), w100);
+        let ql = _mm512_madd_epi16(_mm512_maddubs_epi16(and!(tl, keep_lo), w10), w100);
         let vh = add!(mul!(qh, v!(10_000)), srl!(qh, 32));
         let vl = add!(mul!(ql, v!(10_000)), srl!(ql, 32));
         let ms3 = add!(mul!(vh, v!(100_000_000)), vl);
 
         // Which form it is, and what that makes of the line.
         let kf12 = kf1 | kf2;
-        let maybe_digits = _mm256_cmpneq_epi64_mask(n2, zero)
-            & _mm256_cmplt_epu64_mask(sub!(and!(g0, byte), v!(b'0')), v!(10))
-            & _mm256_cmplt_epu64_mask(sub!(srl!(gx, 56), v!(b'0')), v!(10));
+        let maybe_digits = _mm512_cmpneq_epi64_mask(n2, zero)
+            & _mm512_cmplt_epu64_mask(sub!(and!(g0, byte), v!(b'0')), v!(10))
+            & _mm512_cmplt_epu64_mask(sub!(srl!(gx, 56), v!(b'0')), v!(10));
         let ts_dead = (kf12 & bad1) | (!(kf12 | kf3) & maybe_digits);
-        let ts_ok = (kf1 & !bad1 & _mm256_cmpeq_epi64_mask(sfx, v!(b'Z')))
+        let ts_ok = (kf1 & !bad1 & _mm512_cmpeq_epi64_mask(sfx, v!(b'Z')))
             | (kf2 & !bad1 & ok2)
-            | (kf3 & _mm256_testn_epi64_mask(not_digit, not_digit));
-        let ms = _mm256_mask_mov_epi64(_mm256_mask_mov_epi64(_mm256_maskz_mov_epi64(kf3, ms3), kf1, ms1), kf2, ms2);
-        let in_window = _mm256_cmplt_epu64_mask(sub!(ms, ws), span);
-        _mm_storeu_si128(st.ts.as_mut_ptr().add(i) as *mut __m128i, _mm256_cvtepi64_epi32(sub!(ms, t0)));
+            | (kf3 & _mm512_testn_epi64_mask(not_digit, not_digit));
+        let ms = _mm512_mask_mov_epi64(_mm512_mask_mov_epi64(_mm512_maskz_mov_epi64(kf3, ms3), kf1, ms1), kf2, ms2);
+        let in_window = _mm512_cmplt_epu64_mask(sub!(ms, ws), span);
+        _mm256_storeu_si256(st.ts.as_mut_ptr().add(i) as *mut __m256i, _mm512_cvtepi64_epi32(sub!(ms, t0)));
 
         // ingest_ts on the same UTC day as ts? `super::stage_decode` compares
         // its first ten bytes with the text of the day of ts; for an event
@@ -320,43 +301,42 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
         // which is `((x >> 10) * 3335999724) >> 48` exactly.
         let (a3, n3) = (at!(3), ln!(3));
         let (i0, i8, i12) = (gather!(a3, 0), gather!(a3, 8), gather!(a3, 12));
-        let x = _mm256_min_epu64(sub!(ms, first_day), day_cap);
+        let x = _mm512_min_epu64(sub!(ms, first_day), day_cap);
         let day = srl!(mul!(srl!(x, 10), v!(3_335_999_724u64)), 48);
         let (ingest_in_table, ingest_day_ms) = day_of!(i0, i8);
         let same_day = ingest_in_table
-            & _mm256_cmpeq_epi64_mask(ingest_day_ms, add!(first_day, mul!(day, v!(DAY_MS))))
-            & _mm256_cmpeq_epi64_mask(srl!(i12, 56), v!(b'Z'));
+            & _mm512_cmpeq_epi64_mask(ingest_day_ms, add!(first_day, mul!(day, v!(DAY_MS))))
+            & _mm512_cmpeq_epi64_mask(srl!(i12, 56), v!(b'Z'));
 
         // view / cart / purchase, exactly; a product.
         let (a4, n4) = (at!(4), ln!(4));
         let w = gather!(a4, 0);
         let wl = and!(w, v!(0xFFFF_FFFFu64));
-        let k_purchase = _mm256_cmpeq_epi64_mask(n4, v!(8)) & _mm256_cmpeq_epi64_mask(w, v!(PURCHASE));
-        let k_view = _mm256_cmpeq_epi64_mask(n4, v!(4))
-            & (_mm256_cmpeq_epi64_mask(wl, v!(VIEW)) | _mm256_cmpeq_epi64_mask(wl, v!(CART)));
-        let has_product = _mm256_cmpneq_epi64_mask(ln!(5), zero);
+        let k_purchase = _mm512_cmpeq_epi64_mask(n4, v!(8)) & _mm512_cmpeq_epi64_mask(w, v!(PURCHASE));
+        let k_view = _mm512_cmpeq_epi64_mask(n4, v!(4))
+            & (_mm512_cmpeq_epi64_mask(wl, v!(VIEW)) | _mm512_cmpeq_epi64_mask(wl, v!(CART)));
+        let has_product = _mm512_cmpneq_epi64_mask(ln!(5), zero);
 
         // The flags, as `super::stage_decode` sets them.
-        let dead = (dead_id
-            | _mm256_cmpneq_epi64_mask(n3, v!(20))
+        let dead = dead_id
+            | _mm512_cmpneq_epi64_mask(n3, v!(20))
             | ts_dead
-            | (user_bad & _mm256_cmpneq_epi64_mask(n1, zero)))
-            & 0xF;
-        let valid = !(dead | user_bad) & (k_purchase | k_view) & has_product & ts_ok & in_window & 0xF;
+            | (user_bad & _mm512_cmpneq_epi64_mask(n1, zero));
+        let valid = !(dead | user_bad) & (k_purchase | k_view) & has_product & ts_ok & in_window;
         let ingest = valid & !same_day;
         let purchase = valid & k_purchase;
         let fl = or!(
-            or!(_mm256_maskz_mov_epi64(dead, v!(F_DEAD)), _mm256_maskz_mov_epi64(valid, v!(F_VALID))),
-            or!(_mm256_maskz_mov_epi64(purchase, v!(F_PURCHASE)), _mm256_maskz_mov_epi64(ingest, v!(F_INGEST)))
+            or!(_mm512_maskz_mov_epi64(dead, v!(F_DEAD)), _mm512_maskz_mov_epi64(valid, v!(F_VALID))),
+            or!(_mm512_maskz_mov_epi64(purchase, v!(F_PURCHASE)), _mm512_maskz_mov_epi64(ingest, v!(F_INGEST)))
         );
-        (st.flags.as_mut_ptr().add(i) as *mut u32).write_unaligned(_mm_cvtsi128_si32(_mm256_cvtepi64_epi8(fl)) as u32);
+        (st.flags.as_mut_ptr().add(i) as *mut u64).write_unaligned(_mm_cvtsi128_si64(_mm512_cvtepi64_epi8(fl)) as u64);
         // The lines with more to do, in order: their numbers picked out of
-        // the four packed in a word.
-        let mk = ((ingest | purchase) & live) as usize;
-        let numbers = 0x0302_0100u32 + 0x0101_0101 * i as u32;
-        (st.more.as_mut_ptr().add(nmore) as *mut u32).write_unaligned(_pext_u32(numbers, *PICK.get_unchecked(mk)));
+        // the eight packed in a word.
+        let mk = ((ingest | purchase) & live) as u64;
+        let numbers = 0x0706_0504_0302_0100u64 + LOW * i as u64;
+        (st.more.as_mut_ptr().add(nmore) as *mut u64).write_unaligned(_pext_u64(numbers, _pdep_u64(mk, LOW) * 0xFF));
         nmore += mk.count_ones() as usize;
-        i += 4;
+        i += W;
     }
     nmore
 }
@@ -387,7 +367,7 @@ unsafe fn checked(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
     }
     let mut base = *st;
     let nb = stage_decode(ctx, &mut base, n, loc0);
-    let nw = decode4(ctx, st, n, loc0);
+    let nw = decode8(ctx, st, n, loc0);
     for i in 0..n {
         let (fw, fb) = (st.flags[i], base.flags[i]);
         if fw != fb {

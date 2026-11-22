@@ -770,8 +770,8 @@ struct Stage {
     /// Scratch: the current line's field starts and lengths (see `fields`).
     sl: [u64; 2],
     /// Lines with more to do after `decode`: a lateness check on the value of
-    /// ingest_ts, or a purchase. (The wide path appends four bytes at a time.)
-    more: [u8; NB + 4],
+    /// ingest_ts, or a purchase. (The wide path appends eight bytes at a time.)
+    more: [u8; NB + 8],
 }
 
 impl Stage {
@@ -787,7 +787,7 @@ impl Stage {
             ts: [0; NB],
             flags: [0; NB],
             sl: [0; 2],
-            more: [0; NB + 4],
+            more: [0; NB + 8],
         }
     }
 }
