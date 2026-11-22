@@ -131,6 +131,35 @@ wall time unchanged (20M 437 / 442 against 439 / 443 with `SS_CALIBRATE=0`; 60M
 only taken where it measures faster. Diagnostic image of v4:
 `575ddf8add4781538b57bd865f5e35b310d01fce` (`diag-v5c`).
 
+**06:10 UTC: v4 passed its full gate** (`CANDIDATE-OK`, tag `cand-v4`) and went to the
+user as the commit to enter; the tests fork ran 710 runs aimed at the calibration
+(one-file sets whose first 512 KB is a whale, all long IDs, all malformed, the longest
+lines, link storms; files of exactly 4 MB minus one byte and 4 MB; 1, 2, 3, 4, 8
+threads) without a failure. Both forks have finished and reported.
+
+**The scorers' processors are known after all** (official starter README, which the
+earlier notes had lost): "Google Cloud n2 Intel Xeon machines, Cascade Lake or newer,
+with AVX-512 available". So every scorer runs one of the two wide instances, and v2's
+0.6919 s, taken on the base path, came from a Cascade Lake machine.
+
+After v4, measured on EC2 and not adopted: each thread pinned to a processor of its own
+(no difference); each 1 MB chunk of input mapped in one call before it is parsed
+(1.4% slower; it would only pay where the kernel maps one page per fault, which could
+not be reproduced here: kernel 7.0 maps a whole large folio per fault whatever
+`fault_around_bytes` says); `-C llvm-args=-x86-branches-within-32B-boundaries`
+(padding against Cascade Lake's JCC erratum: 0.3 to 0.8% slower here, where there is
+nothing to mitigate; our hot loops have few branches, so no gain is to be expected
+there either). `scripts/remote/faultaround.sh`, `flagab.sh` repeat these.
+
+Competitor repositories (the user asked for a look at Team 67's `express-lane`, MIT
+licence, carrying a request to other teams' tools not to use it; the user overrode
+that): read its build files and system layer only. Nothing was taken from it. What it
+showed: built for `target-cpu=cascadelake` with a re-exec fallback on a fault; all
+input mapped into one region; a start-up probe for whether a page fault maps the
+neighbouring pages, switching to reads if not (the idea behind the chunk experiment
+above); threads pinned by hyperthread siblings; parallel release of memory at exit as
+ours.
+
 Measured and left alone after v3: marking the input mappings sequential (no change in
 the 13 ms the release of memory takes at the end: it is work per page, done by all
 threads, and still 8 ms better than leaving it to the exit); the campaign counters of
