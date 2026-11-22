@@ -126,6 +126,12 @@ static PICK: [u32; 16] = {
 /// Decode the batch's lines: `super::stage_decode`, on this path.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
 pub(super) unsafe fn decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
+    if !ctx.dates.wide_ok {
+        // A window too long for the table of days by day of the month: the
+        // ordinary decoder, which then sends every dated timestamp to the
+        // scalar path.
+        return stage_decode(ctx, st, n, loc0);
+    }
     if wide_check() {
         return checked(ctx, st, n, loc0);
     }
@@ -146,9 +152,24 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
     // A position in the window's days, capped at the start of the last one
     // (see the division below).
     let day_cap = v!(last_day * DAY_MS as u64);
-    let dom_text = dt.dom_text.as_ptr() as *const i64;
-    let dom_ms = dt.dom_ms.as_ptr();
-    let day_text = dt.day_text.as_ptr() as *const i64;
+    let (ym_a, ym_b) = (v!(dt.ym[0]), v!(dt.ym[1]));
+    let (days_a, days_b) = (v!(dt.ym_days[0]), v!(dt.ym_days[1]));
+    let (base_a, base_b) = (v!(dt.ym_base[0]), v!(dt.ym_base[1]));
+    // The day a date's text names, if it is one of the days of the table
+    // (`DateTab::dom_text`): from the text's first eight bytes and the two
+    // after them. The first eight must be one of the two months', the next
+    // two digits, and the day they spell one of that month's in the table.
+    macro_rules! day_of {
+        ($q0:expr, $q1:expr) => {{
+            let t = xor!(and!($q1, v!(0xFFFFu64)), v!(0x3030u64));
+            let digits = _mm256_testn_epi64_mask(or!(add!(t, v!(0x7676u64)), t), v!(0x8080u64));
+            let dd = add!(mul!(and!(t, byte), v!(10)), srl!(t, 8));
+            let (ka, kb) = (_mm256_cmpeq_epi64_mask($q0, ym_a), _mm256_cmpeq_epi64_mask($q0, ym_b));
+            let set = _mm256_mask_mov_epi64(_mm256_maskz_mov_epi64(ka, days_a), kb, days_b);
+            let base = _mm256_mask_mov_epi64(_mm256_maskz_mov_epi64(ka, base_a), kb, base_b);
+            (digits & _mm256_test_epi64_mask(_mm256_srlv_epi64(set, dd), v!(1)), add!(base, mul!(dd, v!(DAY_MS))))
+        }};
+    }
     let swap = _mm256_setr_epi8(
         7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
     );
@@ -212,32 +233,34 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
             *st.home.get_unchecked_mut(i + j) = ctx.table.prefetch_home(*st.key.get_unchecked(i + j)) as u32;
         }
 
-        // ts: bytes 0..24 of the field, and the 16 bytes that end where it ends.
+        // ts: bytes 0 to 23 of the field, and eight more that depend on its
+        // form: bytes 17 to 24 for F2 (its offset), the last eight otherwise
+        // (the last one is looked at for a field of no known form).
         let (a2, n2) = (at!(2), ln!(2));
-        let (g0, g1, g2, g17) = (gather!(a2, 0), gather!(a2, 8), gather!(a2, 16), gather!(a2, 17));
-        let end = add!(a2, n2);
-        let (hi8, lo8) = (gather!(end, -16), gather!(end, -8));
+        let (g0, g1, g2) = (gather!(a2, 0), gather!(a2, 8), gather!(a2, 16));
         let kf1 = _mm256_cmpeq_epi64_mask(n2, v!(20));
         let kf2 = _mm256_cmpeq_epi64_mask(n2, v!(25));
         let kf3 = _mm256_cmplt_epu64_mask(sub!(n2, v!(1)), v!(16));
+        let gx = gather!(_mm256_mask_mov_epi64(add!(a2, n2), kf2, add!(a2, v!(25))), -8);
 
-        // F1 and F2 (see `super::event_ts`): the day by its day of the month,
-        // the text of the date compared, the time of day.
-        let d8 = and!(g1, v!(15));
-        let dom = add!(add!(sll!(d8, 3), sll!(d8, 1)), and!(srl!(g1, 8), v!(15)));
-        let dom2 = sll!(dom, 1);
-        let date_ok = _mm256_cmpeq_epi64_mask(g0, _mm256_i64gather_epi64::<8>(dom_text, dom2))
-            & _mm256_testn_epi64_mask(xor!(g1, _mm256_i64gather_epi64::<8>(dom_text.add(1), dom2)), v!(0xFF_FFFFu64));
+        // F1 and F2 (see `super::event_ts`): the date is one of the table's
+        // days, then `T`, then the time of day. (The table's unused entries
+        // are sixteen 0xFF bytes at day start 0, which eleven 0xFF bytes for
+        // a date match: so they do here.)
+        let (in_table, day_ms) = day_of!(g0, g1);
+        let all_ff = _mm256_cmpeq_epi64_mask(g0, ones)
+            & _mm256_cmpeq_epi64_mask(and!(g1, v!(0xFF_FFFFu64)), v!(0xFF_FFFFu64));
+        let date_ok = (in_table & _mm256_cmpeq_epi64_mask(and!(srl!(g1, 16), byte), v!(b'T'))) | all_ff;
         let d = xor!(or!(srl!(g1, 24), sll!(g2, 40)), v!(0x3030_3A30_303A_3030u64));
         let over = and!(or!(add!(d, v!(0x767A_7F76_7A7F_767Du64)), d), v!(HIGH));
         let y = add!(add!(d, sll!(d, 9)), sll!(d, 11)); // d * 0xA01
         let hh = and!(srl!(y, 8), byte);
         let secs = add!(add!(mul!(hh, v!(3600)), mul!(and!(srl!(y, 32), byte), v!(60))), srl!(y, 56));
-        let ms1 = add!(_mm256_i64gather_epi64::<8>(dom_ms, dom), mul!(secs, v!(1000)));
+        let ms1 = add!(_mm256_maskz_mov_epi64(!all_ff, day_ms), mul!(secs, v!(1000)));
         let bad1 = !date_ok | _mm256_cmpneq_epi64_mask(over, zero) | _mm256_cmpgt_epu64_mask(hh, v!(23));
         let sfx = and!(srl!(g2, 24), byte);
-        // F2's offset: bytes 20 to 24 are bytes 3 to 7 of `g17`.
-        let u = and!(_mm256_sub_epi8(g17, v!(0x3030_3A30_3000_0000u64)), v!(0xFFFF_FFFF_FF00_0000u64));
+        // F2's offset: bytes 20 to 24 are bytes 3 to 7 of `gx`.
+        let u = and!(_mm256_sub_epi8(gx, v!(0x3030_3A30_3000_0000u64)), v!(0xFFFF_FFFF_FF00_0000u64));
         let lim = v!(0x0909_0009_0900_0000u64);
         let y2 = add!(add!(u, sll!(u, 9)), sll!(u, 11));
         let (oh, om) = (and!(srl!(y2, 32), byte), srl!(y2, 56));
@@ -249,7 +272,16 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
         let off = mul!(add!(mul!(oh, v!(60)), om), v!(60_000));
         let ms2 = _mm256_mask_add_epi64(sub!(ms1, off), minus, ms1, off);
 
-        // F3 (see `super::digits16`): the last `n2` of the 16 bytes are digits.
+        // F3 (see `super::digits16`): 1 to 16 digits. They are in `g0` and
+        // `g1`; moved up by `16 - n2` bytes they are the sixteen bytes that
+        // end where the field ends, with zeros before the field's start
+        // (which, like whatever is really there, are not looked at).
+        let up = sll!(sub!(v!(16), n2), 3);
+        let hi8 = _mm256_sllv_epi64(g0, up);
+        let lo8 = or!(
+            _mm256_sllv_epi64(g1, up),
+            or!(_mm256_srlv_epi64(g0, sub!(v!(64), up)), _mm256_sllv_epi64(g0, sub!(up, v!(64))))
+        );
         let n2lo = _mm256_min_epu64(n2, v!(8));
         let keep_lo = _mm256_sllv_epi64(ones, sub!(v!(64), sll!(n2lo, 3)));
         let keep_hi = _mm256_sllv_epi64(ones, sub!(v!(64), sll!(sub!(n2, n2lo), 3)));
@@ -270,7 +302,7 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
         let kf12 = kf1 | kf2;
         let maybe_digits = _mm256_cmpneq_epi64_mask(n2, zero)
             & _mm256_cmplt_epu64_mask(sub!(and!(g0, byte), v!(b'0')), v!(10))
-            & _mm256_cmplt_epu64_mask(sub!(srl!(lo8, 56), v!(b'0')), v!(10));
+            & _mm256_cmplt_epu64_mask(sub!(srl!(gx, 56), v!(b'0')), v!(10));
         let ts_dead = (kf12 & bad1) | (!(kf12 | kf3) & maybe_digits);
         let ts_ok = (kf1 & !bad1 & _mm256_cmpeq_epi64_mask(sfx, v!(b'Z')))
             | (kf2 & !bad1 & ok2)
@@ -279,20 +311,20 @@ unsafe fn decode4(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
         let in_window = _mm256_cmplt_epu64_mask(sub!(ms, ws), span);
         _mm_storeu_si128(st.ts.as_mut_ptr().add(i) as *mut __m128i, _mm256_cvtepi64_epi32(sub!(ms, t0)));
 
-        // ingest_ts on the same UTC day as ts? Its first ten bytes against the
-        // day of ts as text: ts's own text when that is F1, else the text of
-        // the window's day `(ms - first day) / DAY_MS`. Capped, the dividend is
+        // ingest_ts on the same UTC day as ts? `super::stage_decode` compares
+        // its first ten bytes with the text of the day of ts; for an event
+        // that is valid (the flag is not used otherwise), that is: its date
+        // is one of the table's days, the one `ms` falls on. The window's day
+        // of `ms` is `(ms - first day) / DAY_MS`; capped, the dividend is
         // below 2^32, and for such `x`, `x / DAY_MS` is `(x >> 10) / 84375`,
         // which is `((x >> 10) * 3335999724) >> 48` exactly.
         let (a3, n3) = (at!(3), ln!(3));
         let (i0, i8, i12) = (gather!(a3, 0), gather!(a3, 8), gather!(a3, 12));
         let x = _mm256_min_epu64(sub!(ms, first_day), day_cap);
-        let day2 = sll!(srl!(mul!(srl!(x, 10), v!(3_335_999_724u64)), 48), 1);
-        let not_f1 = _mm256_movm_epi64(!kf1);
-        let dq0 = _mm256_mask_i64gather_epi64::<8>(g0, day_text, day2, not_f1);
-        let dq1 = _mm256_mask_i64gather_epi64::<8>(g1, day_text.add(1), day2, not_f1);
-        let same_day = _mm256_cmpeq_epi64_mask(i0, dq0)
-            & _mm256_testn_epi64_mask(xor!(i8, dq1), v!(0xFFFFu64))
+        let day = srl!(mul!(srl!(x, 10), v!(3_335_999_724u64)), 48);
+        let (ingest_in_table, ingest_day_ms) = day_of!(i0, i8);
+        let same_day = ingest_in_table
+            & _mm256_cmpeq_epi64_mask(ingest_day_ms, add!(first_day, mul!(day, v!(DAY_MS))))
             & _mm256_cmpeq_epi64_mask(srl!(i12, 56), v!(b'Z'));
 
         // view / cart / purchase, exactly; a product.
