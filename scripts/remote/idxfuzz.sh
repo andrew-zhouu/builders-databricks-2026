@@ -11,6 +11,9 @@
 #   BINARY: a path, or a name in bin/ (default: the current build)
 #   env: SETTINGS=plain  thread counts, chunk sizes, scalar path, partition sizes (default)
 #        SETTINGS=simd   plain, and the SIMD parser's switches (SS_SIMD=0, SS_SIMD_CHECK=1)
+#        SETTINGS=split  for the block-wise splitter (branch exp-split): its self-checks
+#                        (SS_SPLIT_CHECK=1, SS_SIMD_CHECK=1), SS_WSPLIT=0, SS_SIMD=0, chunk ends
+#                        at and around multiples of 64; and mutations chosen for it
 #        SETTINGS=index  the switches of the index back end (branch exp-index)
 #        MUTATION=name   every seed with this mutation (default: by seed)
 #        EVENTS=n        every seed with this many events (default: by seed)
@@ -28,7 +31,15 @@ names=(none irregular outrange copies disorder gaps nested links wide drop irrfi
        clickshapes linkshapes shapes,clickshapes,linkshapes identityids identityids,mix shapes,copies mix mix mix mix
        emptyevents mix,shapes mix,shapes,clickshapes identityids,copies,gaps,nested userlengths endings
        shapes,userlengths,endings userlengths,mix shapes,clickshapes,linkshapes,userlengths,endings,copies
-       lateness values lateness,shapes values,shapes,endings lateness,values,userlengths,clickshapes)
+       lateness values lateness,shapes values,shapes,endings lateness,values,userlengths,clickshapes
+       stretches stretches,shapes stretches,stretches,endings)
+if [ "$mode" = split ]; then
+  # What a block-wise line splitter has to get right, first of all.
+  names=(splitter splitter,shapes splitter,endings shapes,endings splitter,stretches mix,splitter
+         splitter,userlengths,values none shapes stretches,splitter,endings mix splitter,clickshapes,linkshapes
+         splitter,copies,endings values,splitter mix,splitter,shapes,endings)
+fi
+marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
 fails=0; runs=0
 for seed in $(seq "$first" $((first + count - 1))); do
@@ -75,6 +86,22 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "check|NCPU=4 SS_SIMD_CHECK=1"
       "check1|NCPU=1 SS_SIMD_CHECK=1 SS_CHUNK_BYTES=$((seed % 211 + 97))"
       "nosimd-tiny|NCPU=3 SS_SIMD=0 SS_CHUNK_BYTES=$((seed % 97 + 31))") ;;
+    split) settings=(
+      "default|NCPU=3"
+      "one|NCPU=1"
+      "eight|NCPU=8"
+      "splitcheck|NCPU=4 SS_SPLIT_CHECK=1"
+      "simdcheck|NCPU=4 SS_SIMD_CHECK=1"
+      "bothcheck|NCPU=2 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+      "nowsplit|NCPU=4 SS_WSPLIT=0"
+      "nosimd|NCPU=4 SS_SIMD=0"
+      "tiny|NCPU=4 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "markcheck|NCPU=3 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1 SS_CHUNK_BYTES=${marks[$((seed % ${#marks[@]}))]}"
+      "mark|NCPU=5 SS_CHUNK_BYTES=${marks[$(((seed / 3 + 5) % ${#marks[@]}))]}"
+      "tiny8|NCPU=8 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
+      "chunkcheck|NCPU=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed % 4096 + 2048))"
+      "scalar|NCPU=2 SS_SCALAR=1"
+      "manyparts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))") ;;
     index) settings=(
       "default|NCPU=3"
       "one|NCPU=1"
@@ -98,7 +125,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
     # shellcheck disable=SC2086
     env $vars timeout 300 "$BIN" "$d/data" "$o" 2> "$o.log"; rc=$?
     if [ $rc != 0 ]; then
-      echo "FAIL $tag setting $label ($vars): exit code $rc $(tail -1 "$o.log" | cut -c1-200)"; bad="$bad $label"; continue
+      echo "FAIL $tag setting $label ($vars): exit code $rc $(tail -4 "$o.log" | tr '\n' ' ' | cut -c1-500)"; bad="$bad $label"; continue
     fi
     if ! "$PY" -I tools/cmp.py "$d/slow" "$o" > "$o.cmp" 2>&1; then
       echo "FAIL $tag setting $label ($vars): $(grep -m5 -E 'rows|A:|B:' "$o.cmp" | tr '\n' ' ' | cut -c1-400)"; bad="$bad $label"

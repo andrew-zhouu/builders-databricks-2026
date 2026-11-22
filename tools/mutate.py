@@ -147,9 +147,11 @@ def split_fields(line, count):
 
 
 class Line:
-    __slots__ = ("raw", "f", "file", "changed", "gone", "new", "quotes")
+    __slots__ = ("raw", "f", "file", "changed", "gone", "new", "quotes", "members", "held")
 
     def __init__(self, raw, fields, file):
+        self.members = None     # a block: texts and Lines written one after the other, in this line's place
+        self.held = False       # written as a member of a block, not on its own
         self.raw = raw          # the text as read (written back for lines nobody touched)
         self.f = fields         # the seven values, or None for a malformed line
         self.file = file
@@ -1111,6 +1113,211 @@ def values(D):
     D.notes.append(f"values {made}")
 
 
+def stretches(D):
+    """Stretches of 70 to 400 consecutive lines of one file that all need the
+    same rare treatment: all purchases, all with ingest_ts on the UTC day
+    after ts, all with a user ID no shortcut takes, all with a long event ID.
+    (A parser that works in batches keeps a short list of the lines with more
+    to do; here it is every line of the batch.)"""
+    R = D.R
+    by_file = {}
+    for line in D.events:
+        if not line.new:
+            by_file.setdefault(line.file, []).append(line)
+    files = [lines for lines in by_file.values() if len(lines) >= 80]
+    R.shuffle(files)
+    clusters = {}
+    for line in D.events:
+        if line.f and line.f[0]:
+            clusters.setdefault((line.f[0], line.f[3]), []).append(line)
+    made = []
+    for lines in files[:6]:
+        size = min(len(lines), R.choice([70, 128, 129, 200, 257, 400]))
+        start = R.randrange(len(lines) - size + 1)
+        style = R.choice(["purchase", "midnight", "both", "user", "longid", "quoted"])
+        seen = set()
+        for line in lines[start:start + size]:
+            if line.f is None or not line.f[0] or (line.f[0], line.f[3]) in seen:
+                continue
+            f = list(line.f)
+            key = (f[0], f[3])
+            if any(l.f != f for l in clusters.get(key, [])):
+                continue
+            when = parse_ts(f[2])
+            if style in ("purchase", "both"):
+                f[4] = "purchase"
+                f[5] = f[5] or "p1"
+                f[6] = str(R.choice([1, 250, 4999, 10_000_000, R.randint(1, 50000)]))
+            if style in ("midnight", "both") and when is not None and D.ws <= when < D.we:
+                # The last seconds of a UTC day; ingested in the first seconds of the next.
+                day_end = when - when % DAY + DAY
+                t = day_end - R.randint(1, 30) * 1000
+                if D.ws <= t < D.we:
+                    f[2] = D.ts_text(t)
+                    stamp = day_end + R.randint(0, 600) * 1000
+                    while (f[0], f1(stamp)) in clusters or (f[0], f1(stamp)) in seen:
+                        stamp += 1000
+                    f[3] = f1(stamp)
+            if style == "user" and f[1]:
+                f[1] = R.choice([f[1] + "0123456789", f[1].upper(), " " + f[1], f[1] + "\xc3\xa9"])
+            if style == "longid":
+                f[0] = f[0] + "".join(R.choice(DIGITS) for _ in range(R.randint(2, 12)))
+            seen.add((f[0], f[3]))
+            mask = 127 if style == "quoted" else None
+            for twin in clusters.get(key, [line]):
+                twin.f = list(f)
+                twin.changed = True
+                twin.quotes = mask
+        made.append(f"{style} {size}")
+    D.notes.append("stretches " + ", ".join(made))
+
+
+def splitter(D):
+    """For a splitter that works on 64-byte blocks, eight lines at a step:
+    the third comma of a line at byte 61 to 66, the newline 62 to 66 bytes
+    after it, quotes on either side of those marks; runs of empty and of one-
+    to seven-byte lines (more than eight line ends inside one block) among
+    ordinary lines; lines with no comma, five, seven; lines of 9,000 to 20,000
+    bytes followed by ordinary ones; a lone quote for a field, `""` for every
+    field; runs of lines with an empty event_id, quoted or not, long enough to
+    cross every batch boundary."""
+    R = D.R
+    clusters = {}
+    for line in D.events:
+        if line.f and line.f[0]:
+            clusters.setdefault((line.f[0], line.f[3]), []).append(line)
+    keys = list(clusters)
+    R.shuffle(keys)
+    placed = 0
+    for key in keys[:max(80, len(keys) // 4)]:
+        lines = clusters[key]
+        f = list(lines[0].f)
+        if any(l.f != f for l in lines):
+            continue
+        ms = parse_ts(f[2])
+        mask = quote_mask(R, 7)
+        q = [mask >> i & 1 for i in range(7)]
+        # Where the third comma is: the first three fields, their quotes, two commas.
+        if ms is not None and 0 <= ms < 10 ** 14:
+            want = R.choice([61, 62, 63, 64, 65, 66, 125, 126, 127, 128, 129])
+            other = len(f[0]) + len(f[1]) + 2 + 2 * (q[0] + q[1] + q[2])
+            if want - other >= len(str(ms)):
+                f[2] = str(ms).zfill(want - other)
+        # Where the newline is, counted from the third comma: the last four
+        # fields, their quotes, three commas, and one.
+        want = R.choice([61, 62, 63, 64, 65, 66, 67, 127, 128, 129])
+        rest = len(f[3]) + len(f[4]) + len(f[5]) + len(f[6]) + 3 + 2 * (q[3] + q[4] + q[5] + q[6]) + 1
+        if want > rest:
+            if f[4] == "purchase":
+                if f[6] and all(c in "0123456789" for c in f[6]):
+                    f[6] = "0" * (want - rest) + f[6]
+            elif f[5]:
+                f[5] = f[5] + "y" * (want - rest)
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask
+        placed += 1
+    # A few lines far longer than anything a batch scans in one go.
+    long_ones = 0
+    for key in keys[-12:]:
+        lines = clusters[key]
+        f = list(lines[0].f)
+        if any(l.f != f for l in lines) or f[4] == "purchase" or not f[5]:
+            continue
+        f[5] = f[5] + "z" * R.randint(9000, 20000)
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+        long_ones += 1
+
+    model = next((l.f for l in D.events if l.f and l.f[0] and parse_ts(l.f[2]) is not None), None)
+    if model is None or not D.event_files:
+        D.notes.append(f"splitter {placed} placed")
+        return
+
+    model = list(model)
+
+    def block(members):
+        """Lines that stay together, at a random place in a random file."""
+        line = Line(None, None, R.randrange(len(D.event_files)))
+        line.new = True
+        line.members = members
+        D.events.append(line)
+
+    def empty_id():
+        f = list(model)
+        f[0] = ""
+        f[1] = R.choice(D.users)
+        text = ",".join(f)
+        return R.choice([text, '""' + text, text, '""' + text, '"",' + ",".join('"' + v + '"' for v in f[1:])])
+
+    def ordinary():
+        """A copy of a line of the data (the same values, the same ingest_ts:
+        an identical copy by the rules). It is a line like any other for the
+        mutations that follow, so the copies stay identical."""
+        source = R.choice(D.events)
+        if source.f is None or source.members is not None:
+            return None
+        copy = Line(source.raw, list(source.f), source.file)
+        copy.changed, copy.quotes, copy.held = source.changed, source.quotes, True
+        D.events.append(copy)
+        return copy
+
+    shorts = ["", "", "", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", ",", ",,", '"', '""', ",,,,,,", "1,2,3",
+              ",,,,,", ",,,,,,,", '"",', '""""', "\r", " "]
+    runs = 0
+    for _ in range(R.randint(6, 14)):
+        kind = R.choice(["short", "short", "empty", "mixed", "emptyid", "emptyid", "commas", "quotes", "long", "sevens", "sevens"])
+        size = R.choice([1, 2, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 70, 130, 300])
+        texts = []
+        if kind == "short":
+            texts = [R.choice(shorts) for _ in range(size)]
+        elif kind == "sevens":
+            # Seven empty fields in seven bytes: the shortest line that has the
+            # right shape (and no event_id). Nine of them end inside one block.
+            for _ in range(size):
+                r = R.random()
+                texts.append(",,,,,," if r < 0.7 else '"",,,,,,' if r < 0.8 else ',,,,,,""' if r < 0.9 else (ordinary() or ",,,,,,"))
+        elif kind == "empty":
+            texts = [""] * size
+        elif kind == "mixed":
+            for _ in range(size):
+                texts.append(R.choice(shorts) if R.random() < 0.7 else (ordinary() or ""))
+        elif kind == "emptyid":
+            for _ in range(size):
+                texts.append(empty_id() if R.random() < 0.8 else (ordinary() or empty_id()))
+        elif kind == "commas":
+            body = ",".join(model)
+            for _ in range(size):
+                # (Cut before the last comma: never seven fields.)
+                texts.append(R.choice(["x" * R.randint(1, 200), body.rsplit(",", 1)[0], body + ",x", body + ",", "," + body,
+                                       body.replace(",", ";"), body.replace(",", ",,", 1), body[:R.randrange(body.rfind(","))]]))
+        elif kind == "quotes":
+            parts = list(model)
+            filled = [k for k in range(7) if parts[k]]
+            for _ in range(size):
+                at = R.choice(filled)                     # (a field with something in it: every variant is malformed)
+                texts.append(R.choice([
+                    ",".join(parts[:at] + ['"'] + parts[at + 1:]),                    # a lone quote for a field
+                    ",".join(['""'] * 7),                                             # nothing but quoted nothing
+                    ",".join(parts[:at] + ['"' + parts[at]] + parts[at + 1:]),        # opened, never closed
+                    ",".join(parts[:at] + [parts[at] + '"'] + parts[at + 1:]),        # closed, never opened
+                    ",".join(parts[:at] + ['"' + parts[at] + '""'] + parts[at + 1:]),
+                    '"' + ",".join(parts) + '"',                                      # quotes at both ends of the line
+                    ",".join(parts[:at] + ['""' + parts[at]] + parts[at + 1:]),
+                ]))
+        else:
+            texts = [R.choice(["x" * R.randint(9000, 20000), ",".join(model) + "w" * R.randint(9000, 20000) + '"',
+                               "," * R.randint(9000, 12000)])]
+            texts += [ordinary() or "" for _ in range(R.randint(1, 20))]
+        # Copies of ordinary lines are fine (identical, same ingest_ts); the
+        # rest is malformed or has no event_id.
+        block(texts)
+        runs += 1
+    D.notes.append(f"splitter {placed} placed, {long_ones} long, {runs} runs")
+
+
 def endings(D):
     """Files that end without a newline after their last line, or with an
     empty line (a malformed line by the rules), in all three folders."""
@@ -1119,10 +1326,11 @@ def endings(D):
 
 
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
-                                     purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, endings,
-                                     identityids, emptyevents, noeventfiles]}
+                                     purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
+                                     splitter, endings, identityids, emptyevents, noeventfiles]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
-           "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "endings"]
+           "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
+           "splitter", "splitter", "endings"]
 
 
 # ------------------------------------------------------------------ writing
@@ -1152,7 +1360,7 @@ def write(D, out_dir):
     per_file = [[] for _ in D.event_files]
     added = [[] for _ in D.event_files]
     for line in D.events:
-        if not line.gone:
+        if not line.gone and not line.held:
             (added if line.new else per_file)[line.file].append(line)   # a line of the input keeps its place
     for number, extra in enumerate(added):
         for line in extra:
@@ -1160,19 +1368,30 @@ def write(D, out_dir):
     # What the rules promise: copies with equal ingest_ts are identical. A line
     # that would break it (two mutations met on one event) is left out.
     seen = {}
+
+    def emit(line, out):
+        if line.f is None:
+            out.append(line.raw)
+            return
+        text = encode(D, line.f, line.quotes) if line.changed or line.raw is None else line.raw
+        if line.f[0]:
+            key = (line.f[0], line.f[3])
+            if seen.setdefault(key, line.f) != line.f:
+                return
+        out.append(text)
+
     texts = []
     for number, lines in enumerate(per_file):
         out = []
         for line in lines:
-            if line.f is None:
-                out.append(line.raw)
+            if line.members is None:
+                emit(line, out)
                 continue
-            text = encode(D, line.f, line.quotes) if line.changed or line.raw is None else line.raw
-            if line.f[0]:
-                key = (line.f[0], line.f[3])
-                if seen.setdefault(key, line.f) != line.f:
-                    continue
-            out.append(text)
+            for member in line.members:
+                if isinstance(member, str):
+                    out.append(member)
+                elif not member.gone:
+                    emit(member, out)
         texts.append(out)
     if not D.drop_event_files:
         for (name, header, _), lines in zip(D.event_files, texts):

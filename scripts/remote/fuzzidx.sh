@@ -25,6 +25,7 @@ fails=0; runs=0
 case "$mode" in
   plain) outer=("auto|") ;;
   simd) outer=("auto|" "nosimd|SS_SIMD=0" "check|SS_SIMD_CHECK=1") ;;
+  split) outer=("auto|" "check|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1" "nowsplit|SS_WSPLIT=0") ;;
   index) outer=(
     "auto|"
     "off|SS_INDEX=0"
