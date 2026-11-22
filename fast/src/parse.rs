@@ -1166,6 +1166,37 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
     nmore
 }
 
+const _: () = assert!(NB == 64);
+
+/// The numbers of the first `n` lines of a batch whose flags, under `mask`,
+/// are `want`: into `list`, in order. Returns how many. (The batch's 64 flags
+/// are compared at once and the list is made from the bits: most lines are
+/// not on it.)
+#[inline(always)]
+unsafe fn flagged(flags: &[u8; NB], n: usize, mask: u8, want: u8, list: &mut [u8; NB]) -> usize {
+    let pick = |k: usize| {
+        let v = _mm256_loadu_si256(flags.as_ptr().add(32 * k) as *const __m256i);
+        let hit = _mm256_cmpeq_epi8(_mm256_and_si256(v, _mm256_set1_epi8(mask as i8)), _mm256_set1_epi8(want as i8));
+        _mm256_movemask_epi8(hit) as u32 as u64
+    };
+    let mut bits = _bzhi_u64(pick(0) | pick(1) << 32, n as u32);
+    let mut m = 0usize;
+    while bits != 0 {
+        *list.get_unchecked_mut(m) = bits.trailing_zeros() as u8;
+        bits &= bits - 1;
+        m += 1;
+    }
+    m
+}
+
+/// Where the user_id of an event or click line is (the second field of
+/// both): after the line's first comma (byte 0 of `sep`), and after its
+/// opening quote if it has one (bit 1 of byte 7). As `fields` has it.
+#[inline(always)]
+unsafe fn user_at(p: *const u8, sep: u64) -> *const u8 {
+    p.add((sep & 0xFF) as usize + 1 + (sep >> 57 & 1) as usize)
+}
+
 /// The users of the valid lines that `decode` flagged `F_LONG`: 33 bytes,
 /// which is a long ID if they are `u` and 32 lowercase hexadecimal digits
 /// (ids.rs). Its key is its slot in the table of long IDs, which is asked for
@@ -1175,34 +1206,29 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
 #[inline(never)]
 unsafe fn stage_long(ctx: &Ctx, st: &mut Stage, n: usize) {
     let mut list = [0u8; NB];
-    let mut m = 0usize;
-    for i in 0..n {
-        *list.get_unchecked_mut(m) = i as u8;
-        m += (*st.flags.get_unchecked(i) & (F_LONG | F_VALID | F_DEAD) == F_LONG | F_VALID) as usize;
-    }
+    let m = flagged(&st.flags, n, F_LONG | F_VALID | F_DEAD, F_LONG | F_VALID, &mut list);
     if m == 0 {
         return;
     }
     let table = ctx.users.long.as_ref().unwrap_unchecked();
-    let mut value = [(0u64, 0u64); NB];
+    let mut value = [std::mem::MaybeUninit::<(u64, u64)>::uninit(); NB];
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
-        let (start, _) = fields(*st.sep.get_unchecked(i));
-        let a = (*st.p.get_unchecked(i)).add((start >> 8) as usize & 0xFF);
+        let a = user_at(*st.p.get_unchecked(i), *st.sep.get_unchecked(i));
         let (hex, hi, lo) = hex32(a.add(1));
         if !hex | (*a != b'u') | (hi == 0) | (lo == 0) {
             *st.flags.get_unchecked_mut(i) = F_DEAD;
             continue;
         }
         table.prefetch(hi, lo);
-        *value.get_unchecked_mut(k) = (hi, lo);
+        value.get_unchecked_mut(k).write((hi, lo));
     }
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
         if *st.flags.get_unchecked(i) & F_DEAD != 0 {
             continue;
         }
-        let (hi, lo) = *value.get_unchecked(k);
+        let (hi, lo) = value.get_unchecked(k).assume_init_read();
         // (Neither half is zero, so there is a key.)
         let key = ctx.users.long_key(hi, lo).unwrap_unchecked();
         *st.key.get_unchecked_mut(i) = key;
@@ -1603,34 +1629,29 @@ unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
 #[inline(never)]
 unsafe fn click_long(ctx: &Ctx, st: &mut ClickStage, n: usize) {
     let mut list = [0u8; NB];
-    let mut m = 0usize;
-    for i in 0..n {
-        *list.get_unchecked_mut(m) = i as u8;
-        m += (*st.flags.get_unchecked(i) == C_VALID | C_LONG) as usize;
-    }
+    let m = flagged(&st.flags, n, 0xFF, C_VALID | C_LONG, &mut list);
     if m == 0 {
         return;
     }
     let table = ctx.users.long.as_ref().unwrap_unchecked();
-    let mut value = [(0u64, 0u64); NB];
+    let mut value = [std::mem::MaybeUninit::<(u64, u64)>::uninit(); NB];
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
-        let (start, _) = fields(*st.sep.get_unchecked(i));
-        let a = (*st.p.get_unchecked(i)).add((start >> 8) as usize & 0xFF);
+        let a = user_at(*st.p.get_unchecked(i), *st.sep.get_unchecked(i));
         let (hex, hi, lo) = hex32(a.add(1));
         if !hex | (*a != b'u') | (hi == 0) | (lo == 0) {
             *st.flags.get_unchecked_mut(i) = C_DEAD;
             continue;
         }
         table.prefetch(hi, lo);
-        *value.get_unchecked_mut(k) = (hi, lo);
+        value.get_unchecked_mut(k).write((hi, lo));
     }
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
         if *st.flags.get_unchecked(i) == C_DEAD {
             continue;
         }
-        let (hi, lo) = *value.get_unchecked(k);
+        let (hi, lo) = value.get_unchecked(k).assume_init_read();
         let key = ctx.users.long_key(hi, lo).unwrap_unchecked();
         *st.user.get_unchecked_mut(i) = key;
         *st.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
