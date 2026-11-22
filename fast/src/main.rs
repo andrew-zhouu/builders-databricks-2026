@@ -437,6 +437,7 @@ fn worker(ctx: &Ctx, tid: usize) {
     // still being computed (see sys::start_writeback), and the row buffers
     // stay small.
     let mut files = 0usize;
+    let mut encoded = Encoded::default();
     loop {
         let i = ctx.next_s.fetch_add(1, Relaxed);
         if i >= ctx.ps {
@@ -445,7 +446,7 @@ fn worker(ctx: &Ctx, tid: usize) {
         pass3::run(ctx, &mut sc, order[i] as usize);
         if sc.rows.bytes() >= ctx.out_chunk {
             let t = ctx.now();
-            write_user_daily(ctx, &sc.rows, tid, files);
+            write_user_daily(ctx, &sc.rows, &mut encoded, tid, files);
             ctx.charge_rows(P_WRITE, t, sc.rows.n);
             files += 1;
             sc.rows.clear();
@@ -454,7 +455,7 @@ fn worker(ctx: &Ctx, tid: usize) {
     let t = ctx.now();
     // What is left; and the table always has a file, if only an empty one.
     if sc.rows.n > 0 || (tid == 0 && files == 0) {
-        write_user_daily(ctx, &sc.rows, tid, files);
+        write_user_daily(ctx, &sc.rows, &mut encoded, tid, files);
     }
     ctx.charge_rows(P_WRITE, t, sc.rows.n);
     unsafe { *ctx.acc[tid].0.get() = std::mem::take(&mut sc.acc) };
@@ -563,31 +564,58 @@ fn bench(ctx: &Ctx) {
     prof::write_samples();
 }
 
-fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
-    use parquet::{as_bytes, index_width, pack_indices, packed_run, rle_run, small_dict};
+/// What `write_user_daily` builds for a file, kept for the thread's next one.
+/// A thread writes many files, and memory given back in between costs more
+/// than the encoding: large blocks are mapped and unmapped each time, and an
+/// unmap interrupts every other thread.
+#[derive(Default)]
+struct Encoded {
+    order: Vec<u32>,
+    paid: Vec<u32>,
+    paid_at: Vec<u32>,
+    id_idx: Vec<u8>,
+    day_idx: Vec<u8>,
+    /// For sessions and for events: indexes, dictionary, value -> index, and
+    /// the plain values should there be no dictionary.
+    counts: [(Vec<u8>, Vec<i32>, Vec<u32>, Vec<i32>); 2],
+    amounts: Vec<i64>,
+    /// Open addressing by amount (never 0): the amount and its place in `amounts`.
+    seen: Vec<(i64, u32)>,
+    revenue_idx: Vec<u8>,
+    levels: Vec<u8>,
+    cat_idx: Vec<u8>,
+    days: Vec<i32>,
+    categories: Vec<u8>,
+}
+
+fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, e: &mut Encoded, tid: usize, seq: usize) {
+    use parquet::{as_bytes, index_width, pack_into, packed_run, rle_run, small_dict};
     let n = rows.n;
     // The order of rows in a file is free: the rows without revenue go first.
     // The revenue column and top_category's null flags (a row has a category
     // exactly when it has revenue: a purchase costs at least a cent) are then
     // two runs each, not a value and a bit per row.
-    let mut order: Vec<u32> = Vec::with_capacity(n + 1);
-    let mut paid: Vec<u32> = Vec::with_capacity(n + 1);
+    e.order.clear();
+    e.order.reserve(n + 1);
+    e.paid.clear();
+    e.paid.reserve(n + 1);
     unsafe {
         // Every row number is written to both lists; only one of them keeps it.
         let (mut a, mut b) = (0usize, 0usize);
         for i in 0..n {
             let zero = (*rows.revenue.get_unchecked(i) == 0) as usize;
-            *order.as_mut_ptr().add(a) = i as u32;
-            *paid.as_mut_ptr().add(b) = i as u32;
+            *e.order.as_mut_ptr().add(a) = i as u32;
+            *e.paid.as_mut_ptr().add(b) = i as u32;
             a += zero;
             b += 1 - zero;
         }
-        order.set_len(a);
-        paid.set_len(b);
+        e.order.set_len(a);
+        e.paid.set_len(b);
     }
-    let free = order.len();
-    order.extend_from_slice(&paid);
+    let free = e.order.len();
+    e.order.extend_from_slice(&e.paid);
     assert_eq!(rows.cats.len(), n - free, "a row has a top category exactly when it has revenue");
+    let order = &e.order[..];
 
     // Every column as a dictionary and indexes into it. A person's rows
     // follow each other (within each of the two parts), so their index is
@@ -599,8 +627,10 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
         runs += (v != last) as usize;
         last = v;
     }
-    let id_idx = if runs * (2 + (id_width as usize).div_ceil(8)) < n * id_width as usize / 8 {
-        let mut out = Vec::with_capacity(runs * 5 + 8);
+    if runs * (2 + (id_width as usize).div_ceil(8)) < n * id_width as usize / 8 {
+        let out = &mut e.id_idx;
+        out.clear();
+        out.reserve(runs * 5 + 8);
         out.push(id_width as u8);
         let mut it = ids_in_order();
         if let Some(mut value) = it.next() {
@@ -609,76 +639,86 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
                 if v == value {
                     count += 1;
                 } else {
-                    rle_run(&mut out, value, count, id_width);
+                    rle_run(out, value, count, id_width);
                     value = v;
                     count = 1;
                 }
             }
-            rle_run(&mut out, value, count, id_width);
+            rle_run(out, value, count, id_width);
         }
-        out
     } else {
-        pack_indices(ids_in_order(), n, id_width)
-    };
-    let days: Vec<i32> = (0..ctx.ndays as i64).map(|d| (ctx.day0 + d) as i32).collect();
-    let day_idx = pack_indices(order.iter().map(|&i| unsafe { *rows.day.get_unchecked(i as usize) } as u32), n, index_width(days.len()));
+        pack_into(&mut e.id_idx, ids_in_order(), n, id_width);
+    }
+    if e.days.is_empty() {
+        e.days = (0..ctx.ndays as i64).map(|d| (ctx.day0 + d) as i32).collect();
+        e.categories = ctx.cat_recs().concat();
+    }
+    pack_into(&mut e.day_idx, order.iter().map(|&i| unsafe { *rows.day.get_unchecked(i as usize) } as u32), n, index_width(e.days.len()));
     // Small counts: the distinct values. (Plain, should one ever be huge.)
-    let small = |values: &[i32]| {
-        small_dict(values).map(|(dict, index)| {
+    let mut coded = [false; 2];
+    for (k, values) in [&rows.sessions[..], &rows.events[..]].into_iter().enumerate() {
+        let (idx, dict, index, plain) = &mut e.counts[k];
+        coded[k] = small_dict(values, index, dict);
+        if coded[k] {
             let at = order.iter().map(|&i| unsafe { *index.get_unchecked(*values.get_unchecked(i as usize) as usize) });
-            (pack_indices(at, n, index_width(dict.len())), dict)
-        })
-    };
-    let plain = |values: &[i32]| -> Vec<i32> { order.iter().map(|&i| values[i as usize]).collect() };
-    let (sessions, events) = (small(&rows.sessions), small(&rows.events));
-    let sessions_plain = if sessions.is_none() { plain(&rows.sessions) } else { Vec::new() };
-    let events_plain = if events.is_none() { plain(&rows.events) } else { Vec::new() };
-    // Revenue: one run of zeros, then the amounts of the rows that have one.
-    let mut amounts: Vec<i64> = vec![0];
-    let mut seen: HashMap<i64, u32> = HashMap::new();
-    let paid_at: Vec<u32> = order[free..]
-        .iter()
-        .map(|&i| {
-            let v = rows.revenue[i as usize];
-            *seen.entry(v).or_insert_with(|| {
-                amounts.push(v);
-                amounts.len() as u32 - 1
-            })
-        })
-        .collect();
-    let revenue_width = index_width(amounts.len());
-    let mut revenue_idx = Vec::with_capacity(paid_at.len() * revenue_width as usize / 8 + 32);
-    revenue_idx.push(revenue_width as u8);
-    rle_run(&mut revenue_idx, 0, free, revenue_width);
-    packed_run(&mut revenue_idx, paid_at.iter().copied(), paid_at.len(), revenue_width);
+            pack_into(idx, at, n, index_width(dict.len()));
+        } else {
+            plain.clear();
+            plain.extend(order.iter().map(|&i| values[i as usize]));
+        }
+    }
+    // Revenue: one run of zeros, then the amounts of the rows that have one,
+    // each distinct amount once.
+    let slots = (2 * (n - free)).next_power_of_two().max(16);
+    let shift = 64 - slots.trailing_zeros();
+    e.seen.clear();
+    e.seen.resize(slots, (0, 0));
+    e.amounts.clear();
+    e.amounts.push(0);
+    e.paid_at.clear();
+    e.paid_at.reserve(n - free);
+    for &i in &order[free..] {
+        let v = rows.revenue[i as usize];
+        let mut at = ((v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize;
+        let place = loop {
+            let slot = unsafe { e.seen.get_unchecked_mut(at) };
+            if slot.0 == v {
+                break slot.1;
+            }
+            if slot.0 == 0 {
+                *slot = (v, e.amounts.len() as u32);
+                e.amounts.push(v);
+                break slot.1;
+            }
+            at = (at + 1) & (slots - 1);
+        };
+        e.paid_at.push(place);
+    }
+    let revenue_width = index_width(e.amounts.len());
+    e.revenue_idx.clear();
+    e.revenue_idx.reserve(e.paid_at.len() * revenue_width as usize / 8 + 32);
+    e.revenue_idx.push(revenue_width as u8);
+    rle_run(&mut e.revenue_idx, 0, free, revenue_width);
+    packed_run(&mut e.revenue_idx, e.paid_at.iter().copied(), e.paid_at.len(), revenue_width);
     // top_category: the definition levels (a 4-byte length, then runs of
     // one-bit values: absent, present), then the categories of the rows that
     // have one, which are in the same order as before.
-    let mut level_runs = Vec::with_capacity(16);
-    rle_run(&mut level_runs, 0, free, 1);
-    rle_run(&mut level_runs, 1, n - free, 1);
-    let mut levels = (level_runs.len() as u32).to_le_bytes().to_vec();
-    levels.extend_from_slice(&level_runs);
-    let categories: Vec<u8> = ctx.cat_recs().concat();
-    let cat_idx = pack_indices(rows.cats.iter().copied(), rows.cats.len(), index_width(ctx.cat_recs().len()));
+    e.levels.clear();
+    e.levels.extend_from_slice(&[0; 4]);
+    rle_run(&mut e.levels, 0, free, 1);
+    rle_run(&mut e.levels, 1, n - free, 1);
+    let level_bytes = (e.levels.len() - 4) as u32;
+    e.levels[..4].copy_from_slice(&level_bytes.to_le_bytes());
+    pack_into(&mut e.cat_idx, rows.cats.iter().copied(), rows.cats.len(), index_width(ctx.cat_recs().len()));
 
-    let int = |name: &'static str, values: &'_ [i32], coded: &'_ Option<(Vec<u8>, Vec<i32>)>| match coded {
-        Some((idx, dict)) => Column {
-            name,
-            ptype: parquet::INT32,
-            kind: Kind::Int,
-            optional: false,
-            payload: vec![unsafe { std::slice::from_raw_parts(idx.as_ptr(), idx.len()) }],
-            dict: Some((vec![unsafe { std::slice::from_raw_parts(dict.as_ptr() as *const u8, 4 * dict.len()) }], dict.len())),
-        },
-        None => Column {
-            name,
-            ptype: parquet::INT32,
-            kind: Kind::Int,
-            optional: false,
-            payload: vec![unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, 4 * values.len()) }],
-            dict: None,
-        },
+    let e = &*e;
+    let int = |name: &'static str, k: usize| {
+        let (idx, dict, _, plain) = &e.counts[k];
+        if coded[k] {
+            Column { name, ptype: parquet::INT32, kind: Kind::Int, optional: false, payload: vec![&idx[..]], dict: Some((vec![as_bytes(dict)], dict.len())) }
+        } else {
+            Column { name, ptype: parquet::INT32, kind: Kind::Int, optional: false, payload: vec![as_bytes(plain)], dict: None }
+        }
     };
     let columns = [
         Column {
@@ -686,7 +726,7 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
             ptype: parquet::BYTE_ARRAY,
             kind: Kind::Str,
             optional: false,
-            payload: vec![&id_idx],
+            payload: vec![&e.id_idx],
             dict: Some((vec![&rows.ids], rows.people as usize)),
         },
         Column {
@@ -694,26 +734,26 @@ fn write_user_daily(ctx: &Ctx, rows: &pass3::Rows, tid: usize, seq: usize) {
             ptype: parquet::INT32,
             kind: Kind::Date,
             optional: false,
-            payload: vec![&day_idx],
-            dict: Some((vec![as_bytes(&days)], days.len())),
+            payload: vec![&e.day_idx],
+            dict: Some((vec![as_bytes(&e.days)], e.days.len())),
         },
-        int("sessions", &sessions_plain, &sessions),
-        int("events", &events_plain, &events),
+        int("sessions", 0),
+        int("events", 1),
         Column {
             name: "revenue_cents",
             ptype: parquet::INT64,
             kind: Kind::Int,
             optional: false,
-            payload: vec![&revenue_idx],
-            dict: Some((vec![as_bytes(&amounts)], amounts.len())),
+            payload: vec![&e.revenue_idx],
+            dict: Some((vec![as_bytes(&e.amounts)], e.amounts.len())),
         },
         Column {
             name: "top_category",
             ptype: parquet::BYTE_ARRAY,
             kind: Kind::Str,
             optional: true,
-            payload: vec![&levels, &cat_idx],
-            dict: Some((vec![&categories], ctx.cat_recs().len())),
+            payload: vec![&e.levels, &e.cat_idx],
+            dict: Some((vec![&e.categories], ctx.cat_recs().len())),
         },
     ];
     let path = ctx.out_dir.join("user_daily").join(format!("part-{tid:03}-{seq:04}.parquet"));
