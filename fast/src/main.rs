@@ -578,8 +578,13 @@ fn calibrate(ctx: &Ctx) {
     }
     // The fastest, if it is clearly faster: within a few percent the ordinary
     // instance is the safer one.
-    let fastest = wides.iter().copied().min_by_key(|&w| best[w as usize]).unwrap_or(0);
-    let kind = if best[fastest as usize] * 100 < best[0] * 95 { fastest } else { 0 };
+    // (The 512-bit instance for processors without VBMI2 counts a tenth
+    // more than it took: those lower their clock for it, and here one core was
+    // at the lower clock where the run would have all of them, which on some
+    // lowers it further. The four-lane instance has no such doubt about it.)
+    let cost = |w: u8| best[w as usize] + if w == 2 { best[2] / 10 } else { 0 };
+    let fastest = wides.iter().copied().min_by_key(|&w| cost(w)).unwrap_or(0);
+    let kind = if cost(fastest) * 100 < best[0] * 95 { fastest } else { 0 };
     parse::set_wide_kind(kind);
     let wide = wides.iter().copied().find(|&w| parse::is_512(w)).unwrap_or(0);
     CALIBRATED[0].store(wide as u64, Relaxed);

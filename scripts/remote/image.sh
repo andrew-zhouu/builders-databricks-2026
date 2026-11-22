@@ -38,8 +38,8 @@ case "$mode" in
     tail -1 "$W/fixtures.log"
     # The same with the other parser instances: the ordinary one (SS_SIMD=0,
     # what a processor without AVX-512 runs) and the wide one for processors
-    # with AVX-512 but no VBMI2 (SS_SIMD=2).
-    for kind in SS_SIMD=0 SS_SIMD=2; do
+    # with AVX-512 but no VBMI2 (SS_SIMD=2), the four-lane one (SS_SIMD=3).
+    for kind in SS_SIMD=0 SS_SIMD=2 SS_SIMD=3; do
       env "$kind" bash tools/fixtures.sh "$W/sessions" > "$W/fixtures0.log" 2>&1 || rc=1
       echo "$kind: $(tail -1 "$W/fixtures0.log")"
       for name in dev m5 m20; do
@@ -59,6 +59,10 @@ case "$mode" in
     if [ -f scripts/remote/mulcount.sh ]; then
       if bash scripts/remote/mulcount.sh "$W/sessions" > "$W/mulcount.log" 2>&1; then echo "ok   $(tail -1 "$W/mulcount.log")"
       else echo "FAIL: 512-bit multiplications in the instance for processors without VBMI2"; tail -8 "$W/mulcount.log"; rc=1; fi
+    fi
+    if [ -f scripts/remote/quadcheck.sh ]; then
+      if bash scripts/remote/quadcheck.sh "$W/sessions" > "$W/quadcheck.log" 2>&1; then echo "ok   $(tail -1 "$W/quadcheck.log")"
+      else echo "FAIL: the four-lane instance holds a 512-bit register or a 256-bit multiplication"; tail -8 "$W/quadcheck.log"; rc=1; fi
     fi
     [ $# -gt 0 ] || set -- m5 m20 m60
     for name in dev "$@"; do
