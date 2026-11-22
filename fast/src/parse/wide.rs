@@ -478,3 +478,13 @@ pub(super) unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, 
         c.push2_at(cw, pool, part, w0, *st.click.get_unchecked(i));
     }
 }
+
+// ------------------------------------------------------------------ four lanes
+
+/// The decode with four lines at a time in 256-bit registers (wide_quad.rs):
+/// parser instance 3.
+pub(super) mod quad {
+    use super::*;
+
+    include!("wide_quad.rs");
+}
