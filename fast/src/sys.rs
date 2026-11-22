@@ -98,6 +98,14 @@ pub fn map_anon(len: usize, huge: bool) -> *mut u8 {
     try_map_anon(len, huge).unwrap_or_else(|| panic!("mmap of {len} bytes failed"))
 }
 
+/// Fault in the pages of a page-aligned range, writable, without changing
+/// what is in them (MADV_POPULATE_WRITE, Linux 5.14). False if the kernel
+/// cannot or will not.
+pub fn populate(ptr: *mut u8, len: usize) -> bool {
+    const MADV_POPULATE_WRITE: c_int = 23;
+    unsafe { madvise(ptr as *mut c_void, len, MADV_POPULATE_WRITE) == 0 }
+}
+
 /// Drop the fully covered pages of an anonymous range (their contents are lost).
 pub fn zap(ptr: *mut u8, len: usize) {
     let a = (ptr as usize + 4095) & !4095;
