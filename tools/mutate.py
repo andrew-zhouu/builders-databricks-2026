@@ -1134,7 +1134,7 @@ def stretches(D):
     for lines in files[:6]:
         size = min(len(lines), R.choice([70, 128, 129, 200, 257, 400]))
         start = R.randrange(len(lines) - size + 1)
-        style = R.choice(["purchase", "midnight", "both", "user", "longid", "quoted"])
+        style = R.choice(["purchase", "midnight", "both", "user", "longid", "quoted", "longest", "longest"])
         seen = set()
         for line in lines[start:start + size]:
             if line.f is None or not line.f[0] or (line.f[0], line.f[3]) in seen:
@@ -1164,12 +1164,42 @@ def stretches(D):
                 f[0] = f[0] + "".join(R.choice(DIGITS) for _ in range(R.randint(2, 12)))
             seen.add((f[0], f[3]))
             mask = 127 if style == "quoted" else None
+            if style == "longest":
+                # As long as a line can be for a splitter with two 64-byte
+                # windows (third comma at byte 63, newline 64 bytes on), and
+                # now and then a byte more on either side.
+                mask = quote_mask(R, 7)
+                place(f, mask, R.choice([63, 63, 63, 63, 62, 64]), R.choice([64, 64, 64, 64, 63, 65]))
             for twin in clusters.get(key, [line]):
                 twin.f = list(f)
                 twin.changed = True
                 twin.quotes = mask
         made.append(f"{style} {size}")
     D.notes.append("stretches " + ", ".join(made))
+
+
+def place(f, mask, comma3, newline_after):
+    """Put a line's third comma at byte `comma3` and its newline
+    `newline_after` bytes after that comma, by spellings that change nothing:
+    zeros in front of an F3 ts (any valid ts becomes one), zeros in front of
+    a purchase's price, any tail on a product nobody looks up. (Where that
+    cannot be done, the line stays shorter.)"""
+    q = [mask >> i & 1 for i in range(7)]
+    ms = parse_ts(f[2])
+    if comma3 is not None and ms is not None and 0 <= ms < 10 ** 14:
+        # Before the third comma: the first three fields, their quotes, two commas.
+        other = len(f[0]) + len(f[1]) + 2 + 2 * (q[0] + q[1] + q[2])
+        if comma3 - other >= len(str(ms)):
+            f[2] = str(ms).zfill(comma3 - other)
+    if newline_after is not None:
+        # After it: the last four fields, their quotes, three commas, and one.
+        rest = len(f[3]) + len(f[4]) + len(f[5]) + len(f[6]) + 3 + 2 * (q[3] + q[4] + q[5] + q[6]) + 1
+        if newline_after > rest:
+            if f[4] == "purchase":
+                if f[6] and all(c in "0123456789" for c in f[6]):
+                    f[6] = "0" * (newline_after - rest) + f[6]
+            elif f[5]:
+                f[5] = f[5] + "y" * (newline_after - rest)
 
 
 def splitter(D):
@@ -1194,25 +1224,9 @@ def splitter(D):
         f = list(lines[0].f)
         if any(l.f != f for l in lines):
             continue
-        ms = parse_ts(f[2])
         mask = quote_mask(R, 7)
-        q = [mask >> i & 1 for i in range(7)]
-        # Where the third comma is: the first three fields, their quotes, two commas.
-        if ms is not None and 0 <= ms < 10 ** 14:
-            want = R.choice([61, 62, 63, 64, 65, 66, 125, 126, 127, 128, 129])
-            other = len(f[0]) + len(f[1]) + 2 + 2 * (q[0] + q[1] + q[2])
-            if want - other >= len(str(ms)):
-                f[2] = str(ms).zfill(want - other)
-        # Where the newline is, counted from the third comma: the last four
-        # fields, their quotes, three commas, and one.
-        want = R.choice([61, 62, 63, 64, 65, 66, 67, 127, 128, 129])
-        rest = len(f[3]) + len(f[4]) + len(f[5]) + len(f[6]) + 3 + 2 * (q[3] + q[4] + q[5] + q[6]) + 1
-        if want > rest:
-            if f[4] == "purchase":
-                if f[6] and all(c in "0123456789" for c in f[6]):
-                    f[6] = "0" * (want - rest) + f[6]
-            elif f[5]:
-                f[5] = f[5] + "y" * (want - rest)
+        place(f, mask, R.choice([61, 62, 63, 64, 65, 66, 125, 126, 127, 128, 129]),
+              R.choice([61, 62, 63, 64, 65, 66, 67, 127, 128, 129]))
         for line in lines:
             line.f = list(f)
             line.changed = True
