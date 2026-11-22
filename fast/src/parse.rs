@@ -110,6 +110,15 @@ pub struct DateTab {
     /// month.
     dom_text: [[u8; 16]; 166],
     dom_ms: [i64; 166],
+    /// The same table for the wide path, which cannot index it without a
+    /// gather: the days in it fall in at most two months. For each, its
+    /// `YYYY-MM-` as a little-endian word, the days of the month that are in
+    /// the table (bit `dd`), and the epoch ms of the month's "day 0".
+    /// `wide_ok`: the table is in use and this says all of it.
+    ym: [u64; 2],
+    ym_days: [u64; 2],
+    ym_base: [i64; 2],
+    wide_ok: bool,
 }
 
 impl DateTab {
@@ -123,8 +132,13 @@ impl DateTab {
             first_day_ms: first_day * DAY_MS,
             dom_text: [[0xFF; 16]; 166],
             dom_ms: [0; 166],
+            ym: [0; 2],
+            ym_days: [0; 2],
+            ym_base: [0; 2],
+            wide_ok: ndays + 3 <= 28,
         };
         if ndays + 3 <= 28 {
+            let mut months = 0;
             for day in first_day - 1..=first_day + ndays as i64 + 1 {
                 let (y, m, dd) = civil_from_days(day);
                 if (0..=9999).contains(&y) {
@@ -132,6 +146,18 @@ impl DateTab {
                     text[..11].copy_from_slice(format!("{y:04}-{m:02}-{dd:02}T").as_bytes());
                     t.dom_text[dd as usize] = text;
                     t.dom_ms[dd as usize] = day * DAY_MS;
+                    let ym = u64::from_le_bytes(text[..8].try_into().unwrap());
+                    match (0..months).find(|&k| t.ym[k] == ym) {
+                        Some(k) => t.ym_days[k] |= 1 << dd,
+                        None if months < 2 => {
+                            t.ym[months] = ym;
+                            t.ym_days[months] = 1 << dd;
+                            t.ym_base[months] = (day - dd) * DAY_MS;
+                            months += 1;
+                        }
+                        // (Fewer than 28 days in a row are never in three months.)
+                        None => t.wide_ok = false,
+                    }
                 }
             }
         }
