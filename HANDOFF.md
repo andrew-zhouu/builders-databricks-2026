@@ -1,10 +1,68 @@
 # Handoff: where the work stands
 
-Last updated 2026-11-21, 22:45 UTC. Deadline: 2026-11-22 16:00 UTC (11:00 ET).
+Last updated 2026-11-22, 03:00 UTC. Deadline: 2026-11-22 16:00 UTC (11:00 ET).
 
-## Current state (read this first)
+## Scorer version 5 (22 November, about 02:20 UTC): read this before anything else
 
-Everything below the horizontal rule predates this; where they disagree, this wins.
+The organisers changed the generator and re-scored every entry ("Scorer version
+shopping-sessions-5"). Our scored commit `42b0f35` went from 0.62 s to **3.6747 s**; the
+leader from 0.27 s to 0.7257 s. **Every time and every data set mentioned further down
+is from version 4** and only of historical interest.
+
+What changed (rules line on IDs, `generator/src/text.rs`, `user.rs`, `plan.rs`):
+
+* One in eight distinct `user_id`, `event_id` and `click_id` values is the prefix letter
+  and **32 lowercase hexadecimal digits** (33 bytes); the rest are as before (prefix and
+  1 to 8 base-36 characters). Lines are about 8% longer on average.
+* IDs go through a keyed 6-round Feistel network with a 256-bit key: the number behind
+  an ID cannot be recovered. The index experiment (`exp-index`, `exp-wix`: decoding the
+  event ID to the event's place among all events, placement instead of dedup, session
+  intervals) is **dead**, and it is very likely what the old leaders were doing.
+* The final: at least the 30 fastest entries are retimed 9 times in interleaved rounds
+  across 3 fresh final data sets on one idle machine; the mean of the per-set medians
+  is the score. A scored repository may now be made private.
+
+Why we were 5.9 times slower: an ID over 9 bytes was "irregular": the line left the fast
+path (23% of event and click lines) and long user and click IDs were interned behind one
+mutex.
+
+What was done (branch `exp-v5`, from the wide-parser branch without any index code):
+
+* `ids.rs`: three kinds of key besides the regular one. Long user IDs (`u` + 32 hex) sit
+  in a lock-free table of 128-bit values (`LongIds`), key = its slot; click IDs that are
+  not regular are keyed by the address of their bytes in the mapped input (they are
+  only ever compared, on a tie in `ts`); the mutex dictionary remains for everything
+  else (upper case and the like, about 1,000 IDs in 20M events). `KeySpace::less` orders
+  long against long by value and regular against long by the first eight characters.
+  Event IDs of 33 bytes have a hash of their own (`hash33`).
+* `parse.rs`: the line splitters use three 64-byte windows (an ID and its comma; the
+  next field or two; the rest), so lines up to about 190 bytes stay on the fast path;
+  the decode stage hashes 33-byte event IDs and flags 33-byte user IDs, and a small
+  loop between decode and emit (`stage_long`, `click_long`) checks those and finds
+  their keys. The wide (AVX-512) instance is **off unless `SS_SIMD=1`**
+  (`WIDE_DEFAULT`) until its decode does the same.
+* Data on the EC2 box is version 5 under the old names (`dev`, `m5`, `m20`, `n20`,
+  `m60`, the 200K seeds); the old ones are in `data-v4`, `expected-v4`, `official-v4`.
+  `scripts/refetch.sh` downloads the official materials again and shows what changed;
+  `scripts/remote/v5data.sh` rebuilt everything. The plain implementation and the
+  Python reference needed no change (both reproduce the new official dev answer).
+
+| What | Commit | Status |
+| --- | --- | --- |
+| Scored fallback (version 5: **3.6747 s**) | `42b0f35` on `main` | Correct on version 5, slow. |
+| **Candidate v1: long IDs on the base (AVX2) path** | `21a5b428e7d0843b04c81f24e762dc7580ad9a04` (`exp-v5`) | New 20M set on EC2: **569 / 571 ms against 3171 / 3249** for the scored build. Gate `v1` (`scripts/remote.sh log v1 40`). |
+| Next: batch splitters for the wide path, NUL fix | `0ddfa0e` (`exp-sw`) | A short event ID with a NUL byte hashed like the ID without it (found by the tests fork; the generator writes no NUL; present since c1). Fixed here for the base and scalar paths. |
+
+Known and open:
+
+* Whether the scorer's processors have AVX-512 VBMI2 is still unknown; the wide path
+  was worth 15% on version-4 data on our Ice Lake box.
+* Links with a long ID take the scalar path (`link_line`): about 100 ms of CPU at 20M.
+
+## State before scorer version 5 (historical)
+
+Everything below the horizontal rule predates this section's first line; where they
+disagree, the later text wins.
 
 ### What to submit
 
