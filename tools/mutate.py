@@ -2232,13 +2232,90 @@ def windows(D):
     D.notes.append(f"windows {len(mapping)} users, {long_ids} event ids, {placed} event lines, {click_placed} clicks, {after} short lines after")
 
 
+def grouping(D):
+    """The lines of a file in another order (the order of lines means nothing,
+    so the answer is the one before): all lines whose user is 33 bytes long
+    together, all whose event or click ID is, both; such a line in every
+    second place, or every eighth, or every ninth; the lines by length, the
+    lines with a quoted ID first. One ID in eight is long, so a decoder that
+    takes eight lines at a time hardly ever sees a batch of nothing but long
+    IDs, or the long ID always in the same lane, unless a test puts them
+    there. (After the long-ID mutations the 33-byte near misses are grouped
+    with the long IDs: the batch then is all lines that only look long.)"""
+    R = D.R
+
+    def regroup(lines, id_at, user_at):
+        """`lines` (Line objects of one file) in a new order."""
+        def is33(line, at):
+            f = line.f
+            return f is not None and len(f[at]) == 33
+
+        style = R.choice(["users", "ids", "both", "both", "period2", "period8", "period9", "length", "length_down", "quoted", "blocks"])
+        if style == "users":
+            return sorted(lines, key=lambda l: not is33(l, user_at)), style
+        if style == "ids":
+            return sorted(lines, key=lambda l: not is33(l, id_at)), style
+        if style == "both":
+            return sorted(lines, key=lambda l: (not (is33(l, id_at) and is33(l, user_at)), not is33(l, user_at), not is33(l, id_at))), style
+        if style.startswith("period"):
+            every = int(style[6:])
+            at = R.choice([id_at, user_at])
+            special = [l for l in lines if is33(l, at)]
+            plain = [l for l in lines if not is33(l, at)]
+            out, phase = [], R.randrange(every)
+            while special or plain:
+                want_special = len(out) % every == phase
+                source = special if (want_special and special) or not plain else plain
+                out.append(source.pop())
+            return out, style
+        if style in ("length", "length_down"):
+            def size(line):
+                return len(line.raw) if line.raw is not None and not line.changed else sum(len(v) for v in (line.f or [])) + 6
+            return sorted(lines, key=size, reverse=style == "length_down"), style
+        if style == "quoted":
+            return sorted(lines, key=lambda l: not (l.raw or "").startswith('"')), style
+        # Runs of 1 to 40 long ones, then as many others, and so on.
+        special = [l for l in lines if is33(l, id_at) or is33(l, user_at)]
+        plain = [l for l in lines if not (is33(l, id_at) or is33(l, user_at))]
+        out = []
+        while special or plain:
+            for source in (special, plain):
+                for _ in range(R.choice([1, 2, 7, 8, 9, 16, 17, 40])):
+                    if source:
+                        out.append(source.pop())
+        return out, style
+
+    notes = []
+    for name, all_lines in (("events", D.events), ("clicks", D.load_clicks())):
+        by_file = {}
+        for at, line in enumerate(all_lines):
+            # Whole lines only: a block and the lines it holds stay where they are.
+            if line.members is None and not line.held and not line.gone:
+                by_file.setdefault(line.file, []).append(at)
+        files = sorted(by_file, key=lambda n: len(by_file[n]), reverse=True)
+        chosen = files[:3] + R.sample(files[3:], min(len(files[3:]), max(2, len(files) // 2)))
+        done = []
+        for number in chosen:
+            places = by_file[number]
+            if len(places) < 4:
+                continue
+            new, style = regroup([all_lines[at] for at in places], 0, 1)
+            for at, line in zip(places, new):
+                all_lines[at] = line
+                # (A new line would be put at a random place when written.)
+                line.new = False
+            done.append(style)
+        notes.append(f"{name} {len(done)} files ({', '.join(sorted(set(done)))})")
+    D.notes.append("grouping " + "; ".join(notes))
+
+
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
                                      splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles,
-                                     idbytes, longusers, longevents, longclicks, windows]}
+                                     idbytes, longusers, longevents, longclicks, windows, grouping]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
            "idbytes", "idbytes", "longusers", "longusers", "longevents", "longevents", "longclicks", "longclicks",
-           "windows", "windows",
+           "windows", "windows", "grouping", "grouping",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
            "splitter", "splitter", "clicksplit", "clicksplit", "interleave", "endings"]
 

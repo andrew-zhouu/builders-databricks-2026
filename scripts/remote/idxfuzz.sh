@@ -20,6 +20,9 @@
 #        SETTINGS=v5     for version 5 of the generator (opaque IDs, one in eight 33 bytes
 #                        long): plain, the wide parser's and the splitter's switches and
 #                        self-checks; and the long-ID mutations
+#        SETTINGS=v5w    version 5 with the wide parser on by default: default, the base path
+#                        (SS_SIMD=0), SS_WSPLIT=0, SS_WEMIT=0, both self-checks, each with thread
+#                        counts, tiny chunks, chunk ends at the 64-byte marks, small partitions
 #        SLOW_BIN=name   the yardstick is bin/NAME --slow (default: the binary's own --slow);
 #                        the binary's own --slow is then compared with it as well
 #        REF_EVERY=n     the Python reference also on every n-th of the larger sets (default 5)
@@ -57,7 +60,7 @@ if [ "$mode" = wix ]; then
           identityids,gaps,nested identityids,splitter,copies copies,irregular,outrange badhead,drop,links
           idbytes idbytes,copies identityids,idbytes,disorder idbytes,shapes,splitter idbytes,mix)
 fi
-if [ "$mode" = v5 ]; then
+if [ "$mode" = v5 ] || [ "$mode" = v5w ]; then
   # Version 5 of the generator: IDs are opaque, one in eight is 33 bytes long.
   # The long forms and their near misses for users, events and clicks, alone
   # and with everything else.
@@ -72,7 +75,9 @@ if [ "$mode" = v5 ]; then
          emptyevents,longclicks links,linkshapes,longusers values,lateness,shapes,longusers,longevents,longclicks
          windows windows,longevents,longclicks windows,longusers windows,endings,interleave windows,mix
          longusers,longevents,longclicks,windows windows,shapes,clickshapes windows,splitter,clicksplit
-         windows,copies,idbytes windows,windows,stretches)
+         windows,copies,idbytes windows,windows,stretches
+         grouping longusers,longevents,longclicks,grouping windows,grouping grouping,stretches,purchases
+         longusers,grouping,endings longevents,idbytes,grouping mix,grouping longclicks,clicksplit,grouping)
 fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
@@ -136,6 +141,42 @@ for seed in $(seq "$first" $((first + count - 1))); do
   )
   case "$mode" in
     plain) settings=("${plain[@]}") ;;
+    v5w) settings=(
+      # The wide parser is the default where the processor has it, the base
+      # path (SS_SIMD=0) what runs elsewhere: both count.
+      "default|NCPU=3"
+      "one|NCPU=1"
+      "eight|NCPU=8"
+      "base|NCPU=4 SS_SIMD=0"
+      "base1|NCPU=1 SS_SIMD=0"
+      "base8|NCPU=8 SS_SIMD=0"
+      "nowsplit|NCPU=4 SS_WSPLIT=0"
+      "nowemit|NCPU=4 SS_WEMIT=0"
+      "nowsplitemit|NCPU=3 SS_WSPLIT=0 SS_WEMIT=0"
+      "checks|NCPU=4 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1"
+      "checks1|NCPU=1 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1"
+      "simdcheck|NCPU=8 SS_SIMD_CHECK=1"
+      "splitcheck|NCPU=2 SS_SPLIT_CHECK=1"
+      "checknowsplit|NCPU=3 SS_SIMD_CHECK=1 SS_WSPLIT=0"
+      "checknowemit|NCPU=3 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_WEMIT=0"
+      "tiny|NCPU=4 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "tinychecks|NCPU=8 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 7 % 97 + 31))"
+      "tinybase|NCPU=4 SS_SIMD=0 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "tiny8|NCPU=8 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
+      "tiny8base|NCPU=8 SS_SIMD=0 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
+      "tiny8nowemit|NCPU=8 SS_WEMIT=0 SS_CHUNK_BYTES=$((seed % 509 + 200))"
+      "mark|NCPU=5 SS_CHUNK_BYTES=${marks[$(((seed / 3 + 5) % ${#marks[@]}))]}"
+      "markchecks|NCPU=3 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=${marks[$((seed % ${#marks[@]}))]}"
+      "markbase|NCPU=1 SS_SIMD=0 SS_CHUNK_BYTES=${marks[$(((seed / 2 + 3) % ${#marks[@]}))]}"
+      "chunk4k|NCPU=3 SS_CHUNK_BYTES=$((seed % 4096 + 2048))"
+      "chunk4kchecks|NCPU=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 3 % 4096 + 2048))"
+      "scalar|NCPU=2 SS_SCALAR=1"
+      "tinyscalar|NCPU=3 SS_SCALAR=1 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "manyparts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))"
+      "manypartsbase|NCPU=4 SS_SIMD=0 SS_PD_BYTES=$((seed % 900 + 100))"
+      "onepart|NCPU=5 SS_PD_BYTES=1000000000"
+      "tinyparts|NCPU=8 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))"
+      "tinypartsbase|NCPU=8 SS_SIMD=0 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))") ;;
     v5) settings=("${plain[@]}"
       # (On exp-v5 the wide parser runs only with SS_SIMD=1; without it the
       # settings above are the ones that count.)

@@ -29,6 +29,8 @@ case "$mode" in
   plain) outer=("auto|") ;;
   simd) outer=("auto|" "nosimd|SS_SIMD=0" "check|SS_SIMD_CHECK=1") ;;
   split) outer=("auto|" "check|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1" "nowsplit|SS_WSPLIT=0") ;;
+  v5w) outer=("auto|" "base|SS_SIMD=0" "checks|SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1" "nowsplit|SS_WSPLIT=0" "nowemit|SS_WEMIT=0"
+              "checknowemit|SS_SIMD_CHECK=1 SS_WEMIT=0 SS_WSPLIT=0") ;;
   v5) outer=("auto|" "simd|SS_SIMD=1" "simdnowsplit|SS_SIMD=1 SS_WSPLIT=0")
       [ -n "${SPLIT_CHECKS:-}" ] && outer+=("simdsplit|SS_SIMD=1 SS_SPLIT_CHECK=1")
       # The wide parser's self-checks, on request (SIMD_CHECKS=1).
@@ -82,7 +84,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
     for m in "${modes[@]}"; do
       mlabel="${m%%|*}"; mvars="${m#*|}"
       # With many outer settings: each in the first mode, the other modes take turns.
-      if [ ${#outer[@]} -gt 4 ] && [ "$mlabel" != fast ] && [ $(((seed + ${#ilabel} + ${#mlabel}) % 3)) != 0 ]; then continue; fi
+      if [ ${#outer[@]} -gt 6 ] && [ "$mlabel" != fast ] && [ $(((seed + ${#ilabel} + ${#mlabel}) % 3)) != 0 ]; then continue; fi
       # The binary's plain implementation (--slow), once.
       flag=""
       if [ "$mlabel" = slow ]; then
