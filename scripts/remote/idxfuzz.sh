@@ -26,7 +26,9 @@ PY="$PROJ/.venv/bin/python"
 W="$PROJ/out/idxfuzz"; mkdir -p "$W"
 names=(none irregular outrange copies disorder gaps nested links wide drop irrfile badhead purchases shapes shapes
        clickshapes linkshapes shapes,clickshapes,linkshapes identityids identityids,mix shapes,copies mix mix mix mix
-       emptyevents mix,shapes mix,shapes,clickshapes identityids,copies,gaps,nested)
+       emptyevents mix,shapes mix,shapes,clickshapes identityids,copies,gaps,nested userlengths endings
+       shapes,userlengths,endings userlengths,mix shapes,clickshapes,linkshapes,userlengths,endings,copies
+       lateness values lateness,shapes values,shapes,endings lateness,values,userlengths,clickshapes)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
 fails=0; runs=0
 for seed in $(seq "$first" $((first + count - 1))); do
