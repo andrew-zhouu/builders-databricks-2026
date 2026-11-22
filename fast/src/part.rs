@@ -58,29 +58,6 @@ impl BlockPool {
         self.next.load(Relaxed).min(self.nblocks) * BLOCK_BYTES
     }
 
-    /// Fault in the pool's first `bytes` ahead of the writers, a few megabytes
-    /// at a time and always in front of what they have taken, for as long as
-    /// the kernel does that on request (it leaves the contents alone, so it
-    /// may run while they write). For a helper thread: one thread zeroing
-    /// pages is several times cheaper than every writer doing it at once.
-    pub fn prefault(&self, bytes: usize) {
-        // One write fault per huge page, by an atomic OR of nothing: it
-        // changes no byte, whatever a writer puts there meanwhile.
-        const STEP: usize = 2 << 20;
-        let end = bytes.min(self.nblocks * BLOCK_BYTES);
-        // (Huge pages are aligned in the address space, not in the pool.)
-        let skew = (STEP - (self.base as usize & (STEP - 1))) & (STEP - 1);
-        let mut at = skew;
-        while at < end {
-            at = at.max((self.used_bytes() + STEP).next_multiple_of(STEP) + skew);
-            if at >= end {
-                break;
-            }
-            unsafe { (*(self.base.add(at) as *const std::sync::atomic::AtomicU8)).fetch_or(0, Relaxed) };
-            at += STEP;
-        }
-    }
-
     /// Give the pages of bytes `[from, to)` back to the kernel (teardown only).
     pub fn zap(&self, from: usize, to: usize) {
         crate::sys::zap(unsafe { self.base.add(from) }, to - from);
