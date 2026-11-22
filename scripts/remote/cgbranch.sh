@@ -6,8 +6,8 @@
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/env.sh"
 cd "$PROJ"
 name="${1:-m5}"; top="${2:-40}"; filter="${3:-.}"
-(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/.toolchain/prof-target" 2>&1 | grep -E '^error' -A8)
-PBIN="$PROJ/.toolchain/prof-target/x86_64-unknown-linux-musl/release/sessions"
+(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/out/prof-target" 2>&1 | grep -E '^error' -A8)
+PBIN="$PROJ/out/prof-target/x86_64-unknown-linux-musl/release/sessions"
 out=/tmp/ss-cgbranch; rm -rf "$out"; mkdir -p "$out"
 rows=$(cat "data/$name"/events/*.csv | wc -l)
 NCPU=1 SS_NOHUGE=1 valgrind --tool=cachegrind --cache-sim=no --branch-sim=yes --cachegrind-out-file="$out/cg.out" \
