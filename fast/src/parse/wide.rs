@@ -14,11 +14,6 @@
 
 use super::*;
 
-/// Whether `id_trace8` computes the traces of eight event IDs in vector
-/// registers (which must then mirror `super::id_trace` exactly; SS_SIMD_CHECK=1
-/// compares them), or calls `super::id_trace` for each line.
-const ID_TRACE_WIDE: bool = true;
-
 const LOW: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
 /// Lines per step.
@@ -75,6 +70,13 @@ macro_rules! mul {
 macro_rules! gather {
     ($addr:expr, $off:expr) => {
         _mm512_i64gather_epi64::<1>($addr, ($off as isize) as *const i64)
+    };
+}
+/// The same for the lanes of `$k` only (zero in the others, whose memory is
+/// not touched).
+macro_rules! gather_if {
+    ($k:expr, $addr:expr, $off:expr) => {
+        _mm512_mask_i64gather_epi64::<1>(_mm512_setzero_si512(), $k, $addr, ($off as isize) as *const i64)
     };
 }
 /// The batch's lines `$i..$i + 8` of a stage array, with the lines past the
@@ -263,33 +265,45 @@ unsafe fn picked(i: usize, which: u64) -> u64 {
 
 // ------------------------------------------------------------------ events
 
-/// `super::id_trace` for eight lines: partitions (one per lane), first trace
-/// words without the positions, and the lanes whose ID is not regular.
+/// `super::id_trace_at` for eight event IDs of `n` bytes at `a`; their first
+/// bytes and the eight bytes after them (`w1`, as they are in the input) are
+/// given. Returns the partitions (one per lane, with the four more bits of
+/// the hash), the first trace words without the positions, and the lanes
+/// whose ID has neither the regular shape (at most 9 bytes) nor 33 bytes:
+/// those are for the scalar path.
+///
+/// Both hashes of ids.rs are computed and one is chosen, as there: one ID in
+/// eight is long, so most groups of eight lines have one.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
 #[inline]
-unsafe fn id_trace8(idp: &IdParams, first: __m512i, rest: __m512i, n: __m512i) -> (__m512i, __m512i, __mmask8) {
-    if ID_TRACE_WIDE {
-        // ids::hash9, then as `id_trace`.
-        let x = xor!(rest, _mm512_mullo_epi64(first, v!(0xD6E8_FEB8_6659_FD93u64)));
-        let a = _mm512_mullo_epi64(x, v!(0x9E37_79B9_7F4A_7C15u64));
-        let h = xor!(a, srl!(a, 32));
-        let pk = or!(srl!(mul!(srl!(h, 32), v!(idp.pd)), 32), sll!(and!(srl!(h, 40), v!(15)), 16));
-        let trace = _mm512_sll_epi64(and!(h, v!(idp.fp_mask)), _mm_cvtsi32_si128(idp.loc_bits as i32));
-        (pk, trace, _mm512_cmpgt_epu64_mask(n, v!(9)))
-    } else {
-        let (mut f, mut r, mut len) = ([0u64; W], [0u64; W], [0u64; W]);
-        _mm512_storeu_si512(f.as_mut_ptr() as *mut _, first);
-        _mm512_storeu_si512(r.as_mut_ptr() as *mut _, rest);
-        _mm512_storeu_si512(len.as_mut_ptr() as *mut _, n);
-        let (mut pk, mut trace, mut dead) = ([0u64; W], [0u64; W], 0u8);
-        for j in 0..W {
-            let (p, t, d) = id_trace(idp, f[j] as u8, r[j], len[j]);
-            pk[j] = p as u64;
-            trace[j] = t;
-            dead |= (d as u8) << j;
-        }
-        (_mm512_loadu_si512(pk.as_ptr() as *const _), _mm512_loadu_si512(trace.as_ptr() as *const _), dead)
-    }
+unsafe fn id_trace8(idp: &IdParams, a: __m512i, first: __m512i, w1: __m512i, n: __m512i) -> (__m512i, __m512i, __mmask8) {
+    let long = _mm512_cmpeq_epi64_mask(n, v!(LONG_LEN));
+    // The first multiplication is the same in both: of the first byte's
+    // product with the word after it, which for `ids::hash9` is the rest of
+    // the ID zero-padded and for `ids::hash33` the word as it is.
+    let keep = _mm512_srlv_epi64(v!(u64::MAX), sub!(v!(72), sll!(n, 3)));
+    let rest = and!(w1, keep);
+    let x = xor!(_mm512_mask_mov_epi64(rest, long, w1), _mm512_mullo_epi64(first, v!(0xD6E8_FEB8_6659_FD93u64)));
+    let m = _mm512_mullo_epi64(x, v!(0x9E37_79B9_7F4A_7C15u64));
+    let h9 = xor!(m, srl!(m, 32));
+    // ids::hash33: the three more words of an ID of 33 bytes (only those
+    // lanes' memory is read), then `ids::finish`.
+    let b = _mm512_mullo_epi64(gather_if!(long, a, 9), v!(0xC2B2_AE3D_27D4_EB4Fu64));
+    let c = _mm512_mullo_epi64(gather_if!(long, a, 17), v!(0x1656_67B1_9E37_79F9u64));
+    let d = _mm512_mullo_epi64(gather_if!(long, a, 25), v!(0xFF51_AFD7_ED55_8CCDu64));
+    let s = xor!(xor!(m, _mm512_rol_epi64::<32>(b)), xor!(_mm512_rol_epi64::<17>(c), _mm512_rol_epi64::<47>(d)));
+    let s = xor!(s, srl!(s, 29));
+    let s = _mm512_mullo_epi64(s, v!(0xBF58_476D_1CE4_E5B9u64));
+    let h = _mm512_mask_mov_epi64(h9, long, xor!(s, srl!(s, 32)));
+    // `super::trace_from`.
+    let pk = or!(srl!(mul!(srl!(h, 32), v!(idp.pd)), 32), sll!(and!(srl!(h, 40), v!(15)), 16));
+    let trace = _mm512_sll_epi64(and!(h, v!(idp.fp_mask)), _mm_cvtsi32_si128(idp.loc_bits as i32));
+    // A NUL among a short ID's bytes (its first, or one of the rest: `keep`
+    // has those, and is empty for an ID that is too long anyway): zero-padded
+    // it would hash as a shorter ID does, so the scalar path takes it.
+    let nul = _mm512_test_epi64_mask(_mm512_andnot_si512(w1, sub!(w1, v!(LOW))), and!(keep, v!(HIGH)))
+        | _mm512_cmpeq_epi64_mask(first, _mm512_setzero_si512());
+    (pk, trace, !long & (_mm512_cmpgt_epu64_mask(n, v!(9)) | nul))
 }
 
 /// Decode the batch's event lines: `super::stage_decode`, on this path.
@@ -329,15 +343,18 @@ unsafe fn decode8(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
         // event_id: its first byte, and the rest (up to 8 bytes) zero-padded.
         let (a0, n0) = field!(p, start, len, 0);
         let first = srl!(gather!(a0, -7), 56);
-        let rest = and!(gather!(a0, 1), _mm512_srlv_epi64(v!(u64::MAX), sub!(v!(72), sll!(n0, 3))));
-        let (pk, trace, dead_id) = id_trace8(&idp, first, rest, n0);
+        let (pk, trace, dead_id) = id_trace8(&idp, a0, first, gather!(a0, 1), n0);
         _mm256_storeu_si256(st.pk.as_mut_ptr().add(i) as *mut __m256i, _mm512_cvtepi64_epi32(pk));
         _mm512_storeu_si512(st.trace.as_mut_ptr().add(i) as *mut _, or!(trace, add!(v!(loc0), p)));
 
-        // user_id: one that is its own key, or none (key 0).
+        // user_id: one that is its own key, or none (key 0). One of 33 bytes
+        // is taken for a long ID here, and for good: `super::stage_long`
+        // looks at it and finds its key (0 until then).
         let (a1, n1) = field!(p, start, len, 1);
-        let (user_bad, key) = key8(a1, n1, b'u');
-        _mm512_storeu_si512(st.key.as_mut_ptr().add(i) as *mut _, _mm512_maskz_mov_epi64(!user_bad, key));
+        let (user_odd, key) = key8(a1, n1, b'u');
+        let user_long = _mm512_cmpeq_epi64_mask(n1, v!(LONG_LEN));
+        let user_bad = user_odd & !user_long;
+        _mm512_storeu_si512(st.key.as_mut_ptr().add(i) as *mut _, _mm512_maskz_mov_epi64(!user_odd, key));
         for j in 0..W {
             *st.home.get_unchecked_mut(i + j) = ctx.table.prefetch_home(*st.key.get_unchecked(i + j)) as u32;
         }
@@ -384,6 +401,7 @@ unsafe fn decode8(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
             or!(_mm512_maskz_mov_epi64(dead, v!(F_DEAD)), _mm512_maskz_mov_epi64(valid, v!(F_VALID))),
             or!(_mm512_maskz_mov_epi64(purchase, v!(F_PURCHASE)), _mm512_maskz_mov_epi64(ingest, v!(F_INGEST)))
         );
+        let fl = or!(fl, _mm512_maskz_mov_epi64(valid & user_long, v!(F_LONG)));
         (st.flags.as_mut_ptr().add(i) as *mut u64).write_unaligned(_mm_cvtsi128_si64(_mm512_cvtepi64_epi8(fl)) as u64);
         // The lines with more to do, in order.
         let mk = ((ingest | purchase) & live) as u64;
@@ -482,12 +500,18 @@ unsafe fn click_decode8(ctx: &Ctx, st: &mut ClickStage, n: usize) {
         let p = lines!(st.p, i, live);
         let (start, len) = fields8(lines!(st.sep, i, live));
 
-        // click_id and user_id: the ones that are their own keys.
+        // click_id: one of the regular shape is its own key; any other is
+        // keyed by where it is (ids::ref_word).
         let (a0, n0) = field!(p, start, len, 0);
-        let (click_bad, click) = key8(a0, n0, b'k');
-        _mm512_storeu_si512(st.click.as_mut_ptr().add(i) as *mut _, click);
+        let (click_odd, click) = key8(a0, n0, b'k');
+        let by_ref = or!(or!(v!(crate::ids::IRREGULAR | crate::ids::REF), sll!(n0, 47)), a0);
+        _mm512_storeu_si512(st.click.as_mut_ptr().add(i) as *mut _, _mm512_mask_mov_epi64(click, click_odd, by_ref));
+        // user_id: its own key likewise; one of 33 bytes is taken for a long
+        // ID, for `super::click_long` to look at (its key here is 0).
         let (a1, n1) = field!(p, start, len, 1);
-        let (user_bad, user) = key8(a1, n1, b'u');
+        let (user_odd, user) = key8(a1, n1, b'u');
+        let user_long = _mm512_cmpeq_epi64_mask(n1, v!(LONG_LEN));
+        let user_bad = user_odd & !user_long;
         _mm512_storeu_si512(st.user.as_mut_ptr().add(i) as *mut _, user);
         for j in 0..W {
             *st.home.get_unchecked_mut(i + j) = ctx.table.prefetch_home(*st.user.get_unchecked(i + j)) as u32;
@@ -520,10 +544,13 @@ unsafe fn click_decode8(ctx: &Ctx, st: &mut ClickStage, n: usize) {
         let (a3, n3) = field!(p, start, len, 3);
         let (ts_dead, ts_ok, ms) = ts8(&table_days, a3, n3);
         let rel = sub!(ms, t0);
-        let dead = click_bad | user_bad | campaign_bad | ts_dead;
+        let dead = user_bad | campaign_bad | ts_dead;
         let valid = ts_ok & _mm512_cmplt_epu64_mask(rel, span) & _mm512_cmpneq_epi64_mask(campaign, v!(ABSENT)) & !dead;
         _mm512_storeu_si512(st.tc.as_mut_ptr().add(i) as *mut _, or!(_mm512_slli_epi64::<CAMPAIGN_BITS>(rel), campaign));
-        let fl = or!(_mm512_maskz_mov_epi64(dead, v!(C_DEAD)), _mm512_maskz_mov_epi64(valid, v!(C_VALID)));
+        let fl = or!(
+            or!(_mm512_maskz_mov_epi64(dead, v!(C_DEAD)), _mm512_maskz_mov_epi64(valid, v!(C_VALID))),
+            _mm512_maskz_mov_epi64(valid & user_long, v!(C_LONG))
+        );
         (st.flags.as_mut_ptr().add(i) as *mut u64).write_unaligned(_mm_cvtsi128_si64(_mm512_cvtepi64_epi8(fl)) as u64);
         i += W;
     }
@@ -559,7 +586,7 @@ unsafe fn click_checked(ctx: &Ctx, st: &mut ClickStage, n: usize) {
         if fw != fb {
             fail(i, "flags", fw as u64, fb as u64);
         }
-        if fw == C_VALID {
+        if fw & C_VALID != 0 {
             if st.user[i] != base.user[i] {
                 fail(i, "user key", st.user[i], base.user[i]);
             }

@@ -324,10 +324,9 @@ unsafe fn masks64_wide(p: *const u8) -> (u64, u64, u64) {
 }
 
 /// Whether the wide path is taken where the processor has it, unless SS_SIMD
-/// says otherwise (1: on, 0: off). Off until its decode keeps lines with long
-/// IDs (ids.rs) on the fast path: as it stands it leaves them, a quarter of
-/// all lines, to the scalar path.
-const WIDE_DEFAULT: bool = false;
+/// says otherwise (1: on, 0: off). Its decode keeps lines with long IDs
+/// (ids.rs) on the fast path, as the ordinary one does.
+const WIDE_DEFAULT: bool = true;
 
 /// Whether this processor takes the wide path: AVX-512 with VBMI2, which
 /// means Ice Lake or newer. (Skylake and Cascade Lake have AVX-512 as well,
@@ -818,32 +817,24 @@ impl IdParams {
     }
 }
 
-/// How the fast paths turn an event ID into a trace. From the ID's first byte,
-/// the rest of it as a little-endian word (zero-padded) and its length `n`:
-/// the trace's partition (with four more bits of the hash from bit 16, for the
-/// trace's second word), the trace's first word without the line's position,
-/// and whether the ID is not of the regular shape (1 to 9 bytes), so that the
-/// scalar path must take the line (`event_line`, which hashes any ID).
-///
-/// The wide path has the same computation on four lines at once
-/// (`wide::id_trace4`); with `wide::ID_TRACE_WIDE` off it calls this one.
-#[inline(always)]
-fn id_trace(idp: &IdParams, first: u8, rest: u64, n: u64) -> (u32, u64, bool) {
-    let (pk, trace) = trace_from(idp, hash9(first, rest));
-    (pk, trace, n > 9)
-}
-
-/// A trace's partition (with four more bits of the hash from bit 16) and its
-/// first word without the position, from the hash of the event ID.
+/// A trace's partition (with four more bits of the hash from bit 16, for the
+/// trace's second word) and its first word without the line's position, from
+/// the hash of the event ID.
 #[inline(always)]
 fn trace_from(idp: &IdParams, h: u64) -> (u32, u64) {
     ((((h >> 32) * idp.pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16, (h & idp.fp_mask) << idp.loc_bits)
 }
 
-/// `id_trace` for the `n` bytes of an event ID at `a`, which also takes the
-/// other usual shape, an ID of exactly 33 bytes (`ids::hash33`, as
-/// `ids::event_hash` has it). Both hashes are computed and one is chosen: one
-/// ID in eight is long, in no order a branch could learn.
+/// How the fast paths turn the `n` bytes of an event ID at `a` into a trace:
+/// `trace_from` its hash, and whether the ID has neither of the two usual
+/// shapes, so that the scalar path must take the line (`event_line`, which
+/// hashes any ID). The usual shapes are 1 to 9 bytes (`ids::hash9`) and
+/// exactly 33 bytes (`ids::hash33`), as `ids::event_hash` has them. Both
+/// hashes are computed and one is chosen: one ID in eight is long, in no
+/// order a branch could learn.
+///
+/// The wide path has the same computation on eight lines at once
+/// (`wide::id_trace8`), which SS_SIMD_CHECK=1 compares with this one.
 #[inline(always)]
 unsafe fn id_trace_at(idp: &IdParams, a: *const u8, n: u64) -> (u32, u64, bool) {
     let w = |k: usize| (a.add(1 + 8 * k) as *const u64).read_unaligned();
