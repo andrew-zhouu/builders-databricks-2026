@@ -14,7 +14,7 @@ n="${1:-150}"; first="${2:-1000}"
 log=/tmp/ss-fullcheck.$$.log
 # While the wide parser is only taken when asked for (parse.rs, WIDE_DEFAULT),
 # a default run and a run with it off are the same thing.
-scales=3; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales=1
+scales=4; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales=1
 {
   echo "== build + fixtures + dev + fuzz $first..$((first + n - 1))"
   bash scripts/remote/try.sh "$n" "$first" 2>&1 | grep -v -e '^warning' -e '^ *|' -e '^ *-->' -e '^ *= note' -e '^$' | tail -6
@@ -44,6 +44,20 @@ scales=3; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales
         || { echo "FAIL: a 512-bit multiplication in the instance without VBMI2"; tail -12 /tmp/ss-mulcount.$$ | cut -c1-160; }
       rm -f /tmp/ss-mulcount.$$
     fi
+    echo "== the four-lane instance (SS_SIMD=3): fuzz, seeds, scale, self-checks"
+    SS_SIMD=3 bash scripts/fuzz.sh "$((first + 7000))" 40 3000 2>&1 | tail -2
+    SS_SIMD=3 bash scripts/seeds.sh 200000 50000 2 5 2>&1 | tail -4
+    SS_SIMD=3 bash scripts/remote/scalecheck.sh m5 m20 m60
+    SS_SIMD=3 bash scripts/remote/splitcheck.sh 30 "$((first + 8000))" dev m5 m20
+    SS_SIMD=3 FUZZ=30 FIRST="$((first + 9000))" bash scripts/remote/widecheck.sh dev m5 m20
+    if [ -f scripts/remote/quadcheck.sh ]; then
+      bash scripts/remote/quadcheck.sh fast/target/x86_64-unknown-linux-musl/release/sessions > /tmp/ss-quadcheck.$$ 2>&1 \
+        && echo "ok   $(tail -1 /tmp/ss-quadcheck.$$)" \
+        || { echo "FAIL: the four-lane instance holds a 512-bit register or a 256-bit multiplication"; tail -12 /tmp/ss-quadcheck.$$ | cut -c1-160; }
+      rm -f /tmp/ss-quadcheck.$$
+    fi
+    echo "== calibration off (the choice by the processor's flags)"
+    SS_CALIBRATE=0 bash scripts/remote/scalecheck.sh m5 m20 | grep -v SCALE-OK
   else
     echo "== (the wide parser is off unless asked for: its sections are skipped)"
   fi
