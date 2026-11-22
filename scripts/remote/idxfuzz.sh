@@ -18,7 +18,8 @@ BIN="${1:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 count="${2:-10}"; first="${3:-1}"
 PY="$PROJ/.venv/bin/python"
 W="$PROJ/out/idxfuzz"; mkdir -p "$W"
-names=(none irregular outrange copies disorder gaps links wide drop irrfile badhead purchases mix mix mix mix emptyevents mix)
+names=(none irregular outrange copies disorder gaps nested links wide drop irrfile badhead purchases identityids
+       identityids,mix identityids,copies,gaps,nested mix mix mix mix emptyevents mix identityids,disorder,drop)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
 fails=0; runs=0
 for seed in $(seq "$first" $((first + count - 1))); do
@@ -57,6 +58,8 @@ for seed in $(seq "$first" $((first + count - 1))); do
     "wrongkey|NCPU=4 SS_INDEX_KEY=123456789a"
     "halfbound|NCPU=5 SS_INDEX_BOUND=$((events / 2))"
     "bound64|NCPU=3 SS_INDEX_BOUND=64"
+    "pb5|NCPU=4 SS_INDEX_PB=5"
+    "idpb|NCPU=3 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=50000000 SS_INDEX_PB=$((seed % 7 + 3))"
     "tiny|NCPU=4 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
     "scalar|NCPU=2 SS_SCALAR=1"
   )

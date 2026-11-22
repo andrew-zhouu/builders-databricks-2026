@@ -195,6 +195,7 @@ class Data:
         self.drop_event_files = False
         self.notes = []
         self.key = None
+        self.identity = False
         self.prepare()
 
     # -- what the mutations need to know about the data
@@ -234,7 +235,8 @@ class Data:
         if self.key is not None:
             for eid, n in numbers.items():
                 if n is not None:
-                    v = unscramble(n, self.key)
+                    # (After `identityids` an ID spells its index.)
+                    v = n if self.identity else unscramble(n, self.key)
                     if v < 4 * self.bound:
                         self.index[eid] = v
         self.top = max(self.index.values(), default=0)
@@ -258,6 +260,7 @@ class Data:
             last_person, last_index = who, at
         if run:
             self.runs.append(run)
+        self.where = {eid: (number, at) for number, run in enumerate(self.runs) for at, eid in enumerate(run)}
         self.users = sorted({line.f[1] for line in self.events if line.f and line.f[1]})
         if not self.users:
             self.users = ["u1"]
@@ -335,7 +338,17 @@ class Data:
         return runs[:count]
 
     def id_for(self, index):
-        return "e" + base36(scramble(index, self.key))
+        return "e" + base36(index if self.identity else scramble(index, self.key))
+
+    def shift_tail(self, run, start, delta):
+        """Move the events of a run from position `start` on by `delta` ms, if
+        they all have a time and stay inside the window."""
+        times = [self.time_of(e) for e in run[start:]]
+        if not times or None in times or max(times) + delta >= self.we or min(times) + delta < self.ws:
+            return False
+        for eid, when in zip(run[start:], times):
+            self.set_time(eid, when + delta)
+        return True
 
 
 # ------------------------------------------------------------------ mutations
@@ -461,6 +474,8 @@ def copies(D):
                 copy[4] = R.choice(["view", "cart", "purchase", "purchase", "Purchase", ""])
             if copy[4] == "purchase" and R.random() < 0.8:
                 copy[6] = R.choice(["1", "100", "250", "0250", "10000000", "10000001", "0", "19.99", "", str(R.randint(1, 50000))])
+            if copy[4] == "purchase" and R.random() < 0.3:
+                copy[5] = "p" + str(R.randint(1, 50000))      # another category, perhaps
             if R.random() < 0.08:
                 copy[5] = R.choice(["", "p1", "p999999"])
             if f1(stamp) in used:
@@ -516,14 +531,29 @@ def gaps(D):
     last event of one user and the first of a linked one, after shared times."""
     R = D.R
     made = 0
+    shift_tail = D.shift_tail
 
-    def shift_tail(run, start, delta):
-        times = [D.time_of(e) for e in run[start:]]
-        if None in times or max(times) + delta >= D.we or min(times) + delta < D.ws:
-            return False
-        for eid, when in zip(run[start:], times):
-            D.set_time(eid, when + delta)
-        return True
+    # Across the places where an index-based pipeline may cut its work: the
+    # events just below and at a multiple of a power of two, whoever they
+    # belong to (two users are linked into one person first).
+    by_index = {v: e for e, v in D.index.items()}
+    edges = 0
+    for step in (64, 1024, 4096, 8192, 16384, 32768, 65536):
+        for edge in range(step, D.top + 1, step):
+            if step < 4096 and R.random() > 0.04:
+                continue
+            a, b = by_index.get(edge - 1), by_index.get(edge)
+            if a is None or b is None or a not in D.where or b not in D.where:
+                continue
+            ta, tb = D.time_of(a), D.time_of(b)
+            if ta is None or tb is None:
+                continue
+            run, at = D.where[b]
+            if shift_tail(D.runs[run], at, ta + R.choice([GAP, GAP + 1, GAP, GAP + 1, 0, GAP - 1]) - tb):
+                if D.person(D.user_of(a)) != D.person(D.user_of(b)):
+                    D.add_link(D.user_of(a), D.user_of(b))
+                edges += 1
+    made += edges
 
     for run in D.some_runs(max(6, len(D.runs) // 15)):
         i = R.randrange(len(run) - 1)
@@ -550,7 +580,59 @@ def gaps(D):
         for eid in run[i + 1:i + 3]:
             D.set_time(eid, when)
         made += shift_tail(run, i + 3, when + R.choice([GAP, GAP + 1]) - tail)
-    D.notes.append(f"gaps {made}")
+    D.notes.append(f"gaps {made} ({edges} at edges)")
+
+
+def nested(D):
+    """Two linked users whose events nest: one user's long stretch (events 25
+    minutes apart) with the other's short one inside it, and the other's next
+    event within 30 minutes of the END of the long stretch only. Sessions
+    built from pieces must be joined by the latest time seen so far, not by the
+    end of the piece before."""
+    R = D.R
+    made = 0
+    pairs = D.some_runs(40, least=3)
+    for a, b in zip(pairs[0::2], pairs[1::2]):
+        if D.person(D.user_of(a[0])) == D.person(D.user_of(b[0])):
+            continue
+        start = D.ws + R.randrange(max(1, (D.we - D.ws - 6 * 3_600_000) // 1000)) * 1000
+        minute = 60_000
+        plan_a = [0, 25 * minute, 50 * minute]
+        tail = R.choice([75 * minute, 80 * minute, 80 * minute + 1, 50 * minute + GAP, 50 * minute + GAP + 1])
+        plan_b = [5 * minute, 6 * minute, tail]
+        if R.random() < 0.3:
+            plan_b = [0, 0, tail]                       # the same start as the long stretch
+        for eid, at in zip(a[:3], plan_a):
+            D.set_time(eid, start + at)
+        for eid, at in zip(b[:3], plan_b):
+            D.set_time(eid, start + at)
+        # What follows in either run goes well after, in its old order.
+        for run in (a, b):
+            first = D.time_of(run[3]) if len(run) > 3 else None
+            if first is not None:
+                D.shift_tail(run, 3, start + 4 * 3_600_000 - first)
+        D.add_link(D.user_of(a[0]), D.user_of(b[0]))
+        made += 1
+    D.notes.append(f"nested {made}")
+
+
+def identityids(D):
+    """Every canonical event ID replaced by `e` + its index in base 36: with
+    the un-scrambling switched off (SS_INDEX_IDENTITY=1) the whole data set then
+    goes through the index path, at its own size and shape. Put it first in a
+    list of mutations."""
+    if D.key is None or D.identity:
+        D.notes.append("identityids: no key")
+        return
+    renamed = 0
+    for eid, index in D.index.items():
+        new = "e" + base36(index)
+        for line in D.groups[eid]:
+            line.f[0] = new
+            line.changed = True
+        renamed += 1
+    D.identity = True
+    D.notes.append(f"identityids {renamed}")
 
 
 def links(D):
@@ -590,10 +672,11 @@ def wide(D):
         D.add_link(a, b)
     longest = max(D.runs, key=len, default=[])
     # A stretch of index-neighbouring events, whoever they belonged to.
-    start = R.randrange(max(1, len(D.order) - 4000))
-    stretch = D.order[start:start + min(4000, max(50, len(D.order) // 4))]
+    size = min(70000, max(50, len(D.order) // R.choice([3, 4, 10, 40])))
+    start = R.randrange(max(1, len(D.order) - size))
+    stretch = D.order[start:start + size]
     if len(longest) >= len(stretch):
-        stretch = longest[:4000]
+        stretch = longest[:70000]
     if stretch:
         who = D.user_of(stretch[0]) or R.choice(D.users)
         second = D.ws + R.randrange((D.we - D.ws) // 1000) * 1000
@@ -651,7 +734,25 @@ def badhead(D):
         sizes[line.file] += 1
     target = max(range(len(sizes)), key=sizes.__getitem__)
     head = [l for l in D.events if l.file == target][:R.choice([1, 3, 8, 40, 200, 2000])]
-    style = R.choice(["malformed", "irregular", "random", "mixed"])
+    style = R.choice(["malformed", "irregular", "random", "mixed", "same", "same"])
+    if style == "same":
+        # Copies of one event and nothing else: every sampled ID is the same.
+        model = next((l for l in head if l.f and l.f[0]), None)
+        if model is None:
+            return
+        taken = {l.f[3] for l in D.groups.get(model.f[0], [])}
+        for line in head:
+            if line is model or line.f is None:
+                continue
+            stamp = parse_ts(model.f[3])
+            while f1(stamp) in taken:
+                stamp += 1000
+            taken.add(f1(stamp))
+            line.f = list(model.f)
+            line.f[3] = f1(stamp)
+            line.changed = True
+        D.notes.append(f"badhead {len(head)} same")
+        return
     for line in head:
         how = style if style != "mixed" else R.choice(["malformed", "irregular", "random", "keep"])
         if how == "keep" or line.f is None:
@@ -698,9 +799,10 @@ def noeventfiles(D):
     D.notes.append("noeventfiles")
 
 
-MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, links, wide, drop, irrfile, badhead,
-                                     purchases, emptyevents, noeventfiles]}
-MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "links", "wide", "drop", "irrfile", "badhead", "purchases"]
+MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
+                                     purchases, identityids, emptyevents, noeventfiles]}
+MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
+           "purchases"]
 
 
 # ------------------------------------------------------------------ writing
