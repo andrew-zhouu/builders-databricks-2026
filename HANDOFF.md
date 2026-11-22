@@ -20,6 +20,7 @@ Everything below the horizontal rule predates this; where they disagree, this wi
 | Officially scored, **0.63 s** (22 Nov, about 23:15 UTC on the 21st) | `42b0f35` on `main` (a squash of `dev`; same build inputs as c5) | The best scored so far. |
 | Candidate c6: c5 + user_daily in 512 KB files written during the session pass, writeback of each started at once | `bd38f17` (tag `cand-c6`) | Full gate passed. Program time as c5; the docker command at 60M 1637 ms against 1749. |
 | **Candidate c7: c6 + smaller output** (rows without revenue first, person indexes as runs, campaign_daily dictionary-encoded) | `01708cd` (tag `cand-c7`) | Full gate passed. Program time as c6 (20M 484/488, 60M 1498/1501); output 18.5 MB at 20M (c5: 25), 55 MB at 60M (c5: 72). **The one to submit.** |
+| Candidate c8: c7 + writer that keeps its buffers between files | `1dd7fb8` | 20M 481/482 against 486/490 for c7; 60M 1484/1489 against 1498/1500 (the writer's CPU time at 60M: 180 ms against 310). Gate started 00:55 UTC on the 22nd (`scripts/remote.sh log c8`). |
 | Diagnostic image (fails on purpose, shows a log) | `2a2ea40` (branch `diag4`) | Not yet submitted. The single most informative submission: scorer CPU, clock under 512-bit code, huge pages, page-fault and memory costs, `/output` write speed, CPU-quota throttling. |
 
 "Full gate" = `scripts/cand.sh NAME`: on EC2, `fullcheck.sh` (fixtures, dev answer, 150
@@ -95,6 +96,21 @@ container exit and the docker command's return drops to its fixed 62 ms at any o
 size) and c7 (fewer bytes). Starting writeback from the worker threads themselves
 stalled a run once (journal commit), hence the helper thread. musl's allocator has one
 lock: an allocation per run-length run made eight threads queue for it (+200 ms).
+
+Measured directly (`scripts/remote/dirtycheck.sh`): when the process exits, c5 still has
+all of its output unwritten (24.5 MB at 20M, 72.6 MB at 60M); c6 and c7 have 0 to 0.3 MB.
+
+More from the same night:
+
+* A thread that writes many files must keep its buffers: musl gives large blocks
+  back with an unmap each time, which interrupts every thread (0.5% of all CPU time
+  in map/unmap calls at 60M before c8), and the standard hash map costs 0.4%.
+* No gain, not kept: flushing after every partition near the end of pass 3 (nothing
+  is left unwritten anyway); releasing the input mappings in equal byte shares with
+  thread 0 exempt; a branch-free "candidate or not" in pass 2 (under two threads per
+  core a misprediction is cheaper than the extra instructions; simulated mispredictions
+  are 3.8 per event line, `scripts/remote/cgbranch.sh`, and none of the top sites is
+  cheap to remove for that reason).
 
 Not yet known: whether early writeback takes effect on the scorer (c6 should score
 about 0.57 if so). If c6 stays near 0.63, bytes are what counts there: next would be

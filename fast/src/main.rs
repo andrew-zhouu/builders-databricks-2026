@@ -433,9 +433,9 @@ fn worker(ctx: &Ctx, tid: usize) {
     });
     let mut sc = pass3::Scratch::new(ctx);
     // Rows leave in files of about `out_chunk` bytes as they come, not in one
-    // file at the end: the kernel then writes them to disk while the rest is
-    // still being computed (see sys::start_writeback), and the row buffers
-    // stay small.
+    // file at the end: the row buffers and what the writer encodes at a time
+    // then stay small enough to be reused from the cache, instead of growing
+    // through fresh memory.
     let mut files = 0usize;
     let mut encoded = Encoded::default();
     loop {
@@ -775,9 +775,8 @@ fn write_campaign_daily(ctx: &Ctx) {
             a.revenue += b.revenue;
         }
     }
-    // This file is written last, so it is still unwritten on disk when the
-    // run ends (see sys::start_writeback): it is kept small. Text and days
-    // are dictionaries; a count column is one where that is the smaller form.
+    // Text and days are dictionaries; a count column is one where that is the
+    // smaller form.
     use parquet::{as_bytes, index_width, pack_indices};
     let (mut ids, mut channels) = (Vec::<u8>::new(), Vec::<u8>::new());
     let (mut nids, mut nchannels) = (0u32, 0u32);

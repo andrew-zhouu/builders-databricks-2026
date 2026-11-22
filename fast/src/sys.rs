@@ -27,23 +27,26 @@ pub fn thread_cpu_ns() -> u64 {
     ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
 }
 
-/// Ask the kernel to start writing a finished output file's pages to disk
-/// now, without waiting for it. When a container exits, Docker unmounts its
-/// root, which makes the kernel write out everything still unwritten on that
-/// disk before the run counts as over: output written early costs nothing
-/// then.
+/// With SS_WRITEBACK=1 (an experiment, off otherwise): ask the kernel to
+/// start writing a finished output file's pages to disk now, without waiting
+/// for it.
+///
+/// Why one might: when a container exits, Docker unmounts its root, which
+/// makes the kernel write out everything still unwritten on that disk before
+/// `docker run` returns, and on our test machine that wait disappears when
+/// the output was written early. Why it is off: the official clock does not
+/// include that wait (a build with this on scored no better than one without
+/// and three times the unwritten output), and disk activity during the run
+/// can only cost time.
 ///
 /// Starting the writeback can itself wait (for the file system's journal), so
-/// a thread of its own does it: the caller only hands the file over. Nothing
-/// depends on it happening: a file whose turn never comes, or a file system
-/// that cannot do this, leaves the pages for the kernel to write later, as
-/// without this. SS_WRITEBACK=0 (experiment) leaves it out.
+/// a thread of its own does it: the caller only hands the file over.
 pub fn start_writeback(f: File) {
     use std::sync::mpsc::{channel, Sender};
     use std::sync::{Mutex, OnceLock};
     static QUEUE: OnceLock<Option<Mutex<Sender<File>>>> = OnceLock::new();
     let queue = QUEUE.get_or_init(|| {
-        if std::env::var("SS_WRITEBACK").is_ok_and(|v| v == "0") {
+        if !std::env::var("SS_WRITEBACK").is_ok_and(|v| v == "1") {
             return None;
         }
         let (tx, rx) = channel::<File>();
