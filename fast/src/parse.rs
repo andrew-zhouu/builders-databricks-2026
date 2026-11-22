@@ -410,11 +410,15 @@ unsafe fn link_fast(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
     let m = |c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
     let (cm, nm, qm) = (m(b','), m(b'\n'), m(b'"'));
     let nl = nm.trailing_zeros() as usize;
+    if nl >= 32 {
+        // No newline in 32 bytes: a line with a long ID (ids.rs), usually.
+        return link_long(ctx, ring, p);
+    }
     let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
     let cmb = cm & below;
     let c0 = cmb.trailing_zeros() as usize;
     let (bad, f) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
-    if (nl >= 32) | (cmb == 0) | (cmb & cmb.wrapping_sub(1) != 0) | (bad != 0) {
+    if (cmb == 0) | (cmb & cmb.wrapping_sub(1) != 0) | (bad != 0) {
         return 0;
     }
     let (f0, f1) = ((f & 1) as usize, (f >> 1 & 1) as usize);
@@ -430,6 +434,59 @@ unsafe fn link_fast(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
     }
     ring.push(ctx, (k0, k1));
     nl + 1
+}
+
+/// The key of the user ID of `n` bytes at `a`, if it is regular or long
+/// (ids.rs); a long one is put in the table of long IDs here. `None`: the
+/// scalar path must take the line.
+#[inline(always)]
+unsafe fn link_key(ctx: &Ctx, a: *const u8, n: usize) -> Option<u64> {
+    if n == LONG_LEN {
+        let (hex, hi, lo) = hex32(a.add(1));
+        if !hex | (*a != b'u') {
+            return None;
+        }
+        return ctx.users.long_key(hi, lo);
+    }
+    let (regular, key) = raw_key_fast(a, n, b'u');
+    regular.then_some(key)
+}
+
+/// `link_fast` for a line of more than 31 bytes: two windows of 64 bytes, one
+/// for each ID (33 bytes when long, 35 with quotes) and what ends it.
+#[inline(never)]
+unsafe fn link_long(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
+    // Window 1: the first ID and the comma (no newline before it).
+    let (cm, nm, qm) = masks64(p);
+    let c0 = cm.trailing_zeros() as u64;
+    let mut bad = (c0 >> 6) | _bzhi_u64(nm, c0 as u32);
+    let q0 = _bzhi_u64(qm, c0 as u32);
+    // The field starts with a quote; it ends with one.
+    let f0 = q0 & 1;
+    let l0 = (q0 << 1 >> (c0 & 63)) & 1;
+    // Window 2: the second ID and the newline (no comma before it).
+    let o = (c0 & 63) + 1;
+    let (cm, nm, qm) = masks64(p.add(o as usize));
+    let nl = nm.trailing_zeros() as u64;
+    bad |= (nl >> 6) | _bzhi_u64(cm, nl as u32);
+    let q1 = _bzhi_u64(qm, nl as u32);
+    let f1 = q1 & 1;
+    let l1 = (q1 << 1 >> (nl & 63)) & 1;
+    // Sound quoting: a field is quoted iff its first and last bytes are quotes,
+    // and there is no other quote in the line.
+    bad |= (f0 ^ l0) | (f1 ^ l1) | ((q0.count_ones() + q1.count_ones()) as u64 ^ 2 * (f0 + f1));
+    if bad != 0 {
+        return 0;
+    }
+    let used = (o + nl + 1) as usize;
+    let (a0, n0) = (p.add(f0 as usize), (c0 - 2 * f0) as usize);
+    let (a1, n1) = (p.add((o + f1) as usize), (nl - 2 * f1) as usize);
+    if (n0 == 0) | (n1 == 0) {
+        return used;
+    }
+    let (Some(k0), Some(k1)) = (link_key(ctx, a0, n0), link_key(ctx, a1, n1)) else { return 0 };
+    ring.push(ctx, (k0, k1));
+    used
 }
 
 const RING: usize = 32;
