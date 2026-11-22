@@ -51,6 +51,14 @@ impl Table {
         }
     }
 
+    /// The table itself, for a lookup of several users at once (`parse::wide`):
+    /// 16 bytes a slot, the key in the first eight and the parent (0 = none,
+    /// else the parent's slot + 1) in the next four.
+    #[inline(always)]
+    pub fn slots(&self) -> *const u8 {
+        self.slots as *const u8
+    }
+
     #[inline(always)]
     fn slot(&self, i: u32) -> &Slot {
         unsafe { &*self.slots.add(i as usize) }
