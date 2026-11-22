@@ -1166,6 +1166,21 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
     nmore
 }
 
+const _: () = assert!(NB == 64);
+
+/// The lines among the first `n` of a batch whose flags, as far as `care`
+/// says, are `want`: a bit for each.
+#[inline(always)]
+unsafe fn flagged(flags: &[u8; NB], n: usize, care: u8, want: u8) -> u64 {
+    let (care, want) = (_mm256_set1_epi8(care as i8), _mm256_set1_epi8(want as i8));
+    let half = |k: usize| {
+        let f = _mm256_loadu_si256(flags.as_ptr().add(32 * k) as *const __m256i);
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_and_si256(f, care), want)) as u32 as u64
+    };
+    // (Lines past the batch's end keep the flags of an earlier batch.)
+    _bzhi_u64(half(0) | half(1) << 32, n as u32)
+}
+
 /// The users of the valid lines that `decode` flagged `F_LONG`: 33 bytes,
 /// which is a long ID if they are `u` and 32 lowercase hexadecimal digits
 /// (ids.rs). Its key is its slot in the table of long IDs, which is asked for
@@ -1174,14 +1189,16 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
 /// scalar path. Runs after `stage_more`, which may have found a line invalid.
 #[inline(never)]
 unsafe fn stage_long(ctx: &Ctx, st: &mut Stage, n: usize) {
+    let mut mask = flagged(&st.flags, n, F_LONG | F_VALID | F_DEAD, F_LONG | F_VALID);
+    if mask == 0 {
+        return;
+    }
     let mut list = [0u8; NB];
     let mut m = 0usize;
-    for i in 0..n {
-        *list.get_unchecked_mut(m) = i as u8;
-        m += (*st.flags.get_unchecked(i) & (F_LONG | F_VALID | F_DEAD) == F_LONG | F_VALID) as usize;
-    }
-    if m == 0 {
-        return;
+    while mask != 0 {
+        *list.get_unchecked_mut(m) = mask.trailing_zeros() as u8;
+        m += 1;
+        mask = _blsr_u64(mask);
     }
     let table = ctx.users.long.as_ref().unwrap_unchecked();
     let mut value = [(0u64, 0u64); NB];
@@ -1602,14 +1619,16 @@ unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
 /// of 33 bytes is for the scalar path.
 #[inline(never)]
 unsafe fn click_long(ctx: &Ctx, st: &mut ClickStage, n: usize) {
+    let mut mask = flagged(&st.flags, n, 0xFF, C_VALID | C_LONG);
+    if mask == 0 {
+        return;
+    }
     let mut list = [0u8; NB];
     let mut m = 0usize;
-    for i in 0..n {
-        *list.get_unchecked_mut(m) = i as u8;
-        m += (*st.flags.get_unchecked(i) == C_VALID | C_LONG) as usize;
-    }
-    if m == 0 {
-        return;
+    while mask != 0 {
+        *list.get_unchecked_mut(m) = mask.trailing_zeros() as u8;
+        m += 1;
+        mask = _blsr_u64(mask);
     }
     let table = ctx.users.long.as_ref().unwrap_unchecked();
     let mut value = [(0u64, 0u64); NB];
