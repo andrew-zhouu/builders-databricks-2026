@@ -51,13 +51,25 @@ What was done (branch `exp-v5`, from the wide-parser branch without any index co
 | --- | --- | --- |
 | Scored fallback (version 5: **3.6747 s**) | `42b0f35` on `main` | Correct on version 5, slow. |
 | **Candidate v1: long IDs on the base (AVX2) path** | `21a5b428e7d0843b04c81f24e762dc7580ad9a04` (`exp-v5`) | New 20M set on EC2: **569 / 571 ms against 3171 / 3249** for the scored build. Gate `v1` (`scripts/remote.sh log v1 40`). |
-| Next: batch splitters for the wide path, NUL fix | `0ddfa0e` (`exp-sw`) | A short event ID with a NUL byte hashed like the ID without it (found by the tests fork; the generator writes no NUL; present since c1). Fixed here for the base and scalar paths. |
+| **Candidate v1** passed the full gate (`CANDIDATE-OK`), tag `cand-v1` | as above | Given to the user for official scoring at 03:05 UTC. |
+| **Candidate v2: v1 + the wide (AVX-512) parser with long IDs, on by default again; NUL fix** | `296b0dd3f2e79d4d9e1f8302bfa18618e63cacfc` (`exp-v5`) | One interleaved run on EC2 (Ice Lake), v2 / v2 with `SS_SIMD=0` (= v1's path): 20M **444 / 450 against 570 / 574**; 60M **1414 / 1417 against 1787 / 1792**. Gate `v2` started 03:12 UTC. Only faster where the processor has AVX-512 VBMI2; elsewhere it runs v1's path. |
+| Diagnostic image for version 5 (fails on purpose, shows a log) | `80cc95beefbfd09c487cf3b76958c4283c0676f3` (`diag-v5`) | Prints the scorer's processor (model, the flags the wide path needs) and times the practice data with the wide parser asked for and refused, back to back. One submission answers whether v2 or v1 is the commit for the final. |
+
+What is in v2 beyond v1: the wide decode keeps long IDs on the fast path (`id_trace8`
+mirrors `id_trace_at`: `hash33` on eight lanes, the NUL rule; 33-byte users flagged for
+`stage_long`; click IDs as references), the batch splitters use the three windows of
+the line splitters, a wide emit (`SS_WEMIT=0` turns it off; worth 1 to 2 ms at 20M),
+and a short event ID with a NUL byte is no longer hashed like the same ID without it
+(found by the tests fork; the generator writes no NUL; the fault dates from c1).
 
 Known and open:
 
-* Whether the scorer's processors have AVX-512 VBMI2 is still unknown; the wide path
-  was worth 15% on version-4 data on our Ice Lake box.
-* Links with a long ID take the scalar path (`link_line`): about 100 ms of CPU at 20M.
+* Whether the scorer's processors have AVX-512 VBMI2 is still unknown (the diagnostic
+  image answers it). The wide path is worth 22% on version-5 data on our Ice Lake box.
+* Links with a long ID took the scalar path (`link_line`) in v1 and v2; `exp-sw` has a
+  fast path for them (`link_long`), not yet measured on a quiet machine.
+* Never push sources to `~/db` on the box while a gate runs there (its later steps
+  rebuild from that directory): use a secondary tree (`scripts/newtree.sh`).
 
 ## State before scorer version 5 (historical)
 
