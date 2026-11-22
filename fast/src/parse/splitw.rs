@@ -504,3 +504,11 @@ split_clicks_batch_fn!(
     lowest5,
     ones5
 );
+
+/// The batch splitters with four lines at a time in 256-bit registers
+/// (splitw_quad.rs): for parser instance 3.
+pub mod quad {
+    use super::*;
+
+    include!("splitw_quad.rs");
+}
