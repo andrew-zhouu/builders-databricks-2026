@@ -114,6 +114,30 @@ scorer has AVX-512 without VBMI2 and the third instance pays; about 0.68 to 0.69
 AVX-512 there at all (v3 is then 1.5% better than v2); clearly worse = the third
 instance loses on that processor: set `WIDE5_DEFAULT` to false, gate, submit that.
 
+**Candidate v4**, `ca5f5f91958909da54b1acff50c570b957e139bc` (`exp-v5`), gate `v4`
+started 05:50 UTC: v3 plus **the parser instance chosen by timing** (`main::calibrate`).
+A processor's flags say which instances it can run, not which is fastest there (clock
+reductions for 512-bit code on Skylake-X / Cascade Lake, slow single instructions on
+AMD), and none of that can be measured on our box. So thread 0, right after loading
+the lookups and while the other threads read the links, parses the first 512 KB of the
+largest events file once unclocked and then three times each with the ordinary
+instance and with the wide instance the processor offers, into writers of its own
+(traces thrown away), and takes the wide one only if its best time is under 95% of the
+ordinary one's. Not when `SS_SIMD`, a self-check or `SS_SCALAR` is set, `SS_CALIBRATE=0`,
+or the largest events file is under 4 MB (then: the rule by flags). `SS_TIMING=1`
+prints what was measured. On EC2: 614..634 us against 424 us, instance 1 every time;
+wall time unchanged (20M 437 / 442 against 439 / 443 with `SS_CALIBRATE=0`; 60M
+1388 / 1392 against 1387 / 1394). This makes v3's bet on the third instance safe: it is
+only taken where it measures faster. Diagnostic image of v4:
+`575ddf8add4781538b57bd865f5e35b310d01fce` (`diag-v5c`).
+
+Measured and left alone after v3: marking the input mappings sequential (no change in
+the 13 ms the release of memory takes at the end: it is work per page, done by all
+threads, and still 8 ms better than leaving it to the exit); the campaign counters of
+the session pass (all their cache misses together are 1.3% of the run: one cell for
+everything saves 5 ms); the base decode by source line (flat: timestamps 40 of its
+257 instructions per line, nothing else over 15).
+
 Tried since v2 without gain (all removed): a table of long IDs a quarter the size; a
 helper thread faulting the partition pool in ahead of the writers (by
 `MADV_POPULATE_WRITE`: system time halved, wall time 3% worse; by one write fault per
