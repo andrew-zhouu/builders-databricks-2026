@@ -416,6 +416,60 @@ def irregular(D):
     D.notes.append(f"irregular {made}")
 
 
+def idbytes(D):
+    """Event IDs one byte away from canonical ones, for a decoder that turns
+    the bytes after `e` into a number several lines at a time. Each is a twin:
+    a new event next to the original (same user or another, a time near it),
+    so a decoder that takes the twin for the original loses an event. A digit
+    replaced by a byte next to the digit ranges, by what a decoder without
+    range checks would read as the same digit, by itself with a bit flipped;
+    the ID with NULs, a space or a zero after it, with another first byte;
+    IDs that differ from each other in NULs at the end only (one hash, if the
+    hash pads with zeros)."""
+    R = D.R
+    near = ["/", ":", "`", "{", "@", "[", "\x00", " ", "\x7f", "\x80", "\xff", "G", "Z", "_", "\r", "\t", "\xb1"]
+    ids = [e for e in D.groups if 2 <= len(e) <= 9 and D.time_of(e) is not None]
+    R.shuffle(ids)
+    made = 0
+    for eid in ids[:max(60, len(ids) // 12)]:
+        kind = R.choice(["near", "near", "alias", "alias", "flip", "tail", "head", "nuls", "zero", "all"])
+        at = R.randrange(1, len(eid))
+        c = eid[at]
+        twins = []
+        if kind == "alias" and c not in DIGITS:
+            kind = "near"
+        if kind == "near":
+            twins = [eid[:at] + R.choice(near) + eid[at + 1:]]
+        elif kind == "alias":
+            v = int(c, 36)
+            # `:` to `S` continue the digits; `W` to `` ` `` sit before `a` as 0 to 9 do before 10.
+            other = chr(ord("0") + v) if c.isalpha() else chr(ord("a") - 10 + v)
+            twins = [eid[:at] + R.choice([other, c.upper() if c.isalpha() else other]) + eid[at + 1:]]
+        elif kind == "flip":
+            twins = [eid[:at] + chr(ord(c) ^ R.choice([0x80, 0x20, 0x10, 0x08, 0x40, 0x01])) + eid[at + 1:]]
+        elif kind == "tail":
+            twins = [eid + t for t in R.sample(["\x00", "\x00\x00", " ", "0", "\x000", "\xff", "\x80"], 2)]
+        elif kind == "head":
+            twins = [h + eid[1:] for h in R.sample(["E", "d", "f", "\xe5", "%", "\x00", "u", "k", "1"], 2)]
+        elif kind == "nuls":
+            base = eid.upper() if eid.upper() != eid else "E" + eid[1:]
+            twins = [base, base + "\x00", base + "\x00\x00", base + "\x00\x00\x00"][:R.randint(2, 4)]
+        elif kind == "zero":
+            twins = [eid[0] + "0" + eid[2:], eid[0] + "0" + eid[1:], eid[:at] + "0" * (len(eid) - at)]
+        else:
+            odd = R.choice(near)
+            twins = [eid[0] + odd * (len(eid) - 1), eid[0] + odd * 8, eid[0] + odd]
+        when = D.time_of(eid)
+        user = D.user_of(eid)
+        for twin in twins:
+            if not twin or len(twin) > 12 or any(ch in twin for ch in ',"\n') or twin in D.groups:
+                continue
+            ms = min(D.we - 1, when + R.choice([0, 1000, 60_000, GAP, GAP + 1]))
+            D.new_event(twin, user=R.choice([user, user, None]), ms=ms, kind=R.choice(["view", "cart", "purchase"]))
+            made += 1
+    D.notes.append(f"idbytes {made}")
+
+
 def outrange(D):
     """Canonical-looking IDs whose index is far outside the data, and the
     largest numbers an ID can spell."""
@@ -1358,7 +1412,10 @@ def clicksplit(D):
         if any(l.f != f for l in lines) or ms is None or not 0 <= ms < 10 ** 14:
             continue
         mask = quote_mask(R, 4)
-        want = R.choice([60, 61, 62, 63, 64, 65, 66, 126, 127, 128, 129]) if at >= 3 else R.randint(9000, 20000)
+        # (No more than 4,000 digits: Python's own limit for a number's text is
+        # 4,300, and the reference reads a ts with int(). Longer lines are made
+        # of long IDs below.)
+        want = R.choice([60, 61, 62, 63, 64, 65, 66, 126, 127, 128, 129]) if at >= 3 else R.randint(1500, 4000)
         other = len(f[0]) + len(f[1]) + len(f[2]) + 3 + 2 * bin(mask).count("1")
         if want - other >= len(str(ms)):
             f[3] = str(ms).zfill(want - other)
@@ -1417,7 +1474,13 @@ def clicksplit(D):
                                          ",".join(model[:k] + [model[k] + '"'] + model[k + 1:]), '"' + body + '"',
                                          ",".join(model[:k] + ['"' + model[k] + '""'] + model[k + 1:])]))
             elif kind == "long":
-                members.append(R.choice(["x" * R.randint(9000, 20000), body + "9" * R.randint(9000, 20000) + '"', "," * R.randint(9000, 12000)]))
+                size = R.randint(9000, 20000)
+                # Not a click at all, or a new click that is long by its
+                # click_id, by its user (whom nobody knows) or by its campaign.
+                members.append(R.choice(["x" * size, body + "9" * size + '"', "," * R.randint(9000, 12000),
+                                         f"{new_id()}{'7' * size},{model[1]},{model[2]},{model[3]}",
+                                         f"{new_id()},u{'8' * size},{model[2]},{model[3]}",
+                                         f"{new_id()},{model[1]},{model[2]}{'x' * size},{model[3]}"]))
                 members += [ordinary() or "" for _ in range(R.randint(1, 20))]
                 break
             else:
@@ -1482,8 +1545,10 @@ def endings(D):
 
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
-                                     splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles]}
+                                     splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles,
+                                     idbytes]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
+           "idbytes", "idbytes",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
            "splitter", "splitter", "clicksplit", "clicksplit", "interleave", "endings"]
 

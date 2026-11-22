@@ -44,9 +44,15 @@ if [ "$mode" = split ]; then
          clicksplit,clickshapes,splitter clicksplit,userlengths,endings clicksplit,splitter,interleave,endings
          clicksplit,mix)
 fi
+if [ "$mode" = wix ]; then
+  # Everything, and the splitter's shapes with the index on.
+  names+=(splitter clicksplit interleave splitter,clicksplit,interleave,endings mix,splitter gaps,nested,disorder
+          identityids,gaps,nested identityids,splitter,copies copies,irregular,outrange badhead,drop,links
+          idbytes idbytes,copies identityids,idbytes,disorder idbytes,shapes,splitter idbytes,mix)
+fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
-fails=0; runs=0
+fails=0; runs=0; indexed=0; sets=0
 for seed in $(seq "$first" $((first + count - 1))); do
   events="${EVENTS:-${sizes[$((seed % ${#sizes[@]}))]}}"
   clicks=$((events / (seed % 3 + 2)))
@@ -60,6 +66,10 @@ for seed in $(seq "$first" $((first + count - 1))); do
     echo "FAIL $tag: mutate.py failed: $(tail -1 "$d/mutate.log")"; fails=$((fails + 1)); continue
   fi
   rm -rf "$d/base"
+  # The event key mutate.py found (the generator's): a bound forced on the
+  # index path needs it given too, or the key search fails under the bound.
+  key="$(grep -o 'key [0-9a-f]*' "$d/mutate.log" | head -1 | cut -d' ' -f2)"
+  K=""; [ -n "$key" ] && K="SS_INDEX_KEY=$key"
   if ! timeout 300 "$BIN" --slow "$d/data" "$d/slow" 2> "$d/slow.log"; then
     echo "FAIL $tag: the plain implementation failed: $(tail -1 "$d/slow.log")"; fails=$((fails + 1)); continue
   fi
@@ -109,7 +119,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "scalar|NCPU=2 SS_SCALAR=1"
       "manyparts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))") ;;
     wix) settings=(
-      "default|NCPU=3"
+      "default|NCPU=3 SS_TIMING=1"
       "one|NCPU=1"
       "eight|NCPU=8"
       "checks|NCPU=4 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
@@ -117,16 +127,20 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "nosimd|NCPU=4 SS_SIMD=0"
       "nowsplit|NCPU=3 SS_WSPLIT=0"
       "id4096|NCPU=4 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=4096"
-      "id100k|NCPU=2 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=100000"
+      "id100k|NCPU=2 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=100000 SS_INDEX_PB=$((seed % 5 + 3))"
       "id50m|NCPU=8 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=50000000"
+      "idcheck|NCPU=3 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=1000000 SS_INDEX_PB=$((seed % 6 + 8)) SS_SIMD_CHECK=1"
       "wrongkey|NCPU=4 SS_INDEX_KEY=123456789a"
-      "halfbound|NCPU=5 SS_INDEX_BOUND=$((events / 2))"
-      "bound64|NCPU=3 SS_INDEX_BOUND=64"
-      "pb8|NCPU=4 SS_INDEX_PB=8"
-      "pb9check|NCPU=3 SS_INDEX_PB=9 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
-      "idpb|NCPU=3 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=50000000 SS_INDEX_PB=$((seed % 6 + 8))"
+      "sparse|NCPU=4 SS_INDEX_KEY=$((seed % 9 + 1))23456789 SS_INDEX_BOUND=15000000000 SS_INDEX_PB=18 SS_SIMD_CHECK=1"
+      "halfbound|NCPU=5 $K SS_INDEX_BOUND=$((events / 2))"
+      "bound64|NCPU=3 $K SS_INDEX_BOUND=64"
+      "boundbig|NCPU=4 $K SS_INDEX_BOUND=200000000"
+      "pb3|NCPU=4 $K SS_INDEX_PB=3"
+      "pb5check|NCPU=3 $K SS_INDEX_PB=5 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+      "pb8half|NCPU=2 $K SS_INDEX_PB=8 SS_INDEX_BOUND=$((events * 2 / 3))"
+      "pb18|NCPU=1 $K SS_INDEX_PB=18"
       "tiny|NCPU=4 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
-      "tinypb|NCPU=8 SS_INDEX_PB=8 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "tinypb|NCPU=8 $K SS_INDEX_PB=4 SS_CHUNK_BYTES=$((seed % 97 + 31))"
       "scalar|NCPU=2 SS_SCALAR=1") ;;
     index) settings=(
       "default|NCPU=3"
@@ -153,6 +167,9 @@ for seed in $(seq "$first" $((first + count - 1))); do
     if [ $rc != 0 ]; then
       echo "FAIL $tag setting $label ($vars): exit code $rc $(tail -4 "$o.log" | tr '\n' ' ' | cut -c1-500)"; bad="$bad $label"; continue
     fi
+    if [ "$label" = default ]; then
+      sets=$((sets + 1)); grep -q 'event IDs indexed: true' "$o.log" && indexed=$((indexed + 1))
+    fi
     if ! "$PY" -I tools/cmp.py "$d/slow" "$o" > "$o.cmp" 2>&1; then
       echo "FAIL $tag setting $label ($vars): $(grep -m5 -E 'rows|A:|B:' "$o.cmp" | tr '\n' ' ' | cut -c1-400)"; bad="$bad $label"
     else
@@ -165,5 +182,6 @@ for seed in $(seq "$first" $((first + count - 1))); do
     rm -rf "$d"
   fi
 done
-echo "idxfuzz $(basename "$BIN") [$mode] seeds $first..$((first + count - 1)): $runs runs, $fails failing sets"
+note=""; [ "$mode" = wix ] && note=" ($indexed of $sets sets took the index road by default)"
+echo "idxfuzz $(basename "$BIN") [$mode] seeds $first..$((first + count - 1)): $runs runs, $fails failing sets$note"
 [ "$fails" = 0 ]
