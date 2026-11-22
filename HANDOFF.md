@@ -75,6 +75,33 @@ interleaved rounds (`scripts/abx.sh`).
 * Beware: `remote.sh push` must not preserve file times (fixed), or cargo on EC2 skips
   files edited before its last build.
 
+### 22 November, 01:15 UTC: three lines of work in parallel
+
+After the third official score the brief changed to "independent approaches, in
+parallel". `scripts/newtree.sh NAME` makes a git worktree `../db-NAME` (branch
+`exp-NAME`) with its own directory on the EC2 box (`~/db_NAME`, sharing data, references
+and toolchain by symbolic links); `scripts/remote.sh run` takes a machine-wide lock so
+that nobody disturbs a measurement (`quick` for reading logs).
+
+* **`exp-index` (shelved, pushed as a record, f6b84eb).** Event IDs are `e` + base 36
+  of a bijective scramble of a counter that runs through each user's events in time
+  order. Decoding it (the key is found from six sample IDs in about a millisecond) lets
+  pass 2 place each event at its index (dedup without fingerprints) and walk the slots,
+  handing each person's events to pass 3 as session intervals `[first, last, count]`;
+  pass 3 then sorts 3.5M intervals instead of 19.5M events and merges them. Exact for
+  any input (IDs that are not canonical take the old road and become intervals of one).
+  Measured at 20M: pass 3 gather 205 -> 28 ms CPU, people 523 -> 415, interval sort
+  +55; pass 2 unchanged in total; **parsing +200 to 250 ms**, because the exact decode
+  is about 105 instructions per line as compiled against 12 for the hash, in its own
+  loop or inside `decode`. Wall 484 to 489 ms against 483. A decode without the
+  canonical checks would still cost about half of that. Not worth its risk.
+* **`exp-simd` (running).** A parser instance for Ice Lake and newer chosen at run
+  time, and a decode stage vectorised across lines.
+* **`exp-tests` (running).** `tools/mutate.py`, `scripts/remote/idxfuzz.sh`,
+  `fuzzidx.sh`: mutations of generated data aimed at dedup, session and link edge
+  cases, each run compared with the plain implementation and the Python reference.
+  No failure in c8/c9 so far (about 450 runs).
+
 ### What the third official score says (this corrects the section below)
 
 c7 (early writeback, 18.5 MB of output) scored **0.64 s**; c5 (no writeback, 25 MB)
