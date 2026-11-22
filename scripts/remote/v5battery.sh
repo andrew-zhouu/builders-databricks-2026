@@ -12,7 +12,7 @@
 #          mut     COUNT mutated generator sets from seed FIRST (SETTINGS=v5)
 #          long    COUNT seeds of the fuzz corpus with long IDs and near misses, from FIRST
 #          fuzz    the same corpus with its usual IDs and with dense ones
-#          focus   COUNT sets from FIRST for each of the long-ID mutations alone
+#          focus   COUNT sets from FIRST for each of the version 5 mutations (or of FOCUS="a b,c ...")
 #   env: YARD=name (default dev9), SETTINGS (default v5)
 #        MUTATE_SKIP   what tools/mutate.py leaves out (default nultail: event IDs of at
 #                      most 9 bytes that end in a NUL, a known defect; give MUTATE_SKIP=none
@@ -23,7 +23,7 @@ bin="$1"; stage="$2"; first="${3:-1}"; count="${4:-8}"
 yard="${YARD:-dev9}"; mode="${SETTINGS:-v5}"
 case "$stage" in
   tools)
-    NAMES="longusers longevents longclicks longusers,longevents,longclicks splitter,longevents clicksplit,longclicks" \
+    NAMES="longusers longevents longclicks windows longusers,longevents,longclicks windows,longusers,longevents,longclicks splitter,longevents clicksplit,longclicks" \
       bash scripts/remote/gated.sh scripts/remote/selftest.sh "$yard" 2>&1 | cut -c1-300 ;;
   mut)
     SLOW_BIN="$yard" REF_EVERY=2 bash scripts/remote/gsteps.sh mut "$bin" "$mode" "$first" "$count" 3 ;;
@@ -34,7 +34,7 @@ case "$stage" in
     bash scripts/remote/gsteps.sh dense "$bin" "$mode" "$first" "$count" 3 ;;
   focus)
     at="$first"
-    for mutation in longusers longevents longclicks longusers,longevents,longclicks,splitter,clicksplit,endings; do
+    for mutation in ${FOCUS:-windows longclicks longusers longevents windows,longevents,longclicks windows,longusers,splitter,clicksplit,endings}; do
       MUTATION="$mutation" SLOW_BIN="$yard" REF_EVERY=2 bash scripts/remote/gsteps.sh mut "$bin" "$mode" "$at" "$count" 3
       at=$((at + count))
     done ;;

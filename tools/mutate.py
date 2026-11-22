@@ -2066,6 +2066,31 @@ def longclicks(D):
                 continue
             add(cid, mate(user), R.choice(campaigns), R.choice([str(when), same_instant(D, str(when))]))
             starts += 1
+            if R.random() < 0.3:
+                # The same click once more (identical values, as the rules
+                # promise; other quotes, another place in the files).
+                source = next(l for l in clicks if l.f and l.f[0] == cid)
+                copy = Line(None, list(source.f), R.randrange(len(D.click_files)))
+                copy.changed = True
+                clicks.insert(R.randrange(len(clicks) + 1), copy)
+    # Ties between IDs of the lengths at either end: one byte, hundreds of
+    # bytes, and more bytes than fit a 14-bit length (16,383), where the two
+    # IDs differ in their last byte only or one is the other's beginning.
+    extremes = 0
+    for run in D.some_runs(12, least=1):
+        eid = R.choice(run)
+        when, user = D.time_of(eid), D.user_of(eid)
+        if when is None or not user:
+            continue
+        size = R.choice([300, 300, 1000, 16382, 16383, 16384, 17000])
+        stem = "k" + "".join(R.choice(DIGITS) for _ in range(size - 2))
+        family = R.choice([["k", "k0", "j", "l"], ["0", "k", "K"], [stem + "a", stem + "b"], [stem + "b", stem + "a", stem],
+                           [stem + "a", stem + "aa"], ["k" + L.hex(), "k"], [stem + "z", stem[:300], stem[:9]]])
+        for cid in family:
+            if cid in names:
+                continue
+            add(cid, mate(user), R.choice(campaigns), str(when))
+            extremes += 1
     # Lines that are malformed by a quote in a long click ID, at the time of a
     # real click and for another campaign: read as clicks, they would be in
     # the tie (a quote sorts before every letter and digit).
@@ -2075,15 +2100,145 @@ def longclicks(D):
         text = ",".join([broken(R, cid if is_long(cid, "k") and R.random() < 0.6 else "k" + L.hex()), f[1], R.choice(campaigns), f[3]])
         clicks.insert(R.randrange(len(clicks) + 1), Line(text, None, R.randrange(len(D.click_files))))
         bad += 1
-    D.notes.append(f"longclicks {renamed} renamed, {ties} ties, {starts} at event times, {bad} malformed")
+    D.notes.append(f"longclicks {renamed} renamed, {ties} ties, {starts} at event times, {extremes} of extreme length, {bad} malformed")
+
+
+def windows(D):
+    """For splitters that see a line through three 64-byte windows: the ID and
+    its comma in the first; from that comma on, an event's user, ts and their
+    commas, or a click's user and its comma, in the second; the rest, up to
+    the newline, in the third. Fields that end at a window's edge, a few bytes
+    before it and after it: IDs of 58 to 66 bytes (events and clicks renamed,
+    all copies alike; users renamed everywhere), a ts padded with zeros so
+    that an event's third comma comes 60 to 67 bytes after its first and the
+    newline as many after the third, a click's newline 60 to 67 bytes after
+    its second comma; under every pattern of quotes (a 33-byte ID in quotes
+    is 35). After such a line now and then a short one or two, whose newline
+    comes inside a window the line before filled."""
+    R = D.R
+    edge = [60, 61, 62, 62, 63, 63, 64, 64, 65, 65, 66, 67]
+
+    def padded(value, taken):
+        """`value` and more, 58 to 66 bytes in all (None: too long, or taken)."""
+        want = R.choice([58, 59, 60, 61, 62, 62, 63, 63, 64, 64, 65, 66])
+        if len(value) + 1 > want:
+            return None
+        new = value + "_" + "".join(R.choice(DIGITS) for _ in range(want - len(value) - 1))
+        return None if new in taken else new
+
+    # Users of 58 to 66 bytes: a click's second window, an event's second
+    # window overfull.
+    taken = D.all_users()
+    mapping = {}
+    for user in R.sample(D.users, min(len(D.users), max(20, len(D.users) // 30))):
+        new = padded(user, taken)
+        if new:
+            taken.add(new)
+            mapping[user] = new
+    D.rename_users(mapping)
+
+    # Event IDs of 58 to 66 bytes, all copies alike.
+    names = set(D.groups)
+    ids = [e for e in D.groups if e]
+    R.shuffle(ids)
+    long_ids = 0
+    for eid in ids[:max(40, len(ids) // 7)]:
+        new = padded(eid, names)
+        if new:
+            names.add(new)
+            for line in D.groups[eid]:
+                line.f[0] = new
+                line.changed = True
+            long_ids += 1
+
+    # Event lines: the third comma 60 to 67 bytes after the first, the newline
+    # as many after the third.
+    clusters = {}
+    for line in D.events:
+        if line.f and line.f[0]:
+            clusters.setdefault((line.f[0], line.f[3]), []).append(line)
+    keys = list(clusters)
+    R.shuffle(keys)
+    touched = set()
+    placed = 0
+    for key in keys[:max(80, len(keys) // 3)]:
+        lines = clusters[key]
+        f = list(lines[0].f)
+        if any(l.f != f for l in lines):
+            continue
+        mask = quote_mask(R, 7)
+        first = len(f[0]) + 2 * (mask & 1)
+        place(f, mask, first + R.choice(edge) if R.random() < 0.8 else None, R.choice(edge) if R.random() < 0.8 else None)
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask
+            touched.add(id(line))
+        placed += 1
+    shorts = ["", "a", "ab", ",,,,,,", '"",,,,,,', "x,y", ",", "abcdefghij", ",,,,,,,"]
+    out = []
+    after = 0
+    for line in D.events:
+        out.append(line)
+        if id(line) in touched and not line.new and not line.held and R.random() < 0.15:
+            for _ in range(R.choice([1, 1, 2, 3])):
+                out.append(Line(R.choice(shorts), None, line.file))
+                after += 1
+    D.events = out
+
+    # Clicks: IDs of 58 to 66 bytes (all copies alike), and the newline 60 to
+    # 67 bytes after the second comma.
+    clicks = D.load_clicks()
+    groups = {}
+    for line in clicks:
+        if line.f and line.f[0]:
+            groups.setdefault(line.f[0], []).append(line)
+    click_names = set(groups)
+    cids = list(groups)
+    R.shuffle(cids)
+    click_placed = 0
+    touched = set()
+    for cid in cids[:max(60, len(cids) // 3)]:
+        lines = groups[cid]
+        f = list(lines[0].f)
+        ms = parse_ts(f[3])
+        if any(l.f != f for l in lines) or ms is None or not 0 <= ms < 10 ** 14:
+            continue
+        if R.random() < 0.4:
+            new = padded(cid, click_names)
+            if new:
+                click_names.add(new)
+                f[0] = new
+        mask = quote_mask(R, 4)
+        # From the second comma to the newline: the campaign, a comma, the ts, the newline.
+        digits = R.choice(edge) - 2 - len(f[2]) - 2 * (mask >> 2 & 1) - 2 * (mask >> 3 & 1)
+        if R.random() < 0.8 and digits >= len(str(ms)):
+            f[3] = str(ms).zfill(digits)
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask
+            touched.add(id(line))
+        click_placed += 1
+    click_shorts = ["", "a", ",,,", '"",,,', "x,y", ",", "abcdefghij", ",,,,"]
+    out = []
+    for line in clicks:
+        out.append(line)
+        if id(line) in touched and not line.held and line.members is None and R.random() < 0.15:
+            for _ in range(R.choice([1, 1, 2, 3])):
+                out.append(Line(R.choice(click_shorts), None, line.file))
+                after += 1
+    D.clicks = out
+    D.notes.append(f"windows {len(mapping)} users, {long_ids} event ids, {placed} event lines, {click_placed} clicks, {after} short lines after")
 
 
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
                                      splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles,
-                                     idbytes, longusers, longevents, longclicks]}
+                                     idbytes, longusers, longevents, longclicks, windows]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
            "idbytes", "idbytes", "longusers", "longusers", "longevents", "longevents", "longclicks", "longclicks",
+           "windows", "windows",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
            "splitter", "splitter", "clicksplit", "clicksplit", "interleave", "endings"]
 

@@ -69,7 +69,10 @@ if [ "$mode" = v5 ]; then
          longusers,longclicks,endings longevents,stretches,splitter,interleave idbytes,longevents,copies
          userlengths,longusers,shapes,clickshapes,linkshapes irregular,irrfile,longevents purchases,longevents,longclicks
          longusers,longusers longevents,longevents,shapes longclicks,longclicks,clicksplit mix,mix
-         emptyevents,longclicks links,linkshapes,longusers values,lateness,shapes,longusers,longevents,longclicks)
+         emptyevents,longclicks links,linkshapes,longusers values,lateness,shapes,longusers,longevents,longclicks
+         windows windows,longevents,longclicks windows,longusers windows,endings,interleave windows,mix
+         longusers,longevents,longclicks,windows windows,shapes,clickshapes windows,splitter,clicksplit
+         windows,copies,idbytes windows,windows,stretches)
 fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
