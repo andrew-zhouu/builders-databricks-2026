@@ -1144,7 +1144,7 @@ unsafe fn check_split(st: &Stage, data: &[u8], from: usize, to: usize, n: usize,
 }
 
 macro_rules! events_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $batch:expr) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $emit:path, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1200,7 +1200,7 @@ macro_rules! events_chunk_fn {
                     unsafe {
                         let nmore = $decode(ctx, &mut st, n, loc0);
                         stage_more(ctx, &mut st, nmore);
-                        stage_emit(ctx, out, &st, n);
+                        $emit(ctx, out, &st, n);
                         // The scalar path for what the stages could not decide.
                         if st.flags[..n].iter().fold(0, |a, &f| a | f) & F_DEAD != 0 {
                             for i in 0..n {
@@ -1225,12 +1225,13 @@ macro_rules! events_chunk_fn {
         }
     };
 }
-events_chunk_fn!(events_chunk_base, split_event, stage_decode, false);
+events_chunk_fn!(events_chunk_base, split_event, stage_decode, stage_emit, false);
 events_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     events_chunk_wide,
     split_event_wide,
     wide::decode,
+    wide::emit,
     true
 );
 
@@ -1445,7 +1446,7 @@ unsafe fn check_split_clicks(st: &ClickStage, data: &[u8], from: usize, to: usiz
 }
 
 macro_rules! clicks_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $batch:expr) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $emit:path, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1505,7 +1506,7 @@ macro_rules! clicks_chunk_fn {
                 if n > 0 {
                     unsafe {
                         $decode(ctx, &mut st, n);
-                        click_emit(ctx, c, &st, n);
+                        $emit(ctx, c, &st, n);
                         // The scalar path for what the stages could not decide.
                         if st.flags[..n].iter().fold(0, |a, &f| a | f) & C_DEAD != 0 {
                             for i in 0..n {
@@ -1527,12 +1528,13 @@ macro_rules! clicks_chunk_fn {
         }
     };
 }
-clicks_chunk_fn!(clicks_chunk_base, split_click, click_decode, false);
+clicks_chunk_fn!(clicks_chunk_base, split_click, click_decode, click_emit, false);
 clicks_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     clicks_chunk_wide,
     split_click_wide,
     wide::click_decode,
+    wide::click_emit,
     true
 );
 

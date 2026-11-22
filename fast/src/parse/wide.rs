@@ -575,3 +575,189 @@ unsafe fn click_checked(ctx: &Ctx, st: &mut ClickStage, n: usize) {
         }
     }
 }
+
+// ------------------------------------------------------------------ emit
+
+/// The people of eight users, by their keys and home slots: `Table::person_at`
+/// for the lanes of `want`. The four keys of each home line are fetched and
+/// compared; a key that is there names its slot, and the slot's parent, if it
+/// has one, the person. Returns the people, and the lanes whose key is not in
+/// its home line: a user seen for the first time, or a line that was full.
+/// Those are for `Table::person_at` itself, which knows how to insert.
+/// (`slots` is the table: 16 bytes a slot, the key and then the parent.)
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[inline]
+unsafe fn people8(slots: *const u8, want: __mmask8, home: __m512i, key: __m512i) -> (__m512i, __mmask8) {
+    let zero = _mm512_setzero_si512();
+    let at = sll!(home, 4);
+    let m0 = _mm512_mask_cmpeq_epi64_mask(want, _mm512_mask_i64gather_epi64::<1>(zero, want, at, slots as *const i64), key);
+    let m1 =
+        _mm512_mask_cmpeq_epi64_mask(want, _mm512_mask_i64gather_epi64::<1>(zero, want, at, slots.add(16) as *const i64), key);
+    let m2 =
+        _mm512_mask_cmpeq_epi64_mask(want, _mm512_mask_i64gather_epi64::<1>(zero, want, at, slots.add(32) as *const i64), key);
+    let m3 =
+        _mm512_mask_cmpeq_epi64_mask(want, _mm512_mask_i64gather_epi64::<1>(zero, want, at, slots.add(48) as *const i64), key);
+    let found = m0 | m1 | m2 | m3;
+    // The first slot of the line that holds the key (a key is in one slot only).
+    let which = _mm512_maskz_mov_epi64(
+        !m0,
+        _mm512_mask_mov_epi64(_mm512_mask_mov_epi64(_mm512_maskz_mov_epi64(m3, v!(3)), m2, v!(2)), m1, v!(1)),
+    );
+    let slot = add!(home, which);
+    let parent = and!(
+        _mm512_mask_i64gather_epi64::<1>(zero, found, sll!(slot, 4), slots.add(8) as *const i64),
+        v!(0xFFFF_FFFFu64)
+    );
+    (_mm512_mask_mov_epi64(sub!(parent, v!(1)), _mm512_cmpeq_epi64_mask(parent, zero), slot), want & !found)
+}
+
+/// `people8` for the lines `i..i + 8` of a batch, the lanes it left to
+/// `Table::person_at` filled in by it.
+macro_rules! people_of {
+    ($ctx:expr, $want:expr, $homes:expr, $keys:expr, $i:expr) => {{
+        let home = _mm512_cvtepu32_epi64(_mm256_loadu_si256($homes.as_ptr().add($i) as *const __m256i));
+        let key = _mm512_loadu_si512($keys.as_ptr().add($i) as *const _);
+        let (mut people, mut missed) = people8($ctx.table.slots(), $want, home, key);
+        if missed != 0 {
+            let mut one = [0u64; W];
+            _mm512_storeu_si512(one.as_mut_ptr() as *mut _, people);
+            while missed != 0 {
+                let j = missed.trailing_zeros() as usize;
+                one[j] = $ctx.table.person_at($homes[$i + j] as usize, $keys[$i + j]) as u64;
+                missed &= missed - 1;
+            }
+            people = _mm512_loadu_si512(one.as_ptr() as *const _);
+        }
+        people
+    }};
+}
+
+/// SS_WEMIT=0: the ordinary emit stages on this path too.
+fn wide_emit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SS_WEMIT").is_ok_and(|v| v == "0"))
+}
+
+/// What goes to a partition of a writer: (partition, word, word).
+type Pushed = (usize, u64, u64);
+
+/// What `super::stage_emit` writes for line `i`, which is not for the scalar
+/// path: the purchase, if it is one, and the trace.
+unsafe fn emit_reference(ctx: &Ctx, st: &Stage, i: usize) -> (Option<Pushed>, Pushed) {
+    let fl = st.flags[i];
+    let pk = st.pk[i] as u64;
+    let (mut w2, mut purchase) = (0, None);
+    if fl & F_VALID != 0 {
+        let person = ctx.table.person_at(st.home[i] as usize, st.key[i]) as u64;
+        let ts = st.ts[i] as u64;
+        w2 = trace_valid(pk >> 16, person, ts);
+        if fl & F_PURCHASE != 0 {
+            purchase = Some(((person >> LOCAL_BITS) as usize, (person & ((1 << LOCAL_BITS) - 1)) << 31 | ts, st.extra[i]));
+            w2 |= T_PURCHASE;
+        }
+    }
+    (purchase, (pk as usize & 0xFFFF, st.trace[i], w2))
+}
+
+/// `super::stage_emit` on this path: the people and the traces' second words
+/// of eight lines at a time, then the pushes, a line at a time as there.
+/// (`SS_SIMD_CHECK=1`: what is pushed must be what `stage_emit` would push.)
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+pub(super) unsafe fn emit(ctx: &Ctx, out: &mut EventOut, st: &Stage, n: usize) {
+    if !wide_emit() {
+        return stage_emit(ctx, out, st, n);
+    }
+    let mut second = [0u64; NB];
+    let mut people = [0u64; NB];
+    let mut i = 0usize;
+    while i < n {
+        let live: u8 = if n - i >= W { 0xFF } else { (1u8 << (n - i)) - 1 };
+        let fl = _mm512_cvtepu8_epi64(_mm_loadl_epi64(st.flags.as_ptr().add(i) as *const __m128i));
+        // Valid, and not for the scalar path.
+        let valid = _mm512_mask_testn_epi64_mask(_mm512_test_epi64_mask(fl, v!(F_VALID)) & live, fl, v!(F_DEAD));
+        let person = people_of!(ctx, valid, st.home, st.key, i);
+        let ts = _mm512_cvtepu32_epi64(_mm256_loadu_si256(st.ts.as_ptr().add(i) as *const __m256i));
+        let pk = _mm512_cvtepu32_epi64(_mm256_loadu_si256(st.pk.as_ptr().add(i) as *const __m256i));
+        // `trace_valid`, and `T_PURCHASE` for a purchase.
+        let w2 = or!(or!(v!(T_VALID), sll!(and!(srl!(pk, 16), v!(15)), 58)), or!(sll!(person, 31), ts));
+        let w2 = or!(
+            _mm512_maskz_mov_epi64(valid, w2),
+            _mm512_maskz_mov_epi64(valid & _mm512_test_epi64_mask(fl, v!(F_PURCHASE)), v!(T_PURCHASE))
+        );
+        _mm512_storeu_si512(second.as_mut_ptr().add(i) as *mut _, w2);
+        _mm512_storeu_si512(people.as_mut_ptr().add(i) as *mut _, person);
+        i += W;
+    }
+    let check = wide_check();
+    let (kw, pw) = (out.k.cursors(), out.ps.cursors());
+    let pool = &ctx.pool;
+    for i in 0..n {
+        let fl = *st.flags.get_unchecked(i);
+        if fl & F_DEAD != 0 {
+            continue;
+        }
+        let purchase: Option<Pushed> = if fl & (F_VALID | F_PURCHASE) == F_VALID | F_PURCHASE {
+            let person = *people.get_unchecked(i);
+            let rec = (person & ((1 << LOCAL_BITS) - 1)) << 31 | *st.ts.get_unchecked(i) as u64;
+            Some(((person >> LOCAL_BITS) as usize, rec, *st.extra.get_unchecked(i)))
+        } else {
+            None
+        };
+        let trace: Pushed = (*st.pk.get_unchecked(i) as usize & 0xFFFF, *st.trace.get_unchecked(i), *second.get_unchecked(i));
+        if check {
+            let want = emit_reference(ctx, st, i);
+            if want != (purchase, trace) {
+                eprintln!(
+                    "SS_SIMD_CHECK: emit differs on event line {i} of a batch of {n}: wide {:x?}, ordinary {want:x?}\n{}",
+                    (purchase, trace),
+                    String::from_utf8_lossy(std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 48 & 0xFF) as usize))
+                );
+                std::process::abort();
+            }
+        }
+        if let Some((part, rec, extra)) = purchase {
+            out.ps.push2_at(pw, pool, part, rec, extra);
+        }
+        out.k.push2_at(kw, pool, trace.0, trace.1, trace.2);
+    }
+}
+
+/// `super::click_emit` on this path.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+pub(super) unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, n: usize) {
+    if !wide_emit() {
+        return super::click_emit(ctx, c, st, n);
+    }
+    let mut people = [0u64; NB];
+    let mut i = 0usize;
+    while i < n {
+        let live: u8 = if n - i >= W { 0xFF } else { (1u8 << (n - i)) - 1 };
+        let fl = _mm512_cvtepu8_epi64(_mm_loadl_epi64(st.flags.as_ptr().add(i) as *const __m128i));
+        let valid = _mm512_cmpeq_epi64_mask(fl, v!(C_VALID)) & live;
+        let person = people_of!(ctx, valid, st.home, st.user, i);
+        _mm512_storeu_si512(people.as_mut_ptr().add(i) as *mut _, person);
+        i += W;
+    }
+    let check = wide_check();
+    let cw = c.cursors();
+    let pool = &ctx.pool;
+    for i in 0..n {
+        if *st.flags.get_unchecked(i) != C_VALID {
+            continue;
+        }
+        let (part, w0) = click_words(*people.get_unchecked(i), *st.tc.get_unchecked(i));
+        if check {
+            // What `super::click_emit` pushes.
+            let want = click_words(ctx.table.person_at(st.home[i] as usize, st.user[i]) as u64, st.tc[i]);
+            if want != (part, w0) {
+                eprintln!(
+                    "SS_SIMD_CHECK: emit differs on click line {i} of a batch of {n}: wide {:x?}, ordinary {want:x?}\n{}",
+                    (part, w0),
+                    String::from_utf8_lossy(std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 24 & 0xFF) as usize))
+                );
+                std::process::abort();
+            }
+        }
+        c.push2_at(cw, pool, part, w0, *st.click.get_unchecked(i));
+    }
+}
