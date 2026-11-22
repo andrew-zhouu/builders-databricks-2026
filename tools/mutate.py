@@ -2250,21 +2250,32 @@ def grouping(D):
             f = line.f
             return f is not None and len(f[at]) == 33
 
-        style = R.choice(["users", "ids", "both", "both", "period2", "period8", "period9", "length", "length_down", "quoted", "blocks"])
+        style = R.choice(["users", "ids", "both", "both", "period2", "period8", "period9", "length", "length_down", "quoted", "blocks",
+                          "period63", "period64", "period64", "period65", "allbut64", "allbut64", "runs64", "userslast", "userslast"])
         if style == "users":
             return sorted(lines, key=lambda l: not is33(l, user_at)), style
+        if style == "userslast":
+            # The file's last lines, and its very last one, have a 33-byte user.
+            return sorted(lines, key=lambda l: is33(l, user_at)), style
         if style == "ids":
             return sorted(lines, key=lambda l: not is33(l, id_at)), style
         if style == "both":
             return sorted(lines, key=lambda l: (not (is33(l, id_at) and is33(l, user_at)), not is33(l, user_at), not is33(l, id_at))), style
-        if style.startswith("period"):
-            every = int(style[6:])
-            at = R.choice([id_at, user_at])
+        if style.startswith("period") or style in ("allbut64", "runs64"):
+            # One such line in every 2, 8, 9, 63, 64, 65 (a batch of 64 lines
+            # then has one, at a place that stays or creeps); all but one in
+            # every 64; 64 with and 64 without in turn. For the long steps it
+            # is the user that counts, three times in four.
+            every = 64 if style in ("allbut64", "runs64") else int(style[6:])
+            at = user_at if every > 9 and R.random() < 0.75 else R.choice([id_at, user_at])
             special = [l for l in lines if is33(l, at)]
             plain = [l for l in lines if not is33(l, at)]
             out, phase = [], R.randrange(every)
             while special or plain:
-                want_special = len(out) % every == phase
+                if style == "runs64":
+                    want_special = len(out) // 64 % 2 == 0
+                else:
+                    want_special = (len(out) % every == phase) != (style == "allbut64")
                 source = special if (want_special and special) or not plain else plain
                 out.append(source.pop())
             return out, style
@@ -2309,13 +2320,162 @@ def grouping(D):
     D.notes.append("grouping " + "; ".join(notes))
 
 
+def longlinks(D):
+    """Link lines for a reader with a short cut for long ones (two 64-byte
+    windows: the first ID and the comma, the second ID and the newline; both
+    IDs of the long form by their value). Every line links a user who has rows
+    to a new ID, or two users who have rows, so a link read wrongly shows in
+    the answer: the two people are one or are not, and the smallest of their
+    IDs, byte by byte, is the name in the output.
+
+    The new IDs are of the long form, of the forms near it (32 and 34 bytes,
+    upper case, a letter that is no hex digit, a NUL), and of every length
+    that puts the comma at byte 29 to 35 or 60 to 66 and the newline as many
+    bytes after the comma, with and without quotes (a long ID in quotes is 35
+    bytes); lines of exactly 30 to 34 bytes made of two short IDs. Both sides
+    long, one side, either way round, the pair once more the other way round,
+    an ID linked to itself; chains a-b, b-c, c-d of long and short IDs between
+    two people. And lines that link nobody: a quote inside an ID, three
+    fields, one field, an empty side, with users who have rows on both sides
+    (read as links, they would make one person of two)."""
+    R = D.R
+    if not D.link_files:
+        D.notes.append("longlinks: no link files")
+        return
+    L = Longs(R, [u[1:] for u in D.users if is_long(u, "u")])
+    users = list(D.users)
+    taken = D.all_users()
+    edges = [29, 30, 31, 31, 32, 32, 33, 33, 34, 35, 60, 61, 62, 62, 63, 63, 64, 64, 65, 65, 66]
+
+    def put(a, b, qa=None, qb=None):
+        qa = R.random() < 0.3 if qa is None else qa
+        qb = R.random() < 0.3 if qb is None else qb
+        D.links.append([R.randrange(len(D.link_files)), ('"' + a + '"' if qa else a) + "," + ('"' + b + '"' if qb else b)])
+
+    def fresh(size, small=None):
+        """A new ID of `size` bytes; `small`: one that sorts before every
+        generated ID (it becomes the person's name), or after."""
+        small = R.random() < 0.5 if small is None else small
+        for _ in range(20):
+            head = R.choice(["U", "A", "u!", "u0", "0", "u "]) if small else R.choice(["u", "uz", "u~", "v", "z"])
+            body = "".join(R.choice(DIGITS) for _ in range(max(0, size - len(head))))
+            new = (head + body)[:size]
+            if new and new not in taken:
+                taken.add(new)
+                return new
+        return None
+
+    made = 0
+    # A user with rows and a new ID of a length that puts the comma, or the
+    # newline, at an edge; quoted or not on either side.
+    for _ in range(max(120, len(users) // 6)):
+        user = R.choice(users)
+        r = R.random()
+        if r < 0.25:
+            alias = "u" + L.hex()
+        elif r < 0.40:
+            alias = L.near("u", text=True)
+        elif r < 0.50 and is_long(user, "u"):
+            alias = R.choice(relatives(L, user))
+        else:
+            qa = R.random() < 0.3
+            alias = fresh(R.choice(edges) - 2 * qa)
+            if alias is None:
+                continue
+            if R.random() < 0.5:
+                put(alias, user, qa=qa)
+            else:
+                put(user, alias, qb=qa)
+            made += 1
+            continue
+        if not sayable(alias) or alias == user:
+            continue
+        taken.add(alias)
+        if R.random() < 0.5:
+            put(alias, user)
+        else:
+            put(user, alias)
+        r = R.random()
+        if r < 0.15:
+            put(user, alias)                       # once more, perhaps the other way round
+        elif r < 0.30:
+            put(alias, alias)                      # linked to itself
+        elif r < 0.40:
+            put(user, user)
+        if R.random() < 0.15:
+            D.new_event("e" + L.hex(), user=alias)   # the new ID has a row of its own
+        made += 1
+    # Lines of exactly 30 to 34 bytes made of two IDs that are not long (the
+    # short cut starts at a length), one of them a user with rows.
+    short = 0
+    for _ in range(max(40, len(users) // 20)):
+        user = R.choice(users)
+        qa, qb = R.random() < 0.4, R.random() < 0.4
+        size = R.choice([30, 31, 31, 32, 32, 33, 33, 34]) - 1 - len(user) - 2 * qa - 2 * qb
+        if size < 1:
+            continue
+        alias = fresh(size)
+        if alias is None:
+            continue
+        if R.random() < 0.5:
+            put(alias, user, qa=qa, qb=qb)
+        else:
+            put(user, alias, qa=qb, qb=qa)
+        short += 1
+    # Two people made one: both sides are users with rows.
+    merged = 0
+    longs = [u for u in users if is_long(u, "u")]
+    for _ in range(max(10, len(users) // 100)):
+        a = R.choice(longs) if longs and R.random() < 0.7 else R.choice(users)
+        b = R.choice(longs) if longs and R.random() < 0.5 else R.choice(users)
+        if a != b:
+            put(a, b)
+            if R.random() < 0.3:
+                put(b, a)
+            merged += 1
+    # Chains of new IDs, long and short, between two users with rows.
+    chains = 0
+    for _ in range(max(6, len(users) // 300)):
+        chain = [R.choice(users)]
+        for _ in range(R.randint(2, 14)):
+            r = R.random()
+            new = "u" + L.hex() if r < 0.45 else fresh(R.choice([2, 3, 9, 10, 20, 32, 34, 40]), small=R.random() < 0.3)
+            if new and sayable(new):
+                taken.add(new)
+                chain.append(new)
+        chain.append(R.choice(users))
+        pairs = list(zip(chain, chain[1:]))
+        R.shuffle(pairs)
+        for a, b in pairs:
+            if R.random() < 0.5:
+                a, b = b, a
+            put(a, b)
+        chains += 1
+    # Lines that link nobody, between two users with rows.
+    bad = 0
+    for _ in range(max(60, len(users) // 15)):
+        a, b = R.choice(longs) if longs and R.random() < 0.6 else R.choice(users), R.choice(longs) if longs and R.random() < 0.6 else R.choice(users)
+        if a == b:
+            continue
+        text = R.choice([
+            f"{a},{b},", f"{a},{b},x", f",{a},{b}", f"{a},,{b}",        # three fields
+            f"{broken(R, a)},{b}", f"{a},{broken(R, b)}",              # a quote where none may be
+            f"{a},", f",{b}", f'{a},""', f'"",{b}', f'"{a}",', ",", '"",""',   # an empty side
+            f"{a}", f"{a} {b}", f"{a};{b}",                            # one field
+            f'"{a},{b}"', f'"{a}","{b}",""', f"{a},{b}\r,{a}",
+        ])
+        D.links.append([R.randrange(len(D.link_files)), text])
+        bad += 1
+    D.notes.append(f"longlinks {made} to new IDs, {short} short lines, {merged} merges, {chains} chains, {bad} that link nobody")
+
+
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
                                      splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles,
-                                     idbytes, longusers, longevents, longclicks, windows, grouping]}
+                                     idbytes, longusers, longevents, longclicks, windows, grouping, longlinks]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
            "idbytes", "idbytes", "longusers", "longusers", "longevents", "longevents", "longclicks", "longclicks",
-           "windows", "windows", "grouping", "grouping",
+           "windows", "windows", "grouping", "grouping", "longlinks", "longlinks",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
            "splitter", "splitter", "clicksplit", "clicksplit", "interleave", "endings"]
 

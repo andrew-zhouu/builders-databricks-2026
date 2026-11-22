@@ -77,7 +77,9 @@ if [ "$mode" = v5 ] || [ "$mode" = v5w ]; then
          longusers,longevents,longclicks,windows windows,shapes,clickshapes windows,splitter,clicksplit
          windows,copies,idbytes windows,windows,stretches
          grouping longusers,longevents,longclicks,grouping windows,grouping grouping,stretches,purchases
-         longusers,grouping,endings longevents,idbytes,grouping mix,grouping longclicks,clicksplit,grouping)
+         longusers,grouping,endings longevents,idbytes,grouping mix,grouping longclicks,clicksplit,grouping
+         longlinks longlinks,endings longlinks,longusers longlinks,linkshapes,links,nested longlinks,grouping
+         longlinks,mix longusers,longlinks,userlengths,endings longlinks,wide)
 fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
