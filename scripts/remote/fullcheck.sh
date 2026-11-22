@@ -14,7 +14,7 @@ n="${1:-150}"; first="${2:-1000}"
 log=/tmp/ss-fullcheck.$$.log
 # While the wide parser is only taken when asked for (parse.rs, WIDE_DEFAULT),
 # a default run and a run with it off are the same thing.
-scales=2; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales=1
+scales=3; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales=1
 {
   echo "== build + fixtures + dev + fuzz $first..$((first + n - 1))"
   bash scripts/remote/try.sh "$n" "$first" 2>&1 | grep -v -e '^warning' -e '^ *|' -e '^ *-->' -e '^ *= note' -e '^$' | tail -6
@@ -24,7 +24,7 @@ scales=2; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales
   bash scripts/remote/scalecheck.sh
   echo "== unit tests"
   (cd fast && cargo test --release 2>&1 | grep -E '^test result|FAILED|panicked' | cut -c1-160)
-  if [ "$scales" = 2 ]; then
+  if [ "$scales" != 1 ]; then
     echo "== wide parser off: fuzz, seeds, scale"
     SS_SIMD=0 bash scripts/fuzz.sh "$((first + 1000))" 40 3000 2>&1 | tail -2
     SS_SIMD=0 bash scripts/seeds.sh 200000 50000 2 5 2>&1 | tail -4
@@ -32,6 +32,18 @@ scales=2; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales
     echo "== wide parser self-checks"
     [ -f scripts/remote/splitcheck.sh ] && bash scripts/remote/splitcheck.sh 30 "$((first + 2000))" dev m5 m20 n20
     [ -f scripts/remote/widecheck.sh ] && FUZZ=30 FIRST="$((first + 3000))" bash scripts/remote/widecheck.sh dev m5 m20 n20
+    echo "== the wide parser for processors without VBMI2 (SS_SIMD=2): fuzz, seeds, scale, self-checks"
+    SS_SIMD=2 bash scripts/fuzz.sh "$((first + 4000))" 40 3000 2>&1 | tail -2
+    SS_SIMD=2 bash scripts/seeds.sh 200000 50000 2 5 2>&1 | tail -4
+    SS_SIMD=2 bash scripts/remote/scalecheck.sh m5 m20 m60
+    SS_SIMD=2 bash scripts/remote/splitcheck.sh 30 "$((first + 5000))" dev m5 m20 n20
+    SS_SIMD=2 FUZZ=30 FIRST="$((first + 6000))" bash scripts/remote/widecheck.sh dev m5 m20 n20
+    if [ -f scripts/remote/mulcount.sh ]; then
+      bash scripts/remote/mulcount.sh fast/target/x86_64-unknown-linux-musl/release/sessions > /tmp/ss-mulcount.$$ 2>&1 \
+        && echo "ok   no 512-bit multiplication in the instance without VBMI2" \
+        || { echo "FAIL: a 512-bit multiplication in the instance without VBMI2"; tail -12 /tmp/ss-mulcount.$$ | cut -c1-160; }
+      rm -f /tmp/ss-mulcount.$$
+    fi
   else
     echo "== (the wide parser is off unless asked for: its sections are skipped)"
   fi

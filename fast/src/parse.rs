@@ -328,6 +328,14 @@ unsafe fn masks64_wide(p: *const u8) -> (u64, u64, u64) {
 /// (ids.rs) on the fast path, as the ordinary one does.
 const WIDE_DEFAULT: bool = true;
 
+/// Whether a processor with AVX-512 but without VBMI2 (Skylake-X, Cascade
+/// Lake) takes the third instance unless SS_SIMD says otherwise. Those
+/// processors lower their clock for 512-bit code: a few percent for what this
+/// instance contains (it has no 512-bit multiplication, which would cost
+/// about 20%), against the fifth of the run's time that the instance saves
+/// where the clock does not move. Not measured on such a machine.
+const WIDE5_DEFAULT: bool = true;
+
 /// The parser instance of this run, chosen once:
 ///
 /// * 0: the ordinary one (AVX2).
@@ -335,20 +343,23 @@ const WIDE_DEFAULT: bool = true;
 ///   or newer. The default where the processor has it.
 /// * 2: the wide one for processors with AVX-512 F, BW, VL, DQ and CD only
 ///   (Skylake-X, Cascade Lake): the same code with other instructions where
-///   the first uses VBMI2 or VPOPCNTDQ. Those processors lower their clock
-///   for 512-bit code, so whether it wins there is not known: it is taken
-///   only when asked for.
+///   the first uses VBMI2 or VPOPCNTDQ, and with its multiplications on
+///   256-bit halves. The default where the processor has those and not
+///   VBMI2 (`WIDE5_DEFAULT`).
 ///
-/// SS_SIMD=0: the ordinary one; SS_SIMD=1: as the default; SS_SIMD=2: the
-/// third, wherever the processor can run it (one that has VBMI2 can). The
-/// code of the wide instances is reached through this choice and nowhere else.
+/// SS_SIMD=0: the ordinary one; SS_SIMD=1: the second where the processor has
+/// it, else the ordinary one; SS_SIMD=2: the third, wherever the processor
+/// can run it (one that has VBMI2 can). The code of the wide instances is
+/// reached through this choice and nowhere else.
 pub fn wide_kind() -> u8 {
     static KIND: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *KIND.get_or_init(|| match std::env::var("SS_SIMD").ok().as_deref() {
         Some("0") => 0,
         Some("2") => 2 * wide512_capable() as u8,
         Some("1") => wide_capable() as u8,
-        _ => (WIDE_DEFAULT && wide_capable()) as u8,
+        _ if WIDE_DEFAULT && wide_capable() => 1,
+        _ if WIDE5_DEFAULT && wide512_capable() => 2,
+        _ => 0,
     })
 }
 
