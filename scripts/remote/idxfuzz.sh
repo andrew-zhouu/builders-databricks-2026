@@ -17,9 +17,16 @@
 #        SETTINGS=index  the switches of the index back end (branch exp-index)
 #        SETTINGS=wix    the index back end on the wide parser (branch exp-wix): both sets of
 #                        switches, with small index partitions (SS_INDEX_PB)
+#        SETTINGS=v5     for version 5 of the generator (opaque IDs, one in eight 33 bytes
+#                        long): plain, the wide parser's and the splitter's switches and
+#                        self-checks; and the long-ID mutations
+#        SLOW_BIN=name   the yardstick is bin/NAME --slow (default: the binary's own --slow);
+#                        the binary's own --slow is then compared with it as well
+#        REF_EVERY=n     the Python reference also on every n-th of the larger sets (default 5)
 #        MUTATION=name   every seed with this mutation (default: by seed)
 #        EVENTS=n        every seed with this many events (default: by seed)
 #        ONLY=label      one setting only
+#        WORK=dir        where the sets are made (default out/idxfuzz); KEEP=1 keeps them all
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/env.sh"
 cd "$PROJ"
 BIN="${1:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
@@ -28,7 +35,7 @@ BIN="${1:-$PROJ/fast/target/x86_64-unknown-linux-musl/release/sessions}"
 count="${2:-10}"; first="${3:-1}"
 mode="${SETTINGS:-plain}"
 PY="$PROJ/.venv/bin/python"
-W="$PROJ/out/idxfuzz"; mkdir -p "$W"
+W="$PROJ/${WORK:-out/idxfuzz}"; mkdir -p "$W"
 names=(none irregular outrange copies disorder gaps nested links wide drop irrfile badhead purchases shapes shapes
        clickshapes linkshapes shapes,clickshapes,linkshapes identityids identityids,mix shapes,copies mix mix mix mix
        emptyevents mix,shapes mix,shapes,clickshapes identityids,copies,gaps,nested userlengths endings
@@ -50,8 +57,28 @@ if [ "$mode" = wix ]; then
           identityids,gaps,nested identityids,splitter,copies copies,irregular,outrange badhead,drop,links
           idbytes idbytes,copies identityids,idbytes,disorder idbytes,shapes,splitter idbytes,mix)
 fi
+if [ "$mode" = v5 ]; then
+  # Version 5 of the generator: IDs are opaque, one in eight is 33 bytes long.
+  # The long forms and their near misses for users, events and clicks, alone
+  # and with everything else.
+  names=(longusers longevents longclicks longusers,longevents,longclicks longevents,copies longusers,links,nested
+         longclicks,clickshapes,clicksplit longusers,longevents,splitter,shapes longevents,idbytes,irregular
+         longusers,userlengths,linkshapes mix,longusers mix,longevents,longclicks none shapes splitter clicksplit
+         longusers,longevents,longclicks,splitter,clicksplit,endings,interleave stretches,longevents
+         lateness,values,longevents gaps,nested,disorder,longusers wide,longusers copies drop,badhead mix mix mix
+         longusers,longclicks,endings longevents,stretches,splitter,interleave idbytes,longevents,copies
+         userlengths,longusers,shapes,clickshapes,linkshapes irregular,irrfile,longevents purchases,longevents,longclicks
+         longusers,longusers longevents,longevents,shapes longclicks,longclicks,clicksplit mix,mix
+         emptyevents,longclicks links,linkshapes,longusers values,lateness,shapes,longusers,longevents,longclicks)
+fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
+# The yardstick: the plain implementation of SLOW_BIN (a name in bin/), by
+# default the binary's own. With another binary's, the binary's own --slow is
+# one more thing that is compared.
+SLOW="$BIN"; [ -n "${SLOW_BIN:-}" ] && SLOW="$PROJ/bin/$SLOW_BIN"
+[ -x "$SLOW" ] || { echo "no binary $SLOW"; exit 2; }
+ref_every="${REF_EVERY:-5}"
 fails=0; runs=0; indexed=0; sets=0
 for seed in $(seq "$first" $((first + count - 1))); do
   events="${EVENTS:-${sizes[$((seed % ${#sizes[@]}))]}}"
@@ -70,13 +97,23 @@ for seed in $(seq "$first" $((first + count - 1))); do
   # index path needs it given too, or the key search fails under the bound.
   key="$(grep -o 'key [0-9a-f]*' "$d/mutate.log" | head -1 | cut -d' ' -f2)"
   K=""; [ -n "$key" ] && K="SS_INDEX_KEY=$key"
-  if ! timeout 300 "$BIN" --slow "$d/data" "$d/slow" 2> "$d/slow.log"; then
+  if ! timeout 300 "$SLOW" --slow "$d/data" "$d/slow" 2> "$d/slow.log"; then
     echo "FAIL $tag: the plain implementation failed: $(tail -1 "$d/slow.log")"; fails=$((fails + 1)); continue
   fi
   bad=""
+  if [ "$SLOW" != "$BIN" ]; then
+    runs=$((runs + 1)); mkdir -p "$d/ownslow"
+    if ! timeout 300 "$BIN" --slow "$d/data" "$d/ownslow" 2> "$d/ownslow.log"; then
+      echo "FAIL $tag setting ownslow (--slow): exit code $(tail -2 "$d/ownslow.log" | tr '\n' ' ' | cut -c1-300)"; bad="$bad ownslow"
+    elif ! "$PY" -I tools/cmp.py "$d/slow" "$d/ownslow" > "$d/ownslow.cmp" 2>&1; then
+      echo "FAIL $tag setting ownslow (--slow): $(grep -m5 -E 'rows|A:|B:' "$d/ownslow.cmp" | tr '\n' ' ' | cut -c1-400)"; bad="$bad ownslow"
+    else
+      rm -rf "$d/ownslow" "$d/ownslow.log" "$d/ownslow.cmp"
+    fi
+  fi
   # The plain implementation is the yardstick here; it has to agree with the
   # Python reference (always on the smaller sets, now and then on the others).
-  if [ "$events" -le 20000 ] || [ $((seed % 5)) = 0 ]; then
+  if [ "$events" -le 20000 ] || [ $((seed % ref_every)) = 0 ]; then
     if ! "$PY" -I reference/reference.py "$d/data" "$d/ref" 2> "$d/ref.log"; then
       echo "FAIL $tag: the Python reference failed: $(tail -1 "$d/ref.log")"; bad="$bad reference"
     elif ! "$PY" -I tools/cmp.py "$d/ref" "$d/slow" > "$d/slow.cmp" 2>&1; then
@@ -96,6 +133,22 @@ for seed in $(seq "$first" $((first + count - 1))); do
   )
   case "$mode" in
     plain) settings=("${plain[@]}") ;;
+    v5) settings=("${plain[@]}"
+      # (On exp-v5 the wide parser runs only with SS_SIMD=1; without it the
+      # settings above are the ones that count.)
+      "mark|NCPU=5 SS_CHUNK_BYTES=${marks[$(((seed / 3 + 5) % ${#marks[@]}))]}"
+      "mark1|NCPU=1 SS_CHUNK_BYTES=${marks[$(((seed / 2 + 3) % ${#marks[@]}))]}"
+      "tinyscalar|NCPU=3 SS_SCALAR=1 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "tinyparts|NCPU=8 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))"
+      "simd|NCPU=4 SS_SIMD=1"
+      "simdnowsplit|NCPU=3 SS_SIMD=1 SS_WSPLIT=0"
+      "simdtiny|NCPU=8 SS_SIMD=1 SS_CHUNK_BYTES=$((seed * 7 % 97 + 31))")
+      # The wide parser's self-checks, on request (SIMD_CHECKS=1).
+      [ -n "${SIMD_CHECKS:-}" ] && settings+=(
+      "simdcheck|NCPU=4 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+      "simdchecknowsplit|NCPU=3 SS_SIMD=1 SS_WSPLIT=0 SS_SIMD_CHECK=1"
+      "simdchecktiny|NCPU=8 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1 SS_CHUNK_BYTES=$((seed * 7 % 97 + 31))"
+      "simdcheckmark|NCPU=3 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1 SS_CHUNK_BYTES=${marks[$((seed % ${#marks[@]}))]}") ;;
     simd) settings=("${plain[@]}"
       "nosimd|NCPU=4 SS_SIMD=0"
       "check|NCPU=4 SS_SIMD_CHECK=1"
@@ -178,7 +231,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
   done
   if [ -n "$bad" ]; then
     fails=$((fails + 1)); echo "     kept $d  ($(cut -c1-200 "$d/mutate.log"))"
-  else
+  elif [ -z "${KEEP:-}" ]; then
     rm -rf "$d"
   fi
 done

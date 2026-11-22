@@ -5,10 +5,11 @@ plain implementation (--slow): remove event lines, then click lines, then
 link lines, for as long as the two still differ (delta debugging), and write
 what is left.
 
-Usage: shrink.py DATA_DIR OUT_DIR BINARY [VAR=VALUE ...]
-The settings go to the fast run only. Give SS_INDEX_KEY (and SS_INDEX_BOUND)
-when the difference needs the index path: with few lines left nothing can
-infer a key from the data. Prints the surviving lines at the end.
+Usage: shrink.py DATA_DIR OUT_DIR BINARY [VAR=VALUE ...] [--slow]
+The settings go to the fast run only (`--slow` there: the binary's own plain
+implementation is what is being tested). With YARD=/path/to/binary in the
+environment, that binary's --slow is the yardstick instead of BINARY's own.
+Prints the surviving lines at the end.
 """
 import os
 import shutil
@@ -38,6 +39,9 @@ def read(folder):
 class Case:
     def __init__(self, data, binary, settings):
         self.data, self.binary = data, binary
+        self.yard = os.environ.get("YARD") or binary
+        self.flags = [s for s in settings if s.startswith("--")]
+        settings = [s for s in settings if not s.startswith("--")]
         self.env = dict(os.environ, **dict(s.split("=", 1) for s in settings))
         self.parts = {kind: read(os.path.join(data, kind)) for kind in HEADERS}
         self.work = tempfile.mkdtemp(prefix="ss-shrink-")
@@ -63,10 +67,10 @@ class Case:
         slow, fast = os.path.join(self.work, "slow"), os.path.join(self.work, "fast")
         for path in (slow, fast):
             shutil.rmtree(path, ignore_errors=True)
-        if subprocess.run([self.binary, "--slow", d, slow], capture_output=True).returncode != 0:
+        if subprocess.run([self.yard, "--slow", d, slow], capture_output=True).returncode != 0:
             return False                      # not a data set the yardstick accepts
         try:
-            if subprocess.run([self.binary, d, fast], capture_output=True, env=self.env, timeout=120).returncode != 0:
+            if subprocess.run([self.binary] + self.flags + [d, fast], capture_output=True, env=self.env, timeout=120).returncode != 0:
                 return True
         except subprocess.TimeoutExpired:
             return True

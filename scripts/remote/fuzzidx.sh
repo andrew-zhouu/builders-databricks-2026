@@ -5,8 +5,11 @@
 # against the Python reference, in the modes of scripts/fuzz.sh.
 #
 # Usage: fuzzidx.sh [BINARY] [COUNT] [FIRST_SEED] [ROWS]
-#   env: FUZZ_IDS   dense (default) or plain (the corpus's usual IDs)
+#   env: FUZZ_IDS   dense (default), plain (the corpus's usual IDs) or long (the
+#                   33-byte form of version 5 of the generator and its near misses,
+#                   for events, users and clicks)
 #        SETTINGS   plain (default): every mode once
+#                   v5: also with both self-checks, SS_WSPLIT=0, SS_SIMD=0
 #                   simd: also with SS_SIMD=0 and SS_SIMD_CHECK=1
 #                   index: the switches of the index back end (branch exp-index):
 #                   SS_INDEX_IDENTITY=1 makes the index the number an ID spells, so
@@ -26,6 +29,9 @@ case "$mode" in
   plain) outer=("auto|") ;;
   simd) outer=("auto|" "nosimd|SS_SIMD=0" "check|SS_SIMD_CHECK=1") ;;
   split) outer=("auto|" "check|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1" "nowsplit|SS_WSPLIT=0") ;;
+  v5) outer=("auto|" "simd|SS_SIMD=1" "simdnowsplit|SS_SIMD=1 SS_WSPLIT=0")
+      # The wide parser's self-checks, on request (SIMD_CHECKS=1).
+      [ -n "${SIMD_CHECKS:-}" ] && outer+=("simdcheck|SS_SIMD=1 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1") ;;
   wix) outer=(
     "auto|"
     "checks|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
@@ -67,17 +73,24 @@ for seed in $(seq "$first" $((first + count - 1))); do
     "tiny8|NCPU=8 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
     "manyparts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))"
     "onepart|NCPU=5 SS_PD_BYTES=1000000000"
+    "slow|NCPU=2"
   )
   bad=""
   for i in "${outer[@]}"; do
     ilabel="${i%%|*}"; ivars="${i#*|}"
     for m in "${modes[@]}"; do
       mlabel="${m%%|*}"; mvars="${m#*|}"
-      # With several outer settings: each in the first mode, the other modes take turns.
-      if [ ${#outer[@]} -gt 3 ] && [ "$mlabel" != fast ] && [ $(((seed + ${#ilabel} + ${#mlabel}) % 3)) != 0 ]; then continue; fi
+      # With many outer settings: each in the first mode, the other modes take turns.
+      if [ ${#outer[@]} -gt 4 ] && [ "$mlabel" != fast ] && [ $(((seed + ${#ilabel} + ${#mlabel}) % 3)) != 0 ]; then continue; fi
+      # The binary's plain implementation (--slow), once.
+      flag=""
+      if [ "$mlabel" = slow ]; then
+        [ "$ilabel" = auto ] || continue
+        flag="--slow"
+      fi
       o="$d/$ilabel-$mlabel"; mkdir -p "$o"; runs=$((runs + 1))
       # shellcheck disable=SC2086
-      env $ivars $mvars timeout 120 "$BIN" "$d/data" "$o" 2> "$o.log"; rc=$?
+      env $ivars $mvars timeout 120 "$BIN" $flag "$d/data" "$o" 2> "$o.log"; rc=$?
       if [ $rc != 0 ]; then
         echo "FAIL seed $seed ($ids ids) $ilabel-$mlabel ($ivars $mvars): exit code $rc $(tail -1 "$o.log" | cut -c1-200)"; bad="$bad $ilabel-$mlabel"; continue
       fi
