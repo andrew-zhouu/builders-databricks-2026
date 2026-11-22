@@ -354,6 +354,7 @@ fn worker(ctx: &Ctx, tid: usize) {
     }
     if tid == 0 {
         ctx.load_lookups();
+        calibrate(ctx);
     }
     // ---- links: insert both IDs, join them
     let mut t = ctx.now();
@@ -508,6 +509,72 @@ fn worker(ctx: &Ctx, tid: usize) {
         std::mem::forget(sc);
     }
     ctx.sync("campaign_daily written, memory released");
+}
+
+/// Which parser instance is the faster one here? A processor's flags say
+/// which instances it can run, not which wins: 512-bit code lowers the clock
+/// on some processors, and single instructions are slow on others. So where
+/// the processor offers a wide instance and nothing has been asked for, the
+/// first megabyte of the largest events file is parsed three times by the
+/// ordinary instance and by the wide one in turn, into writers of their own
+/// (the traces are thrown away; what else the parser does, entering users in
+/// the table, the real run does again with the same result), and the wide
+/// one is taken if its best time is clearly the better. Run by the first
+/// thread while the others are on the links, before any of them parses
+/// events: about three milliseconds of one thread. ("Megabyte" below: half
+/// of one.)
+fn calibrate(ctx: &Ctx) {
+    const REGION: usize = 1 << 19;
+    let Some(wide) = parse::wide_to_try() else { return };
+    if std::env::var("SS_CALIBRATE").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let Some(&(_, file)) = ctx.event_files.iter().max_by_key(|&&(_, f)| ctx.files[f as usize].len) else { return };
+    // (A small input is over before the choice could matter.)
+    if ctx.files[file as usize].len < 8 * REGION {
+        return;
+    }
+    let ch = Chunk { file, kind: FileKind::Events, start: 0, end: REGION };
+    let mut free: [Vec<u32>; 2] = Default::default();
+    let mut run = |kind: u8| {
+        parse::set_wide_kind(kind);
+        let (mut k, mut ps) = (PartWriter::new(ctx.pd), PartWriter::new(ctx.ps));
+        k.free = std::mem::take(&mut free[0]);
+        ps.free = std::mem::take(&mut free[1]);
+        let t = Instant::now();
+        parse::events_chunk(ctx, &mut parse::EventOut { k: &mut k, ps: &mut ps }, &ch);
+        let ns = t.elapsed().as_nanos() as u64;
+        for (w, f) in [(&mut k, 0), (&mut ps, 1)] {
+            w.finalize(&ctx.pool);
+            free[f].extend_from_slice(w.all_blocks());
+            free[f].extend_from_slice(&w.free);
+        }
+        ns
+    };
+    // Once without the clock, for the page table and the caches. Then the
+    // ordinary instance first each round: its first time is taken before any
+    // 512-bit instruction has run, at the clock it would have for the run.
+    run(0);
+    let mut best = [u64::MAX; 2];
+    for _ in 0..3 {
+        best[0] = best[0].min(run(0));
+        best[1] = best[1].min(run(wide));
+    }
+    // Clearly: within a few percent the ordinary instance is the safer one.
+    let kind = if best[1] * 100 < best[0] * 95 { wide } else { 0 };
+    parse::set_wide_kind(kind);
+    // The blocks go to this thread's own writers.
+    unsafe {
+        (*ctx.k[0].0.get()).free.append(&mut free[0]);
+        (*ctx.psw[0].0.get()).free.append(&mut free[1]);
+    }
+    if ctx.timing {
+        eprintln!(
+            "              parser instance {kind}: the first 512 KB of events in {} us by the ordinary one, {} us by wide instance {wide}",
+            best[0] / 1000,
+            best[1] / 1000
+        );
+    }
 }
 
 /// `--bench`: the parsers alone on a small region of the largest file of each
