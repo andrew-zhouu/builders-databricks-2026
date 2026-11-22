@@ -37,11 +37,18 @@ pub struct Column<'a> {
 /// `2^width`: the bit width, then one bit-packed run (the last group of eight
 /// padded with zeros).
 pub fn pack_indices(values: impl Iterator<Item = u32>, count: usize, width: u32) -> Vec<u8> {
-    let width = width.clamp(1, 32);
-    let mut out = Vec::with_capacity(count.div_ceil(8) * width as usize + 16);
-    out.push(width as u8);
-    packed_run(&mut out, values, count, width);
+    let mut out = Vec::new();
+    pack_into(&mut out, values, count, width);
     out
+}
+
+/// `pack_indices` into a buffer that is kept (its old contents are dropped).
+pub fn pack_into(out: &mut Vec<u8>, values: impl Iterator<Item = u32>, count: usize, width: u32) {
+    let width = width.clamp(1, 32);
+    out.clear();
+    out.reserve(count.div_ceil(8) * width as usize + 16);
+    out.push(width as u8);
+    packed_run(out, values, count, width);
 }
 
 /// Append one run-length run of the RLE / bit-packed hybrid to a page body:
@@ -118,20 +125,22 @@ pub fn index_width(n: usize) -> u32 {
     (usize::BITS - n.saturating_sub(1).leading_zeros()).max(1)
 }
 
-/// A dictionary for small non-negative integers: the distinct values in order
-/// of first appearance, and a table from value to index. `None` if a value is
-/// negative or too large for a direct table.
-pub fn small_dict(values: &[i32]) -> Option<(Vec<i32>, Vec<u32>)> {
+/// A dictionary for small non-negative integers, into buffers that are kept:
+/// `dict` gets the distinct values in order of first appearance, `index` maps
+/// a value to its place there. False (and nothing of use in the buffers) if a
+/// value is negative or too large for a direct table.
+pub fn small_dict(values: &[i32], index: &mut Vec<u32>, dict: &mut Vec<i32>) -> bool {
     let (mut min, mut max) = (i32::MAX, i32::MIN);
     for &v in values {
         min = min.min(v);
         max = max.max(v);
     }
+    dict.clear();
     if values.is_empty() || min < 0 || max >= 1 << 22 {
-        return None;
+        return false;
     }
-    let mut index = vec![u32::MAX; max as usize + 1];
-    let mut dict = Vec::new();
+    index.clear();
+    index.resize(max as usize + 1, u32::MAX);
     for &v in values {
         let slot = unsafe { index.get_unchecked_mut(v as usize) };
         if *slot == u32::MAX {
@@ -139,7 +148,7 @@ pub fn small_dict(values: &[i32]) -> Option<(Vec<i32>, Vec<u32>)> {
             dict.push(v);
         }
     }
-    Some((dict, index))
+    true
 }
 
 struct Thrift {
