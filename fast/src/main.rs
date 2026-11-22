@@ -563,6 +563,9 @@ fn calibrate(ctx: &Ctx) {
     // Clearly: within a few percent the ordinary instance is the safer one.
     let kind = if best[1] * 100 < best[0] * 95 { wide } else { 0 };
     parse::set_wide_kind(kind);
+    CALIBRATED[0].store(wide as u64, Relaxed);
+    CALIBRATED[1].store(best[0], Relaxed);
+    CALIBRATED[2].store(best[1], Relaxed);
     // The blocks go to this thread's own writers.
     unsafe {
         (*ctx.k[0].0.get()).free.append(&mut free[0]);
@@ -575,6 +578,35 @@ fn calibrate(ctx: &Ctx) {
             best[1] / 1000
         );
     }
+}
+
+/// What `calibrate` tried and found: the wide instance (0: none), the
+/// ordinary instance's best time and the wide one's, in nanoseconds.
+static CALIBRATED: [std::sync::atomic::AtomicU64; 3] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// SS_SIGNAL (set by a probe image's Dockerfile, never by a candidate's): say
+/// through the run's duration what `calibrate` found on this machine, for a
+/// scorer that reports nothing but a time. The finished run sleeps a whole
+/// number of seconds:
+///
+/// * 1 + bucket: the wide instance tried was the one for processors without VBMI2;
+/// * 7 + bucket: it was the one for processors with VBMI2;
+/// * 13: none was tried (no AVX-512, or the calibration did not run);
+///
+/// bucket = the wide instance's best time as a share of the ordinary one's:
+/// 0 under 65%, 1 under 75%, 2 under 85%, 3 under 95% (up to here the wide
+/// one is taken), 4 under 105%, 5 above.
+fn signal() {
+    let (wide, base, best) = (CALIBRATED[0].load(Relaxed), CALIBRATED[1].load(Relaxed), CALIBRATED[2].load(Relaxed));
+    let seconds = if wide == 0 || base == 0 {
+        13
+    } else {
+        let share = best * 100 / base;
+        let bucket = [65, 75, 85, 95, 105].iter().filter(|&&b| share >= b).count() as u64;
+        1 + bucket + if wide == 1 { 6 } else { 0 }
+    };
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
 }
 
 /// `--bench`: the parsers alone on a small region of the largest file of each
@@ -1195,6 +1227,9 @@ fn main() {
             ctx.clicks.dict.len(),
             cancels
         );
+    }
+    if std::env::var("SS_SIGNAL").is_ok() {
+        signal();
     }
     // Skip destructors and unmapping: the kernel reclaims everything at exit.
     unsafe { sys::_exit(0) }
