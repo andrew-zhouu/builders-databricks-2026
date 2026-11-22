@@ -338,14 +338,18 @@ pub fn wide() -> bool {
     static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WIDE.get_or_init(|| {
         let asked = std::env::var("SS_SIMD").ok();
-        (if WIDE_DEFAULT { asked.as_deref() != Some("0") } else { asked.as_deref() == Some("1") })
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vl")
-            && is_x86_feature_detected!("avx512dq")
-            && is_x86_feature_detected!("avx512vbmi")
-            && is_x86_feature_detected!("avx512vbmi2")
+        (if WIDE_DEFAULT { asked.as_deref() != Some("0") } else { asked.as_deref() == Some("1") }) && wide_capable()
     })
+}
+
+/// Whether this processor has what the wide path needs.
+pub fn wide_capable() -> bool {
+    is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512dq")
+        && is_x86_feature_detected!("avx512vbmi")
+        && is_x86_feature_detected!("avx512vbmi2")
 }
 
 /// SS_SIMD_CHECK=1: the wide path also runs the ordinary one on every batch

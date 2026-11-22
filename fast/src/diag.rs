@@ -49,15 +49,36 @@ pub fn run(data_dir: &std::path::Path, out_dir: &std::path::Path) -> ! {
     eprintln!("== diag: environment");
     show("/proc/cmdline", &all, 1);
     show("/proc/version", &all, 1);
-    show("/proc/cpuinfo", &|l| l.starts_with("model name") || l.starts_with("cpu MHz") || l.starts_with("cache size"), 3);
+    show(
+        "/proc/cpuinfo",
+        &|l| ["model name", "cpu MHz", "cache size", "cpu family", "model\t", "stepping"].iter().any(|k| l.starts_with(k)),
+        6,
+    );
     if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
         let n = text.lines().filter(|l| l.starts_with("processor")).count();
         let flags = text.lines().find(|l| l.starts_with("flags")).unwrap_or("");
-        let has: Vec<&str> = ["avx2", "bmi2", "avx512f", "avx512bw", "avx512vbmi", "avx512vbmi2", "pdpe1gb", "hypervisor", "erms", "fsrm"]
-            .into_iter()
-            .filter(|f| flags.split_whitespace().any(|x| x == *f))
-            .collect();
+        let has: Vec<&str> = [
+            "avx2", "bmi2", "avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512vbmi", "avx512_vbmi2", "avx512_vpopcntdq",
+            "avx512_vnni", "avx512_bitalg", "gfni", "pdpe1gb", "hypervisor", "erms", "fsrm",
+        ]
+        .into_iter()
+        .filter(|f| flags.split_whitespace().any(|x| x == *f))
+        .collect();
         eprintln!("  cpuinfo: {n} processors; flags of interest: {}", has.join(" "));
+        let field = |name: &str| {
+            text.lines().find(|l| l.starts_with(name)).and_then(|l| l.split(':').nth(1)).unwrap_or("?").trim().to_string()
+        };
+        // The one line that decides which parser runs here, kept for the end too.
+        key.push(format!(
+            "cpu: family {} model {} stepping {} ({}); wide parser possible here (AVX-512 with VBMI2): {}, its batch splitter: {}; flags: {}",
+            field("cpu family"),
+            field("model\t"),
+            field("stepping"),
+            field("model name"),
+            crate::parse::wide_capable(),
+            crate::parse::splitw::available(),
+            has.join(" ")
+        ));
     }
     for i in 0..4 {
         let base = format!("/sys/devices/system/cpu/cpu0/cache/index{i}");
@@ -120,10 +141,14 @@ pub fn run(data_dir: &std::path::Path, out_dir: &std::path::Path) -> ! {
     // The pipeline itself, several times: the first run shows a cold start (if
     // the page cache is cold), the rest the steady state and two variants.
     let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
-    let runs: [(&str, &[(&str, &str)]); 5] = [
+    let runs: [(&str, &[(&str, &str)]); 9] = [
         ("run 1 (default)", &[]),
         ("run 2 (default)", &[]),
         ("run 3 (default)", &[]),
+        ("wide parser asked for (SS_SIMD=1)", &[("SS_SIMD", "1")]),
+        ("wide parser refused (SS_SIMD=0)", &[("SS_SIMD", "0")]),
+        ("wide parser asked for, again", &[("SS_SIMD", "1")]),
+        ("wide parser refused, again", &[("SS_SIMD", "0")]),
         ("no huge pages", &[("SS_NOHUGE", "1")]),
         ("4 threads", &[("NCPU", "4")]),
     ];
