@@ -1425,9 +1425,24 @@ unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, n: usize) {
     }
 }
 
-/// Whether `splitw` has a batch splitter for click lines (see the place for
-/// it in `clicks_chunk_fn`).
-const CLICK_BATCH: bool = false;
+/// SS_SPLIT_CHECK for clicks: `splitw::split_clicks_batch` against `split_click`.
+unsafe fn check_split_clicks(st: &ClickStage, data: &[u8], from: usize, to: usize, n: usize, took: usize) {
+    let mut one: ClickStage = std::mem::zeroed();
+    let (mut pos, mut m) = (from, 0usize);
+    for line in 0..took {
+        let p = data.as_ptr().add(pos);
+        let (used, added) = split_click(&mut one, 0, p);
+        let show = || String::from_utf8_lossy(&data[pos..(pos + 120).min(data.len())]).into_owned();
+        assert!(used != 0, "batch split took click line {line} at {pos}, which the line split refuses: {}", show());
+        if added {
+            assert!(m < n, "batch split left out click line {line} at {pos}: {}", show());
+            assert!(st.p[m] == p && st.sep[m] == one.sep[0], "click line {line} at {pos}: sep {:016x}, line split {:016x}: {}", st.sep[m], one.sep[0], show());
+            m += 1;
+        }
+        pos += used;
+    }
+    assert!(m == n && pos == to, "batch split of clicks: {n} lines to {to}, line split: {m} lines to {pos}");
+}
 
 macro_rules! clicks_chunk_fn {
     ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $batch:expr) => {
@@ -1451,19 +1466,26 @@ macro_rules! clicks_chunk_fn {
                 ts_len: [0; NB],
                 sl: [0; 2],
             };
+            let mut ws = splitw::Wide::new();
             // The batch splitter, in the instance for processors that have it.
-            let batch = $batch & ctx.wide_split & CLICK_BATCH;
+            let batch = $batch & ctx.wide_split;
             while pos < ch.end {
                 let mut n = 0usize;
                 // The line at `pos` after the batch is for the scalar path.
                 let mut stuck = true;
                 if (pos >= HEAD) & batch {
-                    // The place for the batch splitter, as in `events_chunk_fn`:
-                    //     let (m, to, took, odd) = splitw::split_clicks_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
-                    //     (n, pos, stuck) = (m, to, odd);
-                    //     lines += took;
-                    // inside `if pos < fast_hi`, with `let mut ws = splitw::Wide::new();`
-                    // before the loop, and `CLICK_BATCH` set.
+                    if pos < fast_hi {
+                        unsafe {
+                            let from = pos;
+                            let (m, to, took, odd) =
+                                splitw::split_clicks_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
+                            if ctx.split_check {
+                                check_split_clicks(&st, data, from, to, m, took);
+                            }
+                            (n, pos, stuck) = (m, to, odd);
+                            lines += took;
+                        }
+                    }
                 } else if pos >= HEAD {
                     unsafe {
                         while (n < NB) & (pos < fast_hi) {
