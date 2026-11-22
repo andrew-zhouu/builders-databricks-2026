@@ -199,6 +199,7 @@ class Data:
         self.notes = []
         self.key = None
         self.identity = False
+        self.endings = False
         self.prepare()
 
     # -- what the mutations need to know about the data
@@ -873,6 +874,17 @@ def shapes(D):
         else:
             if R.random() < 0.5:
                 f[6] = R.choice(["", "0", "7", "00000000000000000000001", "abc", "-1", "9" * 30, "1.5", " ", "x" * 70])
+        # One field at a length drawn evenly from a wide range (a decoder with
+        # fixed places for the fields has a limit somewhere).
+        if R.random() < 0.5:
+            want = R.randint(0, 40)
+            if purchase:
+                if f[6] and all(c in "0123456789" for c in f[6]):
+                    f[6] = f[6].lstrip("0").zfill(max(want, 1)) if f[6].strip("0") else f[6]
+            elif R.random() < 0.5 and f[5]:
+                f[5] = "p" + "".join(R.choice(DIGITS) for _ in range(want)) if R.random() < 0.8 else "\xc3\xa9" * (1 + want // 2)
+            else:
+                f[6] = R.choice(["7", "x", "0", " ", "\x00", "\xc3\xa9"]) * want
         mask = quote_mask(R, 7)
         if R.random() < 0.6:
             # A line of an exact length: the padding goes where it means nothing.
@@ -943,10 +955,174 @@ def linkshapes(D):
     D.notes.append(f"linkshapes {done}")
 
 
+def userlengths(D):
+    """Users renamed, everywhere alike (events, clicks, links), to IDs of every
+    length and kind: one or two characters, up to fifty, zeros after the `u`,
+    upper case, a space, a multi-byte character, a NUL byte. The people stay
+    the same people under other names."""
+    R = D.R
+    if D.clicks is None:
+        D.clicks = [Line(raw, split_fields(raw, 4), number)
+                    for number, (_, _, lines) in enumerate(D.click_files) for raw in lines]
+    taken = set(D.users)
+    for line in D.clicks:
+        if line.f:
+            taken.add(line.f[1])
+    for entry in D.links:
+        f = split_fields(entry[1], 2)
+        if f:
+            taken.update(f)
+    chosen = R.sample(D.users, min(len(D.users), max(20, len(D.users) // 8)))
+    mapping = {}
+    for k, user in enumerate(chosen):
+        style = R.choice(["long", "long", "long", "short", "zeros", "utf8", "space", "upper", "nul", "other"])
+        cut = R.randrange(1, len(user) + 1)
+        if style == "long":
+            new = user + "".join(R.choice(DIGITS) for _ in range(R.randint(1, 42)))
+        elif style == "short":
+            new = "u" + base36(k)[:R.choice([0, 1, 1, 2, 3])]
+        elif style == "zeros":
+            new = user[0] + "0" * R.randint(1, 12) + user[1:]
+        elif style == "utf8":
+            new = user[:cut] + R.choice(["\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80"]) + user[cut:]
+        elif style == "space":
+            new = R.choice([user + " ", " " + user, user[:cut] + " " + user[cut:], user + "\t"])
+        elif style == "upper":
+            new = user.upper()
+        elif style == "nul":
+            new = user[:cut] + "\x00" + user[cut:]
+        else:
+            new = R.choice(["x", "U", "0", "user_id", "-"]) + user[1:]
+        if not new or new in taken:
+            continue
+        taken.add(new)
+        mapping[user] = new
+    for line in D.events:
+        if line.f and line.f[1] in mapping:
+            line.f[1] = mapping[line.f[1]]
+            line.changed = True
+    for line in D.clicks:
+        if line.f and line.f[1] in mapping:
+            line.f[1] = mapping[line.f[1]]
+            line.changed = True
+    for entry in D.links:
+        f = split_fields(entry[1], 2)
+        if f and (f[0] in mapping or f[1] in mapping):
+            f = [mapping.get(v, v) for v in f]
+            entry[1] = ",".join('"' + v + '"' if R.random() < 0.3 else v for v in f)
+    D.notes.append(f"userlengths {len(mapping)}")
+
+
+def lateness(D):
+    """Events on the 24-hour edge between ts and ingest_ts, in every ts form.
+    With an offset the date a ts shows is not its UTC date: a ts written as
+    the day of its ingest_ts can be more than 24 hours before it, and the
+    other way round. With milliseconds, 24 hours and a second after the whole
+    second is still late, 24 hours is not."""
+    R = D.R
+    singles = [e for e, lines in D.groups.items() if len(lines) == 1 and D.time_of(e) is not None]
+    R.shuffle(singles)
+    made = 0
+    for eid in singles[:max(40, len(singles) // 10)]:
+        line = D.groups[eid][0]
+        when = D.time_of(eid)
+        when -= when % 1000
+        style = R.randrange(6)
+        if style == 0:
+            # Late, and the local date of ts is the UTC date of ingest_ts.
+            off = R.choice([60, 330, 345, 525, 720, 840, 1439])
+            day = when - when % DAY
+            earliest = DAY - off * 60_000                     # the local date is the next day from here on
+            t = day + R.randrange(earliest // 1000, DAY // 1000) * 1000
+            room = (day + 2 * DAY - (t + DAY)) // 1000        # seconds left of the day ingest_ts must be on
+            if not D.ws <= t < D.we or room < 2:
+                continue
+            line.f[2] = f2(t, off)
+            line.f[3] = f1(t + DAY + R.randrange(1, room) * 1000)
+        elif style == 1:
+            # Not late, though the dates the two show are two days apart.
+            off = R.choice([-1439, -720, -600, -300, -60])
+            day = when - when % DAY
+            t = day + R.randrange(0, -off * 60) * 1000        # early in the UTC day: the local date is the day before
+            if not D.ws <= t < D.we:
+                continue
+            line.f[2] = f2(t, off)
+            line.f[3] = f1(day + DAY + R.randrange(0, max(1, (t - day) // 1000 + 1)) * 1000)
+        elif style == 2:
+            # Milliseconds: 24 h after the whole second is kept, a second more is late.
+            ms = R.randrange(1, 1000)
+            line.f[2] = str(when + ms) if R.random() < 0.8 else str(when + ms).zfill(R.choice([14, 16, 17, 20, 25]))
+            line.f[3] = f1(when + DAY + R.choice([0, 1000, 1000, -1000, 2000]))
+        else:
+            # Exactly 24 hours, a second more, a second less, in any form.
+            delta = R.choice([DAY, DAY + 1000, DAY - 1000, DAY, DAY + 1000, 2 * DAY, DAY + 3_600_000, 0, -5000])
+            r = R.random()
+            line.f[2] = f1(when) if r < 0.3 else f2(when, R.choice(F2_OFFSETS)) if r < 0.7 else str(when).zfill(R.choice([13, 16, 20, 25]))
+            line.f[3] = f1(when + delta)
+        line.changed = True
+        if R.random() < 0.5:
+            line.quotes = quote_mask(R, 7)
+        made += 1
+    D.notes.append(f"lateness {made}")
+
+
+NEAR_TYPES = ["viewcart", "cartview", "view\x00", "cart\x00\x00\x00\x00", "purchasex", "xpurchase", "purchase\x00", "vie", "viewx",
+              "car", "p", "purchas", "PURCHASE", "View", " view", "view ", "", "viewview", "purchaseview", "purchase ", "cartx",
+              "vieW", "wiev", "trac", "purchasf", "qurchase", "view\xc3\xa9", "cart\t"]
+NEAR_PRICES = ["0", "00", "1", "10000000", "10000001", "9999999", "010000000", "0000000010000000", "00000000100000001",
+               "99999999999999999", "18446744073709551617", "1e3", "+5", "5 ", " 5", "5.0", "-1", "", "\xd9\xa5", "12a", "0x10",
+               "1_000", "100000000", "0000000000000000000000000000000000000001"]
+
+
+def values(D):
+    """Near misses of the values the rules name: event types one byte off or
+    padded, prices at both ends of their range and beyond a 64-bit integer,
+    products that are empty or not in the catalogue. (These events change
+    what they mean; the yardstick is the plain implementation.)"""
+    R = D.R
+    clusters = {}
+    for line in D.events:
+        if line.f and line.f[0]:
+            clusters.setdefault((line.f[0], line.f[3]), []).append(line)
+    keys = list(clusters)
+    R.shuffle(keys)
+    made = 0
+    for key in keys[:max(60, len(keys) // 12)]:
+        lines = clusters[key]
+        f = list(lines[0].f)
+        if any(l.f != f for l in lines):
+            continue
+        r = R.random()
+        if r < 0.35:
+            f[4] = R.choice(NEAR_TYPES)
+        elif r < 0.75:
+            f[4] = "purchase"
+            f[6] = R.choice(NEAR_PRICES)
+            if R.random() < 0.3:
+                f[5] = R.choice(["", "p0", "p50001", "P1", "p1 ", "p01", "p", "p4194304", "p99999999", "q1", "p1\x00"])
+        else:
+            f[5] = R.choice(["", "p0", "p50001", "P1", "p1 ", "p01", "p", "p4194304", "p99999999999", "q1"])
+        mask = quote_mask(R, 7) if R.random() < 0.5 else None
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask
+        made += 1
+    D.notes.append(f"values {made}")
+
+
+def endings(D):
+    """Files that end without a newline after their last line, or with an
+    empty line (a malformed line by the rules), in all three folders."""
+    D.endings = True
+    D.notes.append("endings")
+
+
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
-                                     purchases, shapes, clickshapes, linkshapes, identityids, emptyevents, noeventfiles]}
+                                     purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, endings,
+                                     identityids, emptyevents, noeventfiles]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
-           "purchases", "shapes", "shapes", "clickshapes", "linkshapes"]
+           "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "endings"]
 
 
 # ------------------------------------------------------------------ writing
@@ -955,6 +1131,19 @@ def encode(D, fields, quotes=None):
     if quotes is not None:
         return ",".join('"' + v + '"' if quotes >> i & 1 else v for i, v in enumerate(fields))
     return ",".join('"' + v + '"' if D.R.random() < 0.2 else v for v in fields)
+
+
+def body(D, header, lines):
+    """A file's bytes; after `endings`, some files lack the last newline and
+    some end with an empty line."""
+    text = header + "\n" + "".join(l + "\n" for l in lines)
+    if D.endings and lines:
+        r = D.R.random()
+        if r < 0.3:
+            text = text[:-1]
+        elif r < 0.5:
+            text += "\n"
+    return text.encode("latin-1")
 
 
 def write(D, out_dir):
@@ -988,7 +1177,7 @@ def write(D, out_dir):
     if not D.drop_event_files:
         for (name, header, _), lines in zip(D.event_files, texts):
             with open(os.path.join(out_dir, "events", name), "wb") as f:
-                f.write(((header or EVENT_HEADER) + "\n" + "".join(l + "\n" for l in lines)).encode("latin-1"))
+                f.write(body(D, header or EVENT_HEADER, lines))
         for name, rows in D.new_event_files:
             lines = []
             for row in rows:
@@ -1004,17 +1193,19 @@ def write(D, out_dir):
         link_lines[number].append(raw)
     for (name, header, _), lines in zip(D.link_files, link_lines):
         with open(os.path.join(out_dir, "links", name), "wb") as f:
-            f.write(((header or "user_id_a,user_id_b") + "\n" + "".join(l + "\n" for l in lines)).encode("latin-1"))
-    if D.clicks is None:
+            f.write(body(D, header or "user_id_a,user_id_b", lines))
+    if D.clicks is None and not D.endings:
         shutil.copytree(os.path.join(D.in_dir, "clicks"), os.path.join(out_dir, "clicks"))
     else:
+        if D.clicks is None:
+            D.clicks = [Line(raw, None, number) for number, (_, _, lines) in enumerate(D.click_files) for raw in lines]
         os.makedirs(os.path.join(out_dir, "clicks"), exist_ok=True)
         click_lines = [[] for _ in D.click_files]
         for line in D.clicks:
             click_lines[line.file].append(encode(D, line.f, line.quotes) if line.f is not None and line.changed else line.raw)
         for (name, header, _), lines in zip(D.click_files, click_lines):
             with open(os.path.join(out_dir, "clicks", name), "wb") as f:
-                f.write(((header or "click_id,user_id,campaign_id,ts") + "\n" + "".join(l + "\n" for l in lines)).encode("latin-1"))
+                f.write(body(D, header or "click_id,user_id,campaign_id,ts", lines))
     for name in ("products.csv", "campaigns.csv", "manifest.json"):
         shutil.copy(os.path.join(D.in_dir, name), os.path.join(out_dir, name))
 
