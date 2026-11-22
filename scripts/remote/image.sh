@@ -36,18 +36,26 @@ case "$mode" in
     fi
     bash tools/fixtures.sh "$W/sessions" > "$W/fixtures.log" 2>&1 || rc=1
     tail -1 "$W/fixtures.log"
-    # The same with the wide parser off: the path of every other processor.
-    SS_SIMD=0 bash tools/fixtures.sh "$W/sessions" > "$W/fixtures0.log" 2>&1 || rc=1
-    echo "wide parser off: $(tail -1 "$W/fixtures0.log")"
-    for name in dev m5 m20; do
-      [ "$name" = dev ] && want="official/dev-answer/x/dev-answer" || want="expected/$name.slow"
-      rm -rf "$W/base-$name"
-      if SS_SIMD=0 NCPU=8 "$W/sessions" "data/$name" "$W/base-$name" 2> "$W/base-$name.log" \
-         && .venv/bin/python -I tools/cmp.py "$want" "$W/base-$name" > "$W/base-$name.cmp" 2>&1; then
-        echo "ok   $name with the wide parser off: $(grep -c identical "$W/base-$name.cmp") tables identical"
-      else echo "FAIL $name with the wide parser off"; head -8 "$W/base-$name.cmp"; rc=1; fi
-      rm -rf "$W/base-$name"
+    # The same with the other parser instances: the ordinary one (SS_SIMD=0,
+    # what a processor without AVX-512 runs) and the wide one for processors
+    # with AVX-512 but no VBMI2 (SS_SIMD=2).
+    for kind in SS_SIMD=0 SS_SIMD=2; do
+      env "$kind" bash tools/fixtures.sh "$W/sessions" > "$W/fixtures0.log" 2>&1 || rc=1
+      echo "$kind: $(tail -1 "$W/fixtures0.log")"
+      for name in dev m5 m20; do
+        [ "$name" = dev ] && want="official/dev-answer/x/dev-answer" || want="expected/$name.slow"
+        rm -rf "$W/base-$name"
+        if env "$kind" NCPU=8 "$W/sessions" "data/$name" "$W/base-$name" 2> "$W/base-$name.log" \
+           && .venv/bin/python -I tools/cmp.py "$want" "$W/base-$name" > "$W/base-$name.cmp" 2>&1; then
+          echo "ok   $name with $kind: $(grep -c identical "$W/base-$name.cmp") tables identical"
+        else echo "FAIL $name with $kind"; head -8 "$W/base-$name.cmp"; rc=1; fi
+        rm -rf "$W/base-$name"
+      done
     done
+    if [ -f scripts/remote/mulcount.sh ]; then
+      if bash scripts/remote/mulcount.sh "$W/sessions" > "$W/mulcount.log" 2>&1; then echo "ok   $(tail -1 "$W/mulcount.log")"
+      else echo "FAIL: 512-bit multiplications in the instance for processors without VBMI2"; tail -8 "$W/mulcount.log"; rc=1; fi
+    fi
     [ $# -gt 0 ] || set -- m5 m20 m60
     for name in dev "$@"; do
       [ "$name" = dev ] && want="official/dev-answer/x/dev-answer" || want="expected/$name.slow"
