@@ -23,6 +23,7 @@
 #        SETTINGS=v5w    version 5 with the wide parser on by default: default, the base path
 #                        (SS_SIMD=0), SS_WSPLIT=0, SS_WEMIT=0, both self-checks, each with thread
 #                        counts, tiny chunks, chunk ends at the 64-byte marks, small partitions
+#        SETTINGS=v5x    v5w, and the same again for the second wide instance (SS_SIMD=2)
 #        SLOW_BIN=name   the yardstick is bin/NAME --slow (default: the binary's own --slow);
 #                        the binary's own --slow is then compared with it as well
 #        REF_EVERY=n     the Python reference also on every n-th of the larger sets (default 5)
@@ -60,7 +61,7 @@ if [ "$mode" = wix ]; then
           identityids,gaps,nested identityids,splitter,copies copies,irregular,outrange badhead,drop,links
           idbytes idbytes,copies identityids,idbytes,disorder idbytes,shapes,splitter idbytes,mix)
 fi
-if [ "$mode" = v5 ] || [ "$mode" = v5w ]; then
+if [ "$mode" = v5 ] || [ "$mode" = v5w ] || [ "$mode" = v5x ]; then
   # Version 5 of the generator: IDs are opaque, one in eight is 33 bytes long.
   # The long forms and their near misses for users, events and clicks, alone
   # and with everything else.
@@ -143,7 +144,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
   )
   case "$mode" in
     plain) settings=("${plain[@]}") ;;
-    v5w) settings=(
+    v5w|v5x) settings=(
       # The wide parser is the default where the processor has it, the base
       # path (SS_SIMD=0) what runs elsewhere: both count.
       "default|NCPU=3"
@@ -182,7 +183,28 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "manypartsbase|NCPU=4 SS_SIMD=0 SS_PD_BYTES=$((seed % 900 + 100))"
       "onepart|NCPU=5 SS_PD_BYTES=1000000000"
       "tinyparts|NCPU=8 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))"
-      "tinypartsbase|NCPU=8 SS_SIMD=0 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))") ;;
+      "tinypartsbase|NCPU=8 SS_SIMD=0 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))")
+      # v5x: also the second wide instance (SS_SIMD=2: what a processor with
+      # AVX-512 but without VBMI2 runs), which is nobody's default on this box.
+      [ "$mode" = v5x ] && settings+=(
+      "w2|NCPU=3 SS_SIMD=2"
+      "w2one|NCPU=1 SS_SIMD=2"
+      "w2eight|NCPU=8 SS_SIMD=2"
+      "w2checks|NCPU=4 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1"
+      "w2checks1|NCPU=1 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1"
+      "w2nowsplit|NCPU=4 SS_SIMD=2 SS_WSPLIT=0"
+      "w2nowemit|NCPU=4 SS_SIMD=2 SS_WEMIT=0"
+      "w2checknowsplitemit|NCPU=3 SS_SIMD=2 SS_SIMD_CHECK=1 SS_WSPLIT=0 SS_WEMIT=0"
+      "w2tiny|NCPU=4 SS_SIMD=2 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "w2tinychecks|NCPU=8 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 7 % 97 + 31))"
+      "w2tiny8|NCPU=8 SS_SIMD=2 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
+      "w2mark|NCPU=5 SS_SIMD=2 SS_CHUNK_BYTES=${marks[$(((seed / 3 + 5) % ${#marks[@]}))]}"
+      "w2markchecks|NCPU=3 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=${marks[$((seed % ${#marks[@]}))]}"
+      "w2chunk4kchecks|NCPU=2 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 3 % 4096 + 2048))"
+      "w2chunk10k|NCPU=3 SS_SIMD=2 SS_CHUNK_BYTES=$((seed % 3000 + 9000))"
+      "w2chunk10kchecks|NCPU=4 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 11 % 6000 + 7000))"
+      "w2manyparts|NCPU=4 SS_SIMD=2 SS_PD_BYTES=$((seed % 900 + 100))"
+      "w2tinyparts|NCPU=8 SS_SIMD=2 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))") ;;
     v5) settings=("${plain[@]}"
       # (On exp-v5 the wide parser runs only with SS_SIMD=1; without it the
       # settings above are the ones that count.)
