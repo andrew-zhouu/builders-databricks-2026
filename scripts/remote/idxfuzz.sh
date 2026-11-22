@@ -24,6 +24,7 @@
 #                        (SS_SIMD=0), SS_WSPLIT=0, SS_WEMIT=0, both self-checks, each with thread
 #                        counts, tiny chunks, chunk ends at the 64-byte marks, small partitions
 #        SETTINGS=v5x    v5w, and the same again for the second wide instance (SS_SIMD=2)
+#        SETTINGS=w2     the second wide instance alone (22 settings, all with SS_SIMD=2)
 #        SLOW_BIN=name   the yardstick is bin/NAME --slow (default: the binary's own --slow);
 #                        the binary's own --slow is then compared with it as well
 #        REF_EVERY=n     the Python reference also on every n-th of the larger sets (default 5)
@@ -61,7 +62,7 @@ if [ "$mode" = wix ]; then
           identityids,gaps,nested identityids,splitter,copies copies,irregular,outrange badhead,drop,links
           idbytes idbytes,copies identityids,idbytes,disorder idbytes,shapes,splitter idbytes,mix)
 fi
-if [ "$mode" = v5 ] || [ "$mode" = v5w ] || [ "$mode" = v5x ]; then
+if [ "$mode" = v5 ] || [ "$mode" = v5w ] || [ "$mode" = v5x ] || [ "$mode" = w2 ]; then
   # Version 5 of the generator: IDs are opaque, one in eight is 33 bytes long.
   # The long forms and their near misses for users, events and clicks, alone
   # and with everything else.
@@ -80,7 +81,9 @@ if [ "$mode" = v5 ] || [ "$mode" = v5w ] || [ "$mode" = v5x ]; then
          grouping longusers,longevents,longclicks,grouping windows,grouping grouping,stretches,purchases
          longusers,grouping,endings longevents,idbytes,grouping mix,grouping longclicks,clicksplit,grouping
          longlinks longlinks,endings longlinks,longusers longlinks,linkshapes,links,nested longlinks,grouping
-         longlinks,mix longusers,longlinks,userlengths,endings longlinks,wide)
+         longlinks,mix longusers,longlinks,userlengths,endings longlinks,wide
+         numbers numbers,grouping numbers,shapes,lateness numbers,longusers,longevents numbers,windows
+         numbers,values,purchases,grouping numbers,mix numbers,stretches,endings)
 fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
@@ -144,7 +147,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
   )
   case "$mode" in
     plain) settings=("${plain[@]}") ;;
-    v5w|v5x) settings=(
+    v5w|v5x|w2) settings=(
       # The wide parser is the default where the processor has it, the base
       # path (SS_SIMD=0) what runs elsewhere: both count.
       "default|NCPU=3"
@@ -186,7 +189,8 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "tinypartsbase|NCPU=8 SS_SIMD=0 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))")
       # v5x: also the second wide instance (SS_SIMD=2: what a processor with
       # AVX-512 but without VBMI2 runs), which is nobody's default on this box.
-      [ "$mode" = v5x ] && settings+=(
+      # w2: that instance alone.
+      w2set=(
       "w2|NCPU=3 SS_SIMD=2"
       "w2one|NCPU=1 SS_SIMD=2"
       "w2eight|NCPU=8 SS_SIMD=2"
@@ -204,7 +208,13 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "w2chunk10k|NCPU=3 SS_SIMD=2 SS_CHUNK_BYTES=$((seed % 3000 + 9000))"
       "w2chunk10kchecks|NCPU=4 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 11 % 6000 + 7000))"
       "w2manyparts|NCPU=4 SS_SIMD=2 SS_PD_BYTES=$((seed % 900 + 100))"
-      "w2tinyparts|NCPU=8 SS_SIMD=2 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))") ;;
+      "w2tinyparts|NCPU=8 SS_SIMD=2 SS_PD_BYTES=$((seed % 300 + 64)) SS_CHUNK_BYTES=$((seed % 211 + 97))"
+      "w2scalar|NCPU=2 SS_SIMD=2 SS_SCALAR=1"
+      "w2onepart|NCPU=5 SS_SIMD=2 SS_PD_BYTES=1000000000"
+      "w2simdcheck|NCPU=8 SS_SIMD=2 SS_SIMD_CHECK=1"
+      "w2splitcheck|NCPU=2 SS_SIMD=2 SS_SPLIT_CHECK=1")
+      [ "$mode" = v5x ] && settings+=("${w2set[@]}")
+      [ "$mode" = w2 ] && settings=("${w2set[@]}") ;;
     v5) settings=("${plain[@]}"
       # (On exp-v5 the wide parser runs only with SS_SIMD=1; without it the
       # settings above are the ones that count.)

@@ -29,6 +29,8 @@ case "$mode" in
   plain) outer=("auto|") ;;
   simd) outer=("auto|" "nosimd|SS_SIMD=0" "check|SS_SIMD_CHECK=1") ;;
   split) outer=("auto|" "check|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1" "nowsplit|SS_WSPLIT=0") ;;
+  w2) outer=("w2|SS_SIMD=2" "w2checks|SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1" "w2nowsplit|SS_SIMD=2 SS_WSPLIT=0"
+             "w2nowemit|SS_SIMD=2 SS_WEMIT=0" "w2checknowemit|SS_SIMD=2 SS_SIMD_CHECK=1 SS_WEMIT=0 SS_WSPLIT=0") ;;
   v5w|v5x) outer=("auto|" "base|SS_SIMD=0" "checks|SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1" "nowsplit|SS_WSPLIT=0" "nowemit|SS_WEMIT=0"
               "checknowemit|SS_SIMD_CHECK=1 SS_WEMIT=0 SS_WSPLIT=0")
       # v5x: also the second wide instance (SS_SIMD=2).

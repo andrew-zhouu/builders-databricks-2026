@@ -2320,6 +2320,159 @@ def grouping(D):
     D.notes.append("grouping " + "; ".join(notes))
 
 
+def numbers(D):
+    """Timestamps and prices as numbers, for a decoder that turns digits into
+    values several lines at a time (multiplications by powers of ten in lanes,
+    which can lose a carry or a high half without anything looking wrong).
+
+    Events moved to the instants where a millisecond decides something (each
+    midnight of the window and a millisecond or a second on either side, the
+    window's two ends, times of all nines and all zeros) and to random seconds
+    of every day, written in every valid form: F1; F2 at any offset from
+    -23:59 to +23:59 (+14:00, -12:00, odd minutes, -00:00), so that the date
+    shown is a day off and now and then in another month or year; F3 plain
+    and with leading zeros to 14..20, 24 and 32 digits. Their ingest_ts is on
+    either side of the 24-hour limit.
+
+    Timestamps that must NOT land in the window: numbers of 1 to 16 digits and
+    more, the event's own time times ten and divided by ten, with a digit
+    changed, and the event's own time plus 2^64 or 2^32 times something (a
+    64-bit or 32-bit wrap brings it back into the window); calendar dates at
+    month and year ends, the leap day and the days that do not exist.
+
+    Purchases with prices of 1 to 8 digits at both ends of every length, with
+    leading zeros up to 8, 16 and more digits, and prices that are too large
+    but wrap to a small number in 32 or 64 bits."""
+    R = D.R
+    singles = [e for e, lines in D.groups.items() if len(lines) == 1 and lines[0].f and not lines[0].held]
+    R.shuffle(singles)
+    day0 = D.ws - D.ws % DAY
+    days = list(range(day0, D.we + DAY, DAY))
+    clocks = [(23, 59, 59), (0, 0, 0), (9, 9, 9), (19, 59, 59), (20, 0, 0), (9, 59, 59), (10, 0, 0), (12, 34, 56), (1, 1, 1),
+              (11, 11, 11), (22, 22, 22), (0, 0, 1), (0, 1, 0), (1, 0, 0), (0, 59, 59), (23, 0, 0), (8, 8, 8), (17, 7, 7)]
+
+    def offset():
+        if R.random() < 0.35:
+            return R.choice([840, -720, 345, 330, 525, -570, 1, -1, 59, -59, 1439, -1439, 0, 0, 765, 825, -690, 600, -600])
+        minutes = R.randrange(24) * 60 + R.randrange(60)
+        return minutes if R.random() < 0.5 else -minutes
+
+    def spell(ms):
+        r = R.random()
+        if ms % 1000 == 0 and r < 0.25:
+            return f1(ms)
+        if ms % 1000 == 0 and r < 0.60:
+            off = offset()
+            text = f2(ms, off)
+            return text[:19] + "-00:00" if off == 0 and R.random() < 0.5 else text
+        if r < 0.80:
+            return str(ms)
+        return str(ms).zfill(R.choice([14, 15, 16, 16, 17, 18, 19, 20, 24, 32]))
+
+    def instant():
+        day = R.choice(days)
+        r = R.random()
+        if r < 0.35:
+            return day + R.choice([0, 0, 1, -1, 1000, -1000, 999, -999, 59_000, -60_000, 3_599_000, -3_600_000])
+        if r < 0.50:
+            return R.choice([D.ws, D.ws, D.ws + 1, D.ws + 1000, D.we - 1, D.we - 1000, D.we - 1, D.ws - 1, D.ws - 1000, D.we, D.we + 1000])
+        if r < 0.80:
+            return day + R.randrange(86400) * 1000 + (R.randrange(1000) if R.random() < 0.3 else 0)
+        h, m, s = R.choice(clocks)
+        return day + (h * 3600 + m * 60 + s) * 1000
+
+    moved = 0
+    cut = max(200, len(singles) // 4)
+    for eid in singles[:cut]:
+        line = D.groups[eid][0]
+        t = instant()
+        line.f[2] = spell(t)
+        whole = t - t % 1000 + (1000 if t % 1000 else 0)
+        line.f[3] = f1(whole + R.choice([0, 1, 5, 60, 600, 3600, 86399, 86400, 86400, 86401, 2 * 86400]) * 1000)
+        line.changed = True
+        line.quotes = quote_mask(R, 7) if R.random() < 0.3 else None
+        moved += 1
+
+    # Calendar dates at the ends of months and years, and days that are none.
+    calendar = []
+    for year in (2024, 2025, 2026, 2027, 2028, 2029):
+        for month, last in ((1, 31), (2, 28), (2, 29), (2, 30), (3, 31), (4, 30), (4, 31), (6, 30), (6, 31), (9, 30), (9, 31),
+                            (11, 30), (11, 31), (12, 31), (12, 32), (13, 1), (0, 10), (1, 0)):
+            for clock in ("00:00:00", "23:59:59", "12:00:00", "24:00:00", "23:60:00", "23:59:60"):
+                calendar.append(f"{year:04d}-{month:02d}-{last:02d}T{clock}")
+    zones = ["Z", "Z", "+14:00", "-12:00", "+23:59", "-23:59", "+00:00", "-00:00", "+05:45", "-09:30", "+24:00", "+00:60", "+1400", ""]
+
+    def far(ms):
+        """A ts that is not in the window, whatever it looks like."""
+        r = R.random()
+        own = str(ms) if ms is not None and 10 ** 12 <= ms < 10 ** 13 else str(D.ws + 12345)
+        if r < 0.30:
+            k = R.randint(1, 16)
+            if k == 13:
+                # Thirteen digits like any ts of the data, weeks or years off.
+                return str(int(own) + R.choice([-1, 1]) * R.randint(20, 900) * DAY)
+            return str(R.randrange(10 ** (k - 1) if k > 1 else 0, 10 ** k))
+        if r < 0.45:
+            return R.choice([own + "0", own[:-1], own + "000", "9" + own[1:], own[:1] + "9" + own[2:], "1" + own, own + own,
+                             # 2^32 ms (49.7 days) on: the same place in the window for a 32-bit difference.
+                             str(int(own) + (1 << 32)), str(int(own) - (1 << 32)), str(int(own) + (2 << 32)),
+                             str(int(own) + (1 << 32)), str(int(own) - (2 << 32)), f1(int(own) - int(own) % 1000 + (1 << 32) // 1000 * 1000)])
+        if r < 0.65:
+            # Wraps into the window in 64 or in 32 bits; with leading zeros too.
+            value = int(own) + R.choice([1 << 64, 3 << 64, 1 << 63, 1 << 32 << 32, 1 << 127, (1 << 64) * 10 ** 6])
+            return R.choice(["", "", "0", "000"]) + str(value)
+        if r < 0.75:
+            return R.choice(["0", "00000000000000000000", "86400000", "99999999999999999999", "18446744073709551615",
+                             "18446744073709551616", "9223372036854775807", "9223372036854775808", "4294967295", "4294967296"])
+        return R.choice(calendar) + R.choice(zones)
+
+    odd = 0
+    for eid in singles[cut:cut + max(120, len(singles) // 8)]:
+        line = D.groups[eid][0]
+        line.f[2] = far(parse_ts(line.f[2]))
+        line.changed = True
+        line.quotes = quote_mask(R, 7) if R.random() < 0.3 else None
+        odd += 1
+
+    def price():
+        r = R.random()
+        if r < 0.25:
+            value = R.choice([1, 9, 10, 99, 100, 999, 1000, 9999, 10000, 99999, 100000, 999999, 1000000, 9999999, 10000000])
+        elif r < 0.80:
+            k = R.randint(1, 8)
+            value = R.randrange(10 ** (k - 1), 10 ** k) if k < 8 else R.choice([10000000, 10000000, R.randrange(10 ** 7, 10 ** 8)])
+        else:
+            # Too large, or nothing: some of them a small number once the top bits are gone.
+            value = R.choice([0, 0, 10000001, 99999999, 100000000, 10 ** 9, (1 << 32) + 250, (1 << 32) + 1, (1 << 64) + 250,
+                              (1 << 64) + 10000000, 1 << 32, 1 << 64, 4294967295, 10 ** 16, (1 << 31) + 5, 16777216 + 300])
+        text = str(value)
+        zeros = R.choice([0, 0, 0, 0, 1, 2, 3, max(0, 8 - len(text)), max(0, 16 - len(text)), R.randint(0, 24)])
+        return "0" * zeros + text
+
+    clusters = {}
+    for line in D.events:
+        if line.f and line.f[0]:
+            clusters.setdefault((line.f[0], line.f[3]), []).append(line)
+    keys = list(clusters)
+    R.shuffle(keys)
+    priced = 0
+    for key in keys[:max(200, len(keys) // 5)]:
+        lines = clusters[key]
+        f = list(lines[0].f)
+        if any(l.f != f for l in lines):
+            continue
+        f[4] = "purchase"
+        f[5] = f[5] or "p1"
+        f[6] = price()
+        mask = quote_mask(R, 7) if R.random() < 0.3 else None
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask
+        priced += 1
+    D.notes.append(f"numbers {moved} moved, {odd} out of the window, {priced} prices")
+
+
 def longlinks(D):
     """Link lines for a reader with a short cut for long ones (two 64-byte
     windows: the first ID and the comma, the second ID and the newline; both
@@ -2472,10 +2625,10 @@ def longlinks(D):
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
                                      splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles,
-                                     idbytes, longusers, longevents, longclicks, windows, grouping, longlinks]}
+                                     idbytes, longusers, longevents, longclicks, windows, grouping, longlinks, numbers]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
            "idbytes", "idbytes", "longusers", "longusers", "longevents", "longevents", "longclicks", "longclicks",
-           "windows", "windows", "grouping", "grouping", "longlinks", "longlinks",
+           "windows", "windows", "grouping", "grouping", "longlinks", "longlinks", "numbers", "numbers",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
            "splitter", "splitter", "clicksplit", "clicksplit", "interleave", "endings"]
 
