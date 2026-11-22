@@ -17,10 +17,11 @@ Everything below the horizontal rule predates this; where they disagree, this wi
 | **Candidate c3: trace-only parser, pass 2 routes events** | `69557e4` (tag `cand-c3`) | Full gate passed. 20M: 501 / 503 against 555 / 561; 60M: 1556 / 1557 against 1704 / 1710. |
 | **Candidate c4: c3 + merged pass 2, faster writer** | `864640b` (tag `cand-c4`) | Full gate passed. 20M: 490 / 492 against 560 / 562; 60M: 1522 / 1526 against 1704 / 1705. |
 | **Candidate c5: c4 + same-day check on the text, user table in cache-line buckets** | `4b2bdb3` (tag `cand-c5`) | Full gate passed. One interleaved run, scored / c4 / c5: 20M 561/564, 488/491, 488/489; 60M 1702/1705, 1520/1522, 1503/1509; a second 60M set (seed 77) 1671/1677 scored, 1438/1442 c5. Also identical to the plain implementation on four more large sets (`scripts/remote/moreseeds.sh`: a window holding 29 February 2028 at 5M and 20M, seed 31 at 20M, seed 77 at 60M) and to the Python reference on the leap-day seed at 200K. **The one to submit.** |
-| Officially scored, **0.63 s** (22 Nov, about 23:15 UTC on the 21st) | `42b0f35` on `main` (a squash of `dev`; same build inputs as c5) | The best scored so far. |
-| Candidate c6: c5 + user_daily in 512 KB files written during the session pass, writeback of each started at once | `bd38f17` (tag `cand-c6`) | Full gate passed. Program time as c5; the docker command at 60M 1637 ms against 1749. |
-| **Candidate c7: c6 + smaller output** (rows without revenue first, person indexes as runs, campaign_daily dictionary-encoded) | `01708cd` (tag `cand-c7`) | Full gate passed. Program time as c6 (20M 484/488, 60M 1498/1501); output 18.5 MB at 20M (c5: 25), 55 MB at 60M (c5: 72). **The one to submit.** |
-| Candidate c8: c7 + writer that keeps its buffers between files | `1dd7fb8` | 20M 481/482 against 486/490 for c7; 60M 1484/1489 against 1498/1500 (the writer's CPU time at 60M: 180 ms against 310). Gate started 00:55 UTC on the 22nd (`scripts/remote.sh log c8`). |
+| Officially scored, **0.63 s and 0.62 s** | `42b0f35` on `main` (a squash of `dev`; same build inputs as c5) | **The best scored so far, and the fallback.** |
+| Candidate c6: c5 + user_daily in 512 KB files written during the session pass, writeback of each started at once | `bd38f17` (tag `cand-c6`) | Full gate passed. Not scored. |
+| Candidate c7: c6 + smaller output (rows without revenue first, person indexes as runs, campaign_daily dictionary-encoded) | `01708cd` (tag `cand-c7`) | Full gate passed. **Officially 0.64 s**: no better than c5. |
+| Candidate c8: c7 + writer that keeps its buffers between files | `1dd7fb8` (tag `cand-c8`) | Full gate passed. Superseded by c9 (same, without early writeback). |
+| **Candidate c9: c8 with early writeback off** | `5c5d8d1` | One interleaved run, c5 / c8 / c9: 20M 484/488, 480/483, 482/484; 60M 1507/1509, 1486/1487, 1487/1488. Gate started 01:40 UTC on the 22nd (`scripts/remote.sh log c9`). The one to submit once it says `CANDIDATE-OK`; c5 stays the choice for the final unless c9 scores at least as well. |
 | Diagnostic image (fails on purpose, shows a log) | `2a2ea40` (branch `diag4`) | Not yet submitted. The single most informative submission: scorer CPU, clock under 512-bit code, huge pages, page-fault and memory costs, `/output` write speed, CPU-quota throttling. |
 
 "Full gate" = `scripts/cand.sh NAME`: on EC2, `fullcheck.sh` (fixtures, dev answer, 150
@@ -74,7 +75,33 @@ interleaved rounds (`scripts/abx.sh`).
 * Beware: `remote.sh push` must not preserve file times (fixed), or cargo on EC2 skips
   files edited before its last build.
 
-### What the second official score says (read before optimising anything)
+### What the third official score says (this corrects the section below)
+
+c7 (early writeback, 18.5 MB of output) scored **0.64 s**; c5 (no writeback, 25 MB)
+scored 0.63 s and 0.62 s. So neither the output still unwritten at exit nor the output's
+size is in the official clock, and the two-point model below was a coincidence: the
+first score (0.85 s) was simply taken on a slower machine. The organisers say practice
+times vary by up to 20% between scoring machines; 0.85 / 0.631 s (our container time
+for that build) is 1.35, and 0.62 to 0.64 over 0.557 s is 1.11 to 1.15. A 1.2x spread is
+what one generation of Intel core (Cascade Lake against Ice Lake, both "n2") gives at
+equal clock, so there is no sign that our code suits one of them worse than usual.
+
+What follows from it:
+
+* Official score = machine factor x (program time + about 0.07 s). Only program time
+  is ours, and EC2 A/B results carry over as ratios. Differences under about 3% cannot
+  be seen in a single official score.
+* Early writeback is off by default from c9 on (`SS_WRITEBACK=1` turns it on): it buys
+  nothing there, and disk activity during the run can only cost.
+* Kept from c6 to c8, because they save CPU time whatever the clock includes: output
+  in 512 KB files as the rows come (row buffers stop growing through fresh memory),
+  rows without revenue first and person indexes as runs (fewer bytes through the page
+  cache), the writer's buffers kept between files.
+* For the final (60M, median of 3, the ten fastest retimed 7 times on one idle
+  machine) the commit to choose is the one with the lowest program time that has an
+  official score: c5 until c9 has one that is not worse.
+
+### What the second official score seemed to say (superseded by the section above)
 
 0.85 s (scored build, 77 MB of output) and 0.63 s (c5, 25 MB) both fit
 

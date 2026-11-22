@@ -2,7 +2,8 @@
 # Run things on the remote development machine. Connection details live in
 # .local/remote.env (not committed):  REMOTE_HOST, REMOTE_USER, REMOTE_KEY, REMOTE_DIR
 #
-#   remote.sh run 'command ...'        run a shell command in REMOTE_DIR
+#   remote.sh run 'command ...'        run a shell command in REMOTE_DIR (waits for the machine's lock)
+#   remote.sh quick 'command ...'      the same without the lock: only for looking at things
 #   remote.sh script FILE [ARGS]       copy a local script over and run it with bash
 #   remote.sh push                     rsync the working tree's sources to REMOTE_DIR
 #   remote.sh tmux NAME 'command'      start a detached tmux session (long jobs)
@@ -14,8 +15,14 @@ set -euo pipefail
 SSH=(ssh -i "$REMOTE_KEY" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ConnectTimeout=15
      -o ControlMaster=auto -o ControlPath="/tmp/ss-remote-%r@%h" -o ControlPersist=600 "$REMOTE_USER@$REMOTE_HOST")
 cmd="$1"; shift
+# Several working trees (and agents) share the one machine: whatever builds,
+# tests or measures takes this lock, so that nothing disturbs a measurement.
+# `quick` is for looking at things (logs, listings) and does not wait.
+LOCK=/tmp/ss-heavy.lock
 case "$cmd" in
   run)
+    "${SSH[@]}" "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && flock $LOCK bash -c $(printf %q "$*")" ;;
+  quick)
     "${SSH[@]}" "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && $*" ;;
   script)
     f="$1"; shift
@@ -32,7 +39,7 @@ case "$cmd" in
       "$PROJ/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/" ;;
   tmux)
     name="$1"; shift
-    "${SSH[@]}" "cd $REMOTE_DIR && mkdir -p out/logs && tmux new-session -d -s $name \"($*) > out/logs/$name.log 2>&1; echo EXIT=\\\$? >> out/logs/$name.log\" && echo started $name" ;;
+    "${SSH[@]}" "cd $REMOTE_DIR && mkdir -p out/logs && tmux new-session -d -s $name \"(flock $LOCK bash -c $(printf %q "$*")) > out/logs/$name.log 2>&1; echo EXIT=\\\$? >> out/logs/$name.log\" && echo started $name" ;;
   log)
     name="$1"; lines="${2:-40}"
     "${SSH[@]}" "cd $REMOTE_DIR && tail -n $lines out/logs/$name.log; tmux has-session -t $name 2>/dev/null && echo '[still running]' || echo '[finished]'" ;;
