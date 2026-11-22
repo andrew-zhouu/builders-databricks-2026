@@ -1771,7 +1771,19 @@ def relatives(L, value):
                 value[:8] + chr(ord(value[8]) - 1), value[:9] + "0"]
     else:
         out += [value[0] + L.hex(), (value + L.hex())[:33], value + L.hex()]
-    return [v for v in out if v != value and sayable(v)]
+    # (Not half of a multi-byte character: an ID that is UTF-8 stays UTF-8, as
+    # the rules say the files are; a user ID reaches the output.)
+    whole = is_utf8(value)
+    return [v for v in out if v != value and sayable(v) and (is_utf8(v) or not whole)]
+
+
+def is_utf8(text):
+    """Is this text (bytes read as latin-1) valid UTF-8?"""
+    try:
+        text.encode("latin-1").decode("utf-8")
+        return True
+    except UnicodeError:
+        return False
 
 
 def broken(R, value):
