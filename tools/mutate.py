@@ -44,6 +44,13 @@ EVENT_HEADER = "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents"
 
 # ------------------------------------------------------------------ IDs
 
+def up(text):
+    """Upper case for the ASCII letters only: a text here is bytes read as
+    latin-1, and str.upper() would turn a byte like 0xFF into a character that
+    is no byte at all."""
+    return "".join(chr(ord(c) - 32) if "a" <= c <= "z" else c for c in text)
+
+
 def base36(value):
     out = ""
     while True:
@@ -432,9 +439,9 @@ def irregular(D):
         kind = R.choice(["upper", "upper_some", "zero", "first", "long", "space", "byte", "empty", "pair", "pair2", "dup"])
         cut = R.randrange(1, len(eid) + 1)
         if kind == "upper":
-            new = eid.upper()
+            new = up(eid)
         elif kind == "upper_some":
-            new = eid[0] + eid[1:].upper()
+            new = eid[0] + up(eid[1:])
             lines = [l for l in lines if R.random() < 0.6] or lines[:1]
         elif kind == "zero":
             new = eid[0] + "0" * R.choice([1, 1, 2]) + eid[1:]
@@ -457,7 +464,7 @@ def irregular(D):
             continue
         else:
             # An irregular ID with copies of its own, some under another user.
-            new = eid.upper() if eid.upper() != eid else "E" + eid
+            new = up(eid) if up(eid) != eid else "E" + eid
             first = lines[0]
             used = {l.f[3] for l in lines}
             for extra in range(R.randint(1, 3)):
@@ -504,8 +511,8 @@ def idbytes(D):
         elif kind == "alias":
             v = int(c, 36)
             # `:` to `S` continue the digits; `W` to `` ` `` sit before `a` as 0 to 9 do before 10.
-            other = chr(ord("0") + v) if c.isalpha() else chr(ord("a") - 10 + v)
-            twins = [eid[:at] + R.choice([other, c.upper() if c.isalpha() else other]) + eid[at + 1:]]
+            other = chr(ord("0") + v) if c >= "a" else chr(ord("a") - 10 + v)
+            twins = [eid[:at] + R.choice([other, up(c) if c >= "a" else other]) + eid[at + 1:]]
         elif kind == "flip":
             twins = [eid[:at] + chr(ord(c) ^ R.choice([0x80, 0x20, 0x10, 0x08, 0x40, 0x01])) + eid[at + 1:]]
         elif kind == "tail":
@@ -513,7 +520,7 @@ def idbytes(D):
         elif kind == "head":
             twins = [h + eid[1:] for h in R.sample(["E", "d", "f", "\xe5", "%", "\x00", "u", "k", "1"], 2)]
         elif kind == "nuls":
-            base = eid.upper() if eid.upper() != eid else "E" + eid[1:]
+            base = up(eid) if up(eid) != eid else "E" + eid[1:]
             twins = [base, base + "\x00", base + "\x00\x00", base + "\x00\x00\x00"][:R.randint(2, 4)]
         elif kind == "zero":
             twins = [eid[0] + "0" + eid[2:], eid[0] + "0" + eid[1:], eid[:at] + "0" * (len(eid) - at)]
@@ -837,7 +844,7 @@ def irrfile(D):
         count = 0
         for line in D.events:
             if line.file == target and line.f and line.f[0]:
-                line.f[0] = line.f[0].upper() if line.f[0].upper() != line.f[0] else "E" + line.f[0]
+                line.f[0] = up(line.f[0]) if up(line.f[0]) != line.f[0] else "E" + line.f[0]
                 line.changed = True
                 count += 1
         D.notes.append(f"irrfile {count} in file {target}")
@@ -887,7 +894,7 @@ def badhead(D):
             text = line.raw if line.raw is not None else ",".join(line.f)
             line.f, line.raw, line.changed = None, R.choice([text + ",x", '"' + text, text.rsplit(",", 1)[0], ""]), False
         elif how == "irregular":
-            line.f[0] = R.choice([line.f[0].upper(), line.f[0] + "zzzz", " " + line.f[0], "e0" + line.f[0][1:]])
+            line.f[0] = R.choice([up(line.f[0]), line.f[0] + "zzzz", " " + line.f[0], "e0" + line.f[0][1:]])
             line.changed = True
         else:
             line.f[0] = "e" + "".join(R.choice(DIGITS[1:]) for _ in range(R.choice([1, 2, 6, 8, 8, 8])))
@@ -1110,7 +1117,7 @@ def userlengths(D):
         elif style == "space":
             new = R.choice([user + " ", " " + user, user[:cut] + " " + user[cut:], user + "\t"])
         elif style == "upper":
-            new = user.upper()
+            new = up(user)
         elif style == "nul":
             new = user[:cut] + "\x00" + user[cut:]
         else:
@@ -1279,7 +1286,7 @@ def stretches(D):
                         stamp += 1000
                     f[3] = f1(stamp)
             if style == "user" and f[1]:
-                f[1] = R.choice([f[1] + "0123456789", f[1].upper(), " " + f[1], f[1] + "\xc3\xa9"])
+                f[1] = R.choice([f[1] + "0123456789", up(f[1]), " " + f[1], f[1] + "\xc3\xa9"])
             if style == "longid":
                 f[0] = f[0] + "".join(R.choice(DIGITS) for _ in range(R.randint(2, 12)))
             seen.add((f[0], f[3]))
@@ -1708,17 +1715,17 @@ class Longs:
         if kind == "last":
             return prefix + s[:31] + R.choice("gAF GZz:/`@")
         if kind == "upper":
-            return prefix + s.upper()
+            return prefix + up(s)
         if kind == "upper1":
             letters = [i for i, c in enumerate(s) if c in "abcdef"]
             if not letters:
                 return prefix + s[:31] + "A"
             i = R.choice(letters)
-            return prefix + s[:i] + s[i].upper() + s[i + 1:]
+            return prefix + s[:i] + up(s[i]) + s[i + 1:]
         if kind == "prefix":
             return R.choice([c for c in "euk" if c != prefix] + ["x", "0", "g", "\x00"]) + s
         if kind == "prefixup":
-            return prefix.upper() + s
+            return up(prefix) + s
         if kind == "nul":
             return prefix + s[:at] + "\x00" + s[at + 1:]
         if kind == "utf8":
@@ -1748,13 +1755,13 @@ def relatives(L, value):
         out.append(value[:R.randrange(2, len(value))])
         out.append(value[:-1])
     out.append(value + R.choice(["0", "a", "f", "\x00", " ", "0" * 8]))
-    out.append(value[0] + value[1:].upper())
-    out.append(value[0].upper() + value[1:])
+    out.append(value[0] + up(value[1:]))
+    out.append(up(value[0]) + value[1:])
     out.append(value[:-1] + R.choice(HEX + "gz"))
-    letters = [i for i, c in enumerate(value) if i and c.isalpha() and c.islower()]
+    letters = [i for i, c in enumerate(value) if i and "a" <= c <= "z"]
     if letters:
         i = R.choice(letters)
-        out.append(value[:i] + value[i].upper() + value[i + 1:])
+        out.append(value[:i] + up(value[i]) + value[i + 1:])
     if is_long(value):
         fresh = "".join(R.choice(HEX) for _ in range(32))
         out += [value[:9] + fresh[8:], value[:17] + fresh[16:], value[:17] + fresh[16:], value[:32] + R.choice(HEX),

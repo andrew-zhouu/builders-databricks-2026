@@ -143,6 +143,14 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "simd|NCPU=4 SS_SIMD=1"
       "simdnowsplit|NCPU=3 SS_SIMD=1 SS_WSPLIT=0"
       "simdtiny|NCPU=8 SS_SIMD=1 SS_CHUNK_BYTES=$((seed * 7 % 97 + 31))")
+      # The batch splitters' self-check, on request (SPLIT_CHECKS=1).
+      [ -n "${SPLIT_CHECKS:-}" ] && settings+=(
+      "simdsplit|NCPU=4 SS_SIMD=1 SS_SPLIT_CHECK=1"
+      "simdsplit1|NCPU=1 SS_SIMD=1 SS_SPLIT_CHECK=1"
+      "simdsplit8|NCPU=8 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_PD_BYTES=$((seed % 900 + 100))"
+      "simdsplittiny|NCPU=8 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 7 % 97 + 31))"
+      "simdsplitmark|NCPU=3 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=${marks[$((seed % ${#marks[@]}))]}"
+      "simdsplitchunk|NCPU=2 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed % 4096 + 2048))")
       # The wide parser's self-checks, on request (SIMD_CHECKS=1).
       [ -n "${SIMD_CHECKS:-}" ] && settings+=(
       "simdcheck|NCPU=4 SS_SIMD=1 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
