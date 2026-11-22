@@ -403,33 +403,84 @@ fn link_line(ctx: &Ctx, line: &[u8]) {
     }
 }
 
-/// Returns the bytes consumed, or 0 if the line needs the scalar path.
+/// The key of the user ID at `a` (`n` bytes) if it is a long one (ids.rs): `u`
+/// and 32 lowercase hexadecimal digits, neither half of them zero.
 #[inline(always)]
-unsafe fn link_fast(ctx: &Ctx, ring: &mut LinkRing, p: *const u8) -> usize {
-    let v = _mm256_loadu_si256(p as *const __m256i);
-    let m = |c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
-    let (cm, nm, qm) = (m(b','), m(b'\n'), m(b'"'));
-    let nl = nm.trailing_zeros() as usize;
-    let below = 1u64.wrapping_shl(nl as u32).wrapping_sub(1);
-    let cmb = cm & below;
-    let c0 = cmb.trailing_zeros() as usize;
-    let (bad, f) = quotes(qm & below, cmb | 1u64.wrapping_shl(nl as u32));
-    if (nl >= 32) | (cmb == 0) | (cmb & cmb.wrapping_sub(1) != 0) | (bad != 0) {
-        return 0;
+unsafe fn long_user_key(ctx: &Ctx, a: *const u8, n: usize) -> Option<u64> {
+    if (n != LONG_LEN) | (*a != b'u') {
+        return None;
     }
-    let (f0, f1) = ((f & 1) as usize, (f >> 1 & 1) as usize);
+    let (hex, hi, lo) = hex32(a.add(1));
+    if !hex {
+        return None;
+    }
+    ctx.users.long_key(hi, lo)
+}
+
+/// The link line at `p`: the bytes it takes and its two users' keys, or 0
+/// bytes if the line needs the scalar path. Keys (0, 0): a line with nothing
+/// to do (one of its IDs is empty).
+///
+/// The first ID and its comma must be within 64 bytes of the line's start,
+/// the second ID and the newline within 64 bytes after the comma: a long ID
+/// is 33 bytes, 35 with quotes. Most lines end within the first 64 bytes;
+/// the others are looked at through a second window. Both IDs must be of
+/// the regular or the long shape (`ids.rs`): one line in four has a long one.
+#[inline(always)]
+unsafe fn link_fast(ctx: &Ctx, p: *const u8) -> (usize, (u64, u64)) {
+    const NO: (usize, (u64, u64)) = (0, (0, 0));
+    let (cm, nm, qm) = masks64(p);
+    let c0 = cm.trailing_zeros() as usize;
+    if c0 >= 64 {
+        return NO;
+    }
+    let below0 = (1u64 << c0) - 1;
+    // What follows the comma: in this window if the line ends in it.
+    let q = p.add(c0 + 1);
+    let (cm1, nm1, qm1) = if nm >> c0 != 0 { (cm >> c0 >> 1, nm >> c0 >> 1, qm >> c0 >> 1) } else { masks64(q) };
+    let nl = nm1.trailing_zeros() as usize;
+    if (nl >= 64) | (nm & below0 != 0) {
+        return NO;
+    }
+    let below1 = (1u64 << nl) - 1;
+    let (bad0, f0) = quotes(qm & below0, 1u64 << c0);
+    let (bad1, f1) = quotes(qm1 & below1, 1u64 << nl);
+    // A second comma, or a quote out of place: the scalar path drops the line.
+    if (cm1 & below1) | bad0 | bad1 != 0 {
+        return NO;
+    }
+    let (f0, f1) = (f0 as usize & 1, f1 as usize & 1);
     let (a0, n0) = (p.add(f0), c0 - 2 * f0);
-    let (a1, n1) = (p.add(c0 + 1 + f1), nl - c0 - 1 - 2 * f1);
+    let (a1, n1) = (q.add(f1), nl - 2 * f1);
+    let used = c0 + nl + 2;
     if (n0 == 0) | (n1 == 0) {
-        return nl + 1;
+        return (used, (0, 0));
     }
-    let (r0, k0) = raw_key_fast(a0, n0, b'u');
-    let (r1, k1) = raw_key_fast(a1, n1, b'u');
+    let (r0, mut k0) = raw_key_fast(a0, n0, b'u');
+    let (r1, mut k1) = raw_key_fast(a1, n1, b'u');
     if !(r0 & r1) {
-        return 0;
+        if !r0 {
+            let Some(k) = long_user_key(ctx, a0, n0) else { return NO };
+            k0 = k;
+        }
+        if !r1 {
+            let Some(k) = long_user_key(ctx, a1, n1) else { return NO };
+            k1 = k;
+        }
     }
-    ring.push(ctx, (k0, k1));
-    nl + 1
+    (used, (k0, k1))
+}
+
+/// SS_SPLIT_CHECK: what `link_fast` made of a line must be what the scalar
+/// path makes of it (`link_line`: the same fields, hence the same keys).
+fn check_link(ctx: &Ctx, line: &[u8], keys: (u64, u64)) {
+    let show = || String::from_utf8_lossy(line).into_owned();
+    let want = match split::<2>(line) {
+        Some([a, b]) if !a.is_empty() && !b.is_empty() => (ctx.users.key(a), ctx.users.key(b)),
+        Some(_) => (0, 0),
+        None => panic!("link_fast took a line that is malformed: {}", show()),
+    };
+    assert!(want == keys, "link line: keys {:x?}, scalar path {:x?}: {}", keys, want, show());
 }
 
 const RING: usize = 32;
@@ -488,8 +539,14 @@ pub fn links_chunk(ctx: &Ctx, ch: &Chunk) -> usize {
         while pos < ch.end {
             lines += 1;
             if pos < fast_end {
-                let used = unsafe { link_fast(ctx, &mut ring, data.as_ptr().add(pos)) };
+                let (used, keys) = unsafe { link_fast(ctx, data.as_ptr().add(pos)) };
                 if used != 0 {
+                    if ctx.split_check {
+                        check_link(ctx, &data[pos..pos + used - 1], keys);
+                    }
+                    if keys.0 != 0 {
+                        ring.push(ctx, keys);
+                    }
                     pos += used;
                     continue;
                 }
@@ -1109,6 +1166,37 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
     nmore
 }
 
+const _: () = assert!(NB == 64);
+
+/// The numbers of the first `n` lines of a batch whose flags, under `mask`,
+/// are `want`: into `list`, in order. Returns how many. (The batch's 64 flags
+/// are compared at once and the list is made from the bits: most lines are
+/// not on it.)
+#[inline(always)]
+unsafe fn flagged(flags: &[u8; NB], n: usize, mask: u8, want: u8, list: &mut [u8; NB]) -> usize {
+    let pick = |k: usize| {
+        let v = _mm256_loadu_si256(flags.as_ptr().add(32 * k) as *const __m256i);
+        let hit = _mm256_cmpeq_epi8(_mm256_and_si256(v, _mm256_set1_epi8(mask as i8)), _mm256_set1_epi8(want as i8));
+        _mm256_movemask_epi8(hit) as u32 as u64
+    };
+    let mut bits = _bzhi_u64(pick(0) | pick(1) << 32, n as u32);
+    let mut m = 0usize;
+    while bits != 0 {
+        *list.get_unchecked_mut(m) = bits.trailing_zeros() as u8;
+        bits &= bits - 1;
+        m += 1;
+    }
+    m
+}
+
+/// Where the user_id of an event or click line is (the second field of
+/// both): after the line's first comma (byte 0 of `sep`), and after its
+/// opening quote if it has one (bit 1 of byte 7). As `fields` has it.
+#[inline(always)]
+unsafe fn user_at(p: *const u8, sep: u64) -> *const u8 {
+    p.add((sep & 0xFF) as usize + 1 + (sep >> 57 & 1) as usize)
+}
+
 /// The users of the valid lines that `decode` flagged `F_LONG`: 33 bytes,
 /// which is a long ID if they are `u` and 32 lowercase hexadecimal digits
 /// (ids.rs). Its key is its slot in the table of long IDs, which is asked for
@@ -1118,34 +1206,29 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
 #[inline(never)]
 unsafe fn stage_long(ctx: &Ctx, st: &mut Stage, n: usize) {
     let mut list = [0u8; NB];
-    let mut m = 0usize;
-    for i in 0..n {
-        *list.get_unchecked_mut(m) = i as u8;
-        m += (*st.flags.get_unchecked(i) & (F_LONG | F_VALID | F_DEAD) == F_LONG | F_VALID) as usize;
-    }
+    let m = flagged(&st.flags, n, F_LONG | F_VALID | F_DEAD, F_LONG | F_VALID, &mut list);
     if m == 0 {
         return;
     }
     let table = ctx.users.long.as_ref().unwrap_unchecked();
-    let mut value = [(0u64, 0u64); NB];
+    let mut value = [std::mem::MaybeUninit::<(u64, u64)>::uninit(); NB];
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
-        let (start, _) = fields(*st.sep.get_unchecked(i));
-        let a = (*st.p.get_unchecked(i)).add((start >> 8) as usize & 0xFF);
+        let a = user_at(*st.p.get_unchecked(i), *st.sep.get_unchecked(i));
         let (hex, hi, lo) = hex32(a.add(1));
         if !hex | (*a != b'u') | (hi == 0) | (lo == 0) {
             *st.flags.get_unchecked_mut(i) = F_DEAD;
             continue;
         }
         table.prefetch(hi, lo);
-        *value.get_unchecked_mut(k) = (hi, lo);
+        value.get_unchecked_mut(k).write((hi, lo));
     }
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
         if *st.flags.get_unchecked(i) & F_DEAD != 0 {
             continue;
         }
-        let (hi, lo) = *value.get_unchecked(k);
+        let (hi, lo) = value.get_unchecked(k).assume_init_read();
         // (Neither half is zero, so there is a key.)
         let key = ctx.users.long_key(hi, lo).unwrap_unchecked();
         *st.key.get_unchecked_mut(i) = key;
@@ -1546,34 +1629,29 @@ unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
 #[inline(never)]
 unsafe fn click_long(ctx: &Ctx, st: &mut ClickStage, n: usize) {
     let mut list = [0u8; NB];
-    let mut m = 0usize;
-    for i in 0..n {
-        *list.get_unchecked_mut(m) = i as u8;
-        m += (*st.flags.get_unchecked(i) == C_VALID | C_LONG) as usize;
-    }
+    let m = flagged(&st.flags, n, 0xFF, C_VALID | C_LONG, &mut list);
     if m == 0 {
         return;
     }
     let table = ctx.users.long.as_ref().unwrap_unchecked();
-    let mut value = [(0u64, 0u64); NB];
+    let mut value = [std::mem::MaybeUninit::<(u64, u64)>::uninit(); NB];
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
-        let (start, _) = fields(*st.sep.get_unchecked(i));
-        let a = (*st.p.get_unchecked(i)).add((start >> 8) as usize & 0xFF);
+        let a = user_at(*st.p.get_unchecked(i), *st.sep.get_unchecked(i));
         let (hex, hi, lo) = hex32(a.add(1));
         if !hex | (*a != b'u') | (hi == 0) | (lo == 0) {
             *st.flags.get_unchecked_mut(i) = C_DEAD;
             continue;
         }
         table.prefetch(hi, lo);
-        *value.get_unchecked_mut(k) = (hi, lo);
+        value.get_unchecked_mut(k).write((hi, lo));
     }
     for k in 0..m {
         let i = *list.get_unchecked(k) as usize;
         if *st.flags.get_unchecked(i) == C_DEAD {
             continue;
         }
-        let (hi, lo) = *value.get_unchecked(k);
+        let (hi, lo) = value.get_unchecked(k).assume_init_read();
         let key = ctx.users.long_key(hi, lo).unwrap_unchecked();
         *st.user.get_unchecked_mut(i) = key;
         *st.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
