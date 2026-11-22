@@ -23,7 +23,7 @@ bin="$1"; stage="$2"; first="${3:-1}"; count="${4:-8}"
 yard="${YARD:-dev9}"; mode="${SETTINGS:-v5}"
 case "$stage" in
   tools)
-    NAMES="longusers longevents longclicks windows longusers,longevents,longclicks windows,longusers,longevents,longclicks splitter,longevents clicksplit,longclicks" \
+    NAMES="${TOOLS:-longusers longevents longclicks windows grouping longlinks longlinks,longusers,grouping,endings longusers,longevents,longclicks windows,longusers,longevents,longclicks splitter,longevents clicksplit,longclicks}" \
       bash scripts/remote/gated.sh scripts/remote/selftest.sh "$yard" 2>&1 | cut -c1-300 ;;
   mut)
     SLOW_BIN="$yard" REF_EVERY=2 bash scripts/remote/gsteps.sh mut "$bin" "$mode" "$first" "$count" 3 ;;

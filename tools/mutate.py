@@ -2345,7 +2345,7 @@ def longlinks(D):
     L = Longs(R, [u[1:] for u in D.users if is_long(u, "u")])
     users = list(D.users)
     taken = D.all_users()
-    edges = [29, 30, 31, 31, 32, 32, 33, 33, 34, 35, 60, 61, 62, 62, 63, 63, 64, 64, 65, 65, 66]
+    edges = [29, 30, 31, 31, 32, 32, 33, 33, 34, 35, 60, 61, 62, 62, 62, 63, 63, 63, 64, 64, 64, 65, 65, 65, 66, 67]
 
     def put(a, b, qa=None, qb=None):
         qa = R.random() < 0.3 if qa is None else qa
@@ -2368,7 +2368,7 @@ def longlinks(D):
     made = 0
     # A user with rows and a new ID of a length that puts the comma, or the
     # newline, at an edge; quoted or not on either side.
-    for _ in range(max(120, len(users) // 6)):
+    for _ in range(max(500, len(users) // 2)):
         user = R.choice(users)
         r = R.random()
         if r < 0.25:
@@ -2408,7 +2408,7 @@ def longlinks(D):
     # Lines of exactly 30 to 34 bytes made of two IDs that are not long (the
     # short cut starts at a length), one of them a user with rows.
     short = 0
-    for _ in range(max(40, len(users) // 20)):
+    for _ in range(max(150, len(users) // 8)):
         user = R.choice(users)
         qa, qb = R.random() < 0.4, R.random() < 0.4
         size = R.choice([30, 31, 31, 32, 32, 33, 33, 34]) - 1 - len(user) - 2 * qa - 2 * qb

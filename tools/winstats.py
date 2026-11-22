@@ -59,6 +59,32 @@ def main():
         show("first comma at byte", first)
         show("from the first comma to the " + ("third" if folder == "events" else "second"), middle)
         show("from there to the newline", rest)
+    # Links: the comma's byte and the bytes from there to the newline, next
+    # to 32 (where a reader's short window ends) and next to 64.
+    path = os.path.join(data, "links")
+    comma, tail, lengths = [], [], []
+    other = lines = 0
+    for name in sorted(os.listdir(path)) if os.path.isdir(path) else []:
+        if not name.endswith(".csv"):
+            continue
+        with open(os.path.join(path, name), "rb") as f:
+            rows = f.read().split(b"\n")[1:]
+        if rows and rows[-1] == b"":
+            rows.pop()
+        for row in rows:
+            lines += 1
+            lengths.append(len(row))
+            at = [i for i, c in enumerate(row) if c == 0x2C]
+            if len(at) != 1:
+                other += 1
+                continue
+            comma.append(at[0])
+            tail.append(len(row) - at[0])
+    print(f"links: {lines} lines, {other} with another number of commas, {sum(1 for n in lengths if n >= 32)} of 32 bytes or more; "
+          "of exactly " + " ".join(f"{n}:{lengths.count(n)}" for n in range(29, 36)) + " bytes")
+    for name, values in (("comma at byte", comma), ("from the comma to the newline", tail)):
+        print(f"  {name}: " + " ".join(f"{v}:{values.count(v)}" for v in list(range(29, 37)) + list(range(60, 68)))
+              + f"; beyond 67: {sum(1 for v in values if v > 67)}; largest {max(values, default=0)}")
 
 
 if __name__ == "__main__":
