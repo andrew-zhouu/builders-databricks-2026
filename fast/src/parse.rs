@@ -1366,6 +1366,7 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
 /// A batch of click lines, for the same three loops as events (see "events,
 /// staged").
 #[repr(C, align(64))]
+#[derive(Clone, Copy)]
 struct ClickStage {
     p: [*const u8; NB],
     /// Bytes 0..4: the offsets of the line's three commas and its newline;
@@ -1536,7 +1537,7 @@ unsafe fn check_split_clicks(st: &ClickStage, data: &[u8], from: usize, to: usiz
 }
 
 macro_rules! clicks_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident, $batch:expr) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1595,7 +1596,7 @@ macro_rules! clicks_chunk_fn {
                 }
                 if n > 0 {
                     unsafe {
-                        click_decode(ctx, &mut st, n);
+                        $decode(ctx, &mut st, n);
                         click_emit(ctx, c, &st, n);
                         // The scalar path for what the stages could not decide.
                         if st.flags[..n].iter().fold(0, |a, &f| a | f) & C_DEAD != 0 {
@@ -1618,11 +1619,12 @@ macro_rules! clicks_chunk_fn {
         }
     };
 }
-clicks_chunk_fn!(clicks_chunk_base, split_click, false);
+clicks_chunk_fn!(clicks_chunk_base, split_click, click_decode, false);
 clicks_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     clicks_chunk_wide,
     split_click_wide,
+    wide::click_decode,
     true
 );
 

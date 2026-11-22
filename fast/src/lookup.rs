@@ -78,6 +78,13 @@ impl IdIndex {
         }
     }
 
+    /// The direct table itself: the value of the ID with number `n` at index
+    /// `n`, `ABSENT` where there is none (for a lookup of several at once).
+    #[inline]
+    pub fn direct(&self) -> &[u32] {
+        &self.direct
+    }
+
     /// Direct lookup by the number after the prefix (for the SIMD fast path).
     #[inline]
     pub fn by_number(&self, n: usize) -> u32 {
