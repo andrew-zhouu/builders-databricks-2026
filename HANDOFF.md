@@ -160,6 +160,37 @@ neighbouring pages, switching to reads if not (the idea behind the chunk experim
 above); threads pinned by hyperthread siblings; parallel release of memory at exit as
 ours.
 
+**08:00 UTC. v4 scored 0.6745 s** (the entry in the final as of then); **a probe of
+v4** (`09bce89`, branch `signal-v4`: the same build, sleeping a whole number of seconds
+at its end that says what the calibration found; `scripts/mksignal.sh`) **scored
+6.6902 s**: 6 = a processor without VBMI2 on which the 512-bit instance took 105% or
+more of the ordinary one's time, so v4 ran the base path there, as v2 did.
+
+Why, most likely (the SIMD fork's point): v4 timed base and wide in turn on 512 KB,
+0.3 to 0.6 ms a run. On Cascade Lake the first 512-bit instructions run at a fraction
+of their speed while the processor changes its clock, and the change lapses a few
+milliseconds after the last one: every timed wide run sat in a change-over. Even on
+this box the wide instance measures 56% of base when timed in a row and 68% in turn.
+
+**Candidate v5**, `37023b2caeeac3b0c363538e87a09cd46cbd2b8c` (`exp-v5`), gate `v5`
+started 08:00 UTC:
+
+* calibration: base three times in a row first; then each wide instance the processor
+  offers, three times in a row: the four-lane one first, a 512-bit one last and after
+  five unclocked runs; the fastest wins if it beats base by 5% (instance 2 counts 10%
+  more than it took: one core at the lower clock here, all of them in the run);
+* **parser instance 3** (SIMD fork; `parse/wide_quad.rs`, `parse/splitw_quad.rs`): the
+  wide decode and batch splitters with four lanes in 256-bit registers, EVEX
+  encodings, every multiplication on 128-bit halves: nothing in it lowers the clock
+  on Cascade Lake, so its gain over base on this box carries over. 20M 510 / 514
+  against 565 / 568 base (454 / 456 instance 2, 439 / 442 instance 1); 60M 1605 against
+  1758 (1430, 1389). `scripts/remote/quadcheck.sh` fails on a 512-bit register or a
+  256-bit multiplication in it; the gate runs `SS_SIMD=3` wherever it runs 2.
+* Probe of the 512-bit instance under the new timing, with the user:
+  `28246edb1e0d251fa4432b049437ba74e0c02f80` (`signal-v5`; scale: 1 to 17 s = its time
+  as a share of base in steps of 5% from "under 55%", 18 = a VBMI2 machine, 19 =
+  nothing tried). `SS_SIGNAL=3` (`mksignal.sh REV 3`) reports instance 3 instead.
+
 Measured and left alone after v3: marking the input mappings sequential (no change in
 the 13 ms the release of memory takes at the end: it is work per page, done by all
 threads, and still 8 ms better than leaving it to the exit); the campaign counters of
