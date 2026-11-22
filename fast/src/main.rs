@@ -106,9 +106,22 @@ pub struct Ctx {
     next_s: AtomicUsize,
     /// Person partitions, the ones with the most events first.
     s_order: std::sync::OnceLock<Vec<u32>>,
-    /// Trace partitions and person partitions.
+    /// Trace partitions and person partitions. The first `pd_x` trace
+    /// partitions are for event IDs by hash, the others for indexed ones by
+    /// index range (parse::Ix).
     pub pd: usize,
     pub ps: usize,
+    pub pd_x: usize,
+    /// Indexed event IDs: a partition holds `2^idx_pb` indexes, and an index
+    /// must be below `idx_bound`. The key is found by `find_key` (or given),
+    /// and until then no ID is indexed.
+    pub idx_pb: u32,
+    idx_bound: u64,
+    idx_identity: bool,
+    idx_key: std::sync::atomic::AtomicU64,
+    idx_on: AtomicBool,
+    idx_samples: Vec<u64>,
+    next_key: AtomicUsize,
     k: Vec<Shared<PartWriter>>,
     c: Vec<Shared<PartWriter>>,
     s: Vec<Shared<PartWriter>>,
@@ -144,6 +157,19 @@ impl Ctx {
         let cat_recs =
             products.categories.iter().map(|name| [&(name.len() as u32).to_le_bytes()[..], name].concat()).collect();
         unsafe { *self.lookups.0.get() = Some(Lookups { products, campaigns, cat_recs }) };
+    }
+
+    /// How event IDs become indexes, as it stands (settled before the events are parsed).
+    #[inline(always)]
+    pub fn index(&self) -> parse::Ix {
+        parse::Ix {
+            on: self.idx_on.load(Relaxed),
+            identity: self.idx_identity,
+            key: self.idx_key.load(Relaxed),
+            bound: self.idx_bound,
+            pb: self.idx_pb,
+            base: self.pd_x as u32,
+        }
     }
 
     #[inline(always)]
@@ -332,6 +358,40 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Find the key of the data's event IDs (ids.rs, "event indexes"), all threads
+/// together: the first sample ID is the event of some index below the bound,
+/// and each candidate index gives a key; the right one puts the other samples
+/// below the bound as well (a wrong one does that once in thousands of
+/// millions of tries, and would only cost time: any key numbers IDs one to
+/// one). No key, for data that is not the generator's, leaves the index off.
+fn find_key(ctx: &Ctx) {
+    const STEP: u64 = 1 << 16;
+    let z = &ctx.idx_samples;
+    if z.len() < 6 {
+        return;
+    }
+    loop {
+        if ctx.idx_on.load(Relaxed) {
+            return;
+        }
+        let from = ctx.next_key.fetch_add(STEP as usize, Relaxed) as u64;
+        if from >= ctx.idx_bound {
+            return;
+        }
+        // `index * M1` for each candidate index of the first sample, in turn.
+        let mut a = from.wrapping_mul(ids::M1) & ids::MASK40;
+        for _ in from..(from + STEP).min(ctx.idx_bound) {
+            let key = z[0] ^ a;
+            if ids::index_of(z[1], key) < ctx.idx_bound && z[2..].iter().all(|&s| ids::index_of(s, key) < ctx.idx_bound) {
+                ctx.idx_key.store(key, Relaxed);
+                ctx.idx_on.store(true, Relaxed);
+                return;
+            }
+            a = (a + ids::M1) & ids::MASK40;
+        }
+    }
+}
+
 fn worker(ctx: &Ctx, tid: usize) {
     // Per-thread partition writers, built here so their memory is first touched
     // by the thread that uses it and the allocations run in parallel.
@@ -341,6 +401,7 @@ fn worker(ctx: &Ctx, tid: usize) {
         *ctx.s[tid].0.get() = PartWriter::new(ctx.ps);
         *ctx.psw[tid].0.get() = PartWriter::new(ctx.ps);
     }
+    find_key(ctx);
     if tid == 0 {
         ctx.load_lookups();
     }
@@ -357,6 +418,18 @@ fn worker(ctx: &Ctx, tid: usize) {
     ctx.sync("links parsed");
     if ctx.failed() {
         return;
+    }
+    if tid == 0 && ctx.timing {
+        let ix = ctx.index();
+        eprintln!(
+            "              event IDs indexed: {} (key {:x}, bound {}, {} + {} trace partitions of 2^{})",
+            ix.on,
+            ix.key,
+            ix.bound,
+            ctx.pd_x,
+            ctx.pd - ctx.pd_x,
+            ix.pb
+        );
     }
     let t = ctx.now();
     loop {
@@ -411,7 +484,11 @@ fn worker(ctx: &Ctx, tid: usize) {
             if p >= ctx.pd {
                 break;
             }
-            pass2::run(ctx, &mut sc, x, s, p);
+            if p < ctx.pd_x {
+                pass2::run(ctx, &mut sc, x, s, p);
+            } else {
+                pass2::run_indexed(ctx, &mut sc, x, s, p);
+            }
         }
         s.finalize(&ctx.pool);
         x.finish(ctx.ps);
@@ -963,7 +1040,35 @@ fn main() {
     // pass 2 stay in the first-level cache; but never so many that a thread's
     // write-combining lines (64 bytes per partition) crowd its L2.
     let pd_bytes: usize = std::env::var("SS_PD_BYTES").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(2_400_000);
-    let pd = (events_bytes / pd_bytes).next_power_of_two().clamp(1, 4096);
+    let pd_x = (events_bytes / pd_bytes).next_power_of_two().clamp(1, 4096);
+    // Indexed event IDs (parse::Ix). The bound is a guess at the number of
+    // events from the size of the input: an index beyond it is not indexed,
+    // which costs time and nothing else. Switches for tests: SS_INDEX=0 (no ID
+    // is indexed), SS_INDEX_KEY (hexadecimal: this key, no search),
+    // SS_INDEX_BOUND, SS_INDEX_IDENTITY=1 (an ID's index is its number).
+    let idx_allowed = !std::env::var("SS_INDEX").is_ok_and(|v| v == "0");
+    let idx_identity = std::env::var("SS_INDEX_IDENTITY").is_ok_and(|v| v == "1");
+    let idx_forced_key = std::env::var("SS_INDEX_KEY").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+    let idx_bound: u64 = std::env::var("SS_INDEX_BOUND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or((events_bytes / 64) as u64)
+        .clamp(1, ids::MASK40 + 1);
+    // A partition number has 16 bits in the parser's batches.
+    let mut idx_pb: u32 = std::env::var("SS_INDEX_PB").ok().and_then(|v| v.parse().ok()).filter(|n| (8..=18).contains(n)).unwrap_or(15);
+    while (idx_bound >> idx_pb) + pd_x as u64 + 1 > 60_000 {
+        idx_pb += 1;
+    }
+    let mut idx_samples: Vec<u64> = Vec::new();
+    if idx_allowed && !idx_identity && idx_forced_key.is_none() {
+        if let Some(&(_, file)) = event_files.iter().max_by_key(|&&(_, f)| files[f as usize].len) {
+            idx_samples = parse::sample_ids(files[file as usize].slice());
+        }
+    }
+    let idx_known = idx_identity || idx_forced_key.is_some();
+    let idx_possible = idx_allowed && idx_pb <= 18 && (idx_known || idx_samples.len() >= 6);
+    let pd_i = if idx_possible { ((idx_bound + (1 << idx_pb) - 1) >> idx_pb) as usize } else { 0 };
+    let pd = pd_x + pd_i;
     // A trace holds the position of its line among all event bytes; the rest
     // of the word is the fingerprint of the event ID.
     let loc_bits = (64 - (events_bytes.max(2) as u64 - 1).leading_zeros()).max(1);
@@ -1030,6 +1135,14 @@ fn main() {
         s_order: std::sync::OnceLock::new(),
         pd,
         ps,
+        pd_x,
+        idx_pb,
+        idx_bound,
+        idx_identity,
+        idx_key: std::sync::atomic::AtomicU64::new(idx_forced_key.unwrap_or(0) & ids::MASK40),
+        idx_on: AtomicBool::new(idx_possible && idx_known),
+        idx_samples: if idx_possible { idx_samples } else { Vec::new() },
+        next_key: AtomicUsize::new(0),
         k: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         c: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),
         s: (0..nthreads).map(|_| Shared::new(PartWriter::new(0))).collect(),

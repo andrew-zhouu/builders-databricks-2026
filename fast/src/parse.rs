@@ -25,7 +25,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::ids::{event_hash, hash9, raw_key_fast};
+use crate::ids::{base36_id, event_hash, hash9, index_of, raw_key_fast, unmix, MASK40};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
@@ -79,7 +79,106 @@ pub struct EventOut<'a> {
 /// The trace partition and the trace word (without the position) of an event-ID hash.
 #[inline(always)]
 pub fn trace_of(ctx: &Ctx, h: u64) -> (usize, u64) {
-    ((((h >> 32) * ctx.pd as u64) >> 32) as usize, (h & ctx.fp_mask) << ctx.loc_bits)
+    ((((h >> 32) * ctx.pd_x as u64) >> 32) as usize, (h & ctx.fp_mask) << ctx.loc_bits)
+}
+
+/// How event IDs become indexes in this run (see ids.rs, "event indexes"). An
+/// ID is *indexed* when it is canonical and its number, un-scrambled with
+/// `key`, is below `bound`: its trace then goes to partition
+/// `base + (index >> pb)` and carries the index's low `pb` bits where other
+/// traces carry a fingerprint. Whether an ID is indexed depends only on the ID,
+/// so all copies of an event take the same road.
+#[derive(Clone, Copy)]
+pub struct Ix {
+    pub on: bool,
+    /// Test switch: the index is the ID's number itself.
+    pub identity: bool,
+    pub key: u64,
+    pub bound: u64,
+    pub pb: u32,
+    pub base: u32,
+}
+
+impl Ix {
+    #[inline(always)]
+    fn index(&self, y: u64) -> u64 {
+        if self.identity {
+            y
+        } else {
+            index_of(unmix(y), self.key)
+        }
+    }
+
+    /// The index of an event ID, if it is an indexed one. (The scalar twin of `index36`.)
+    pub fn of(&self, id: &[u8]) -> Option<u64> {
+        if !self.on {
+            return None;
+        }
+        let v = self.index(base36_id(id, b'e')?);
+        (v < self.bound).then_some(v)
+    }
+
+    /// The trace partition and trace word (without the position) of index `v`.
+    #[inline(always)]
+    pub fn trace(&self, v: u64, loc_bits: u32) -> (usize, u64) {
+        (self.base as usize + (v >> self.pb) as usize, (v & ((1 << self.pb) - 1)) << loc_bits)
+    }
+}
+
+/// For finding the key: `unmix` of the numbers of up to 12 different event IDs
+/// of the indexed shape, from the first lines of an events file.
+pub fn sample_ids(data: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let Some(header) = find_newline(data, 0) else { return out };
+    let (mut pos, mut lines) = (header + 1, 0);
+    while pos < data.len() && lines < 4096 && out.len() < 12 {
+        let end = find_newline(data, pos).unwrap_or(data.len());
+        let line = &data[pos..end];
+        let mut id = &line[..line.iter().position(|&c| c == b',').unwrap_or(line.len())];
+        if id.len() >= 2 && id[0] == b'"' && id[id.len() - 1] == b'"' {
+            id = &id[1..id.len() - 1];
+        }
+        if let Some(y) = base36_id(id, b'e') {
+            let z = unmix(y);
+            if !out.contains(&z) {
+                out.push(z);
+            }
+        }
+        pos = end + 1;
+        lines += 1;
+    }
+    out
+}
+
+/// `Ix::of` for an ID of `n0` bytes whose first byte is `first` and whose
+/// other bytes are `x` (little-endian, zero beyond them): (indexed, index).
+#[inline(always)]
+unsafe fn index36(first: u8, x: u64, n0: u64, ix: &Ix) -> (bool, u64) {
+    let n = n0.wrapping_sub(1) as u32;
+    // Digit values: '0'..'9' are 0..9, 'a'..'z' are 10..35; any other byte
+    // (the zeros past the ID among them) gives 0 and is not a digit.
+    let c = _mm_cvtsi64_si128(x as i64);
+    let dd = _mm_sub_epi8(c, _mm_set1_epi8(b'0' as i8));
+    let da = _mm_sub_epi8(c, _mm_set1_epi8(b'a' as i8));
+    let is_d = _mm_cmpeq_epi8(_mm_min_epu8(dd, _mm_set1_epi8(9)), dd);
+    let is_a = _mm_cmpeq_epi8(_mm_min_epu8(da, _mm_set1_epi8(25)), da);
+    let d = _mm_or_si128(_mm_and_si128(dd, is_d), _mm_and_si128(_mm_add_epi8(da, _mm_set1_epi8(10)), is_a));
+    let digit_bytes = _mm_movemask_epi8(_mm_or_si128(is_d, is_a)) as u32;
+    let need = 1u32.wrapping_shl(n).wrapping_sub(1) & 0xFF;
+    // Most significant digit first: move the last digit to the top byte, so
+    // that the missing leading ones are zeros, and add up in base 36 by pairs.
+    let digits = (_mm_cvtsi128_si64(d) as u64).wrapping_shl(64u32.wrapping_sub(8 * n));
+    let pairs = _mm_maddubs_epi16(_mm_cvtsi64_si128(digits as i64), _mm_set1_epi16(0x0124)); // bytes 36, 1
+    let fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510)); // words 1296, 1
+    let q = _mm_cvtsi128_si64(fours) as u64;
+    let y = (q & 0xFFFF_FFFF) * 1_679_616 + (q >> 32);
+    let canonical = (n0.wrapping_sub(2) < 8)
+        & (first == b'e')
+        & (digit_bytes & need == need)
+        & ((x as u8 != b'0') | (n == 1))
+        & (y <= MASK40);
+    let v = ix.index(y);
+    (canonical & (v < ix.bound), v)
 }
 
 // ------------------------------------------------------------------ dates
@@ -496,12 +595,22 @@ pub fn event_records(ctx: &Ctx, e: &Event) -> (usize, u64, u64) {
 #[inline(never)]
 fn event_line(ctx: &Ctx, out: &mut EventOut, line: &[u8], loc: u64) {
     let Some(e) = parse_event(ctx, line) else { return };
-    let h = event_hash(e.id);
-    let (pk, trace) = trace_of(ctx, h);
+    let ix = ctx.index();
+    let (pk, trace, h4) = match ix.of(e.id) {
+        Some(v) => {
+            let (pk, trace) = ix.trace(v, ctx.loc_bits);
+            (pk, trace, 0)
+        }
+        None => {
+            let h = event_hash(e.id);
+            let (pk, trace) = trace_of(ctx, h);
+            (pk, trace, h >> 40)
+        }
+    };
     let mut w2 = 0;
     if e.valid {
         let (sp, rec, extra) = event_records(ctx, &e);
-        w2 = trace_valid(h >> 40, (sp as u64) << LOCAL_BITS | rec >> 31, rec & TS_MASK);
+        w2 = trace_valid(h4, (sp as u64) << LOCAL_BITS | rec >> 31, rec & TS_MASK);
         if e.purchase {
             out.ps.push2(&ctx.pool, sp, rec, extra);
             w2 |= T_PURCHASE;
@@ -695,6 +804,10 @@ struct Stage {
     /// `price << 32 | category`, with `F_PURCHASE`.
     extra: [u64; NB],
     pk: [u32; NB],
+    /// The event_id's bytes after the first (up to 8, zero-padded), and its
+    /// first byte and length.
+    id_rest: [u64; NB],
+    id_head: [[u8; 2]; NB],
     /// The user's home slot in the user table (prefetched).
     home: [u32; NB],
     /// `ts - t0`, meaningful with `F_VALID`.
@@ -716,6 +829,8 @@ impl Stage {
             key: [0; NB],
             extra: [0; NB],
             pk: [0; NB],
+            id_rest: [0; NB],
+            id_head: [[0; 2]; NB],
             home: [0; NB],
             ts: [0; NB],
             flags: [0; NB],
@@ -859,12 +974,11 @@ unsafe fn event_ts(dt: &DateTab, a: *const u8, n: usize) -> (bool, bool, i64) {
 /// integers that are zero when all is well and OR-ed together, so that a line
 /// costs a handful of tests, not one per rule.
 #[inline(never)]
-unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
+unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize) -> usize {
     const LOW: u64 = 0x0101_0101_0101_0101;
     const HIGH: u64 = 0x8080_8080_8080_8080;
     let dt = &ctx.dates;
     let (ws, t0, span) = (ctx.ws, ctx.t0, (ctx.we - ctx.ws) as u64);
-    let (pd, fp_mask, loc_bits) = (ctx.pd as u64, ctx.fp_mask, ctx.loc_bits);
     let (first_day_ms, last_day) = (dt.first_day_ms, dt.day_text.len() as u64 - 1);
     let day_text = dt.day_text.as_ptr();
     let mut nmore = 0usize;
@@ -880,14 +994,12 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         let at = |k: usize| p.add(sl.add(k).read_volatile() as usize);
         let ln = |k: usize| sl.add(8 + k).read_volatile() as u64;
 
-        // The trace: a hash of the event_id's bytes after the first (1 to 9
-        // bytes in all; see ids::event_hash).
+        // The event_id: its first byte, and the bytes after it (up to 8; a
+        // longer ID is for the scalar path). `stage_ids` makes the trace.
         let n0 = ln(0);
         let a0 = at(0);
-        let x = _bzhi_u64((a0.add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
-        let h = hash9(*a0, x);
-        *st.pk.get_unchecked_mut(i) = (((h >> 32) * pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16;
-        *st.trace.get_unchecked_mut(i) = (h & fp_mask) << loc_bits | loc0.wrapping_add(p as u64);
+        *st.id_rest.get_unchecked_mut(i) = _bzhi_u64((a0.add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
+        *st.id_head.get_unchecked_mut(i) = [*a0, n0 as u8];
 
         // The user: `u` and 1 to 8 ASCII bytes, none of them NUL, is its own
         // key (ids::raw_key). `user_bad` is zero for those.
@@ -947,6 +1059,29 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         nmore += (ingest | purchase) as usize;
     }
     nmore
+}
+
+/// The batch's traces from its event IDs: for an indexed ID (see `Ix`) its
+/// place among all events, for any other a hash. A loop of its own: decoding
+/// an index is a long chain of operations, cheap in the number of them, and
+/// in a short loop the chains of several lines overlap; inside `decode`,
+/// whose own chains fill the processor's window, each costs its full length.
+#[inline(never)]
+unsafe fn stage_ids(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) {
+    let (pd, fp_mask, loc_bits) = (ctx.pd_x as u64, ctx.fp_mask, ctx.loc_bits);
+    let ix = ctx.index();
+    let low = (1u64 << ix.pb) - 1;
+    for i in 0..n {
+        let x = *st.id_rest.get_unchecked(i);
+        let [first, n0] = *st.id_head.get_unchecked(i);
+        let loc = loc0.wrapping_add(*st.p.get_unchecked(i) as u64);
+        let (indexed, v) = if ix.on { index36(first, x, n0 as u64, &ix) } else { (false, 0) };
+        let h = hash9(first, x);
+        let by_hash = ((((h >> 32) * pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16, (h & fp_mask) << loc_bits);
+        let (pk, trace) = if indexed { (ix.base + (v >> ix.pb) as u32, (v & low) << loc_bits) } else { by_hash };
+        *st.pk.get_unchecked_mut(i) = pk;
+        *st.trace.get_unchecked_mut(i) = trace | loc;
+    }
 }
 
 /// The rest of validation for the lines `decode` listed: the lateness rule by
@@ -1048,8 +1183,9 @@ pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
         }
         if n > 0 {
             unsafe {
-                let nmore = stage_decode(ctx, &mut st, n, loc0);
+                let nmore = stage_decode(ctx, &mut st, n);
                 stage_more(ctx, &mut st, nmore);
+                stage_ids(ctx, &mut st, n, loc0);
                 stage_emit(ctx, out, &st, n);
                 // The scalar path for what the stages could not decide.
                 if st.flags[..n].iter().fold(0, |a, &f| a | f) & F_DEAD != 0 {

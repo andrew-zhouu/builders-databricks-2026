@@ -1,9 +1,10 @@
 //! Pass 3: one person partition -> sessions, attribution, and output rows.
 //!
-//! A partition holds the people whose user-table slot falls in one 4096-slot
-//! range, so a person is a 12-bit local index. Events are bucketed by person
-//! with a counting sort (two passes straight over the partition's blocks), then
-//! each person's timestamps are sorted on their own.
+//! A partition holds the people whose user-table slot falls in one range of
+//! `2^LOCAL_BITS` slots, so a person is a local index. Pass 2 hands a person's
+//! events on as intervals (runs of events no more than 30 minutes apart: first
+//! time, last time, count); here they are ordered by person and first time
+//! and joined into sessions.
 
 use crate::parse::{CAMPAIGN_BITS, CANCEL, CLICK_SHIFT, LOCAL_BITS, TS_MASK};
 use crate::util::{DAY_MS, GAP_MS, REACH_MS};
@@ -94,10 +95,8 @@ const SLOTS: usize = 1 << (31 - SLOT_SHIFT);
 const _: () = assert!((1u32 << SLOT_SHIFT) <= GAP_MS);
 
 pub struct Scratch {
-    /// `start[l]..start[l + 1]` are the events of person `l` in the sorted buffer.
-    start: Vec<u32>,
-    /// Radix sort buffers and histograms (slots, then persons).
-    a: Vec<u64>,
+    /// The partition's intervals; a buffer and a histogram for sorting.
+    iv: Vec<u64>,
     b: Vec<u64>,
     h: Vec<u32>,
     pu: Vec<u64>,
@@ -112,8 +111,8 @@ pub struct Scratch {
     touched: Vec<u32>,
     /// Scratch space for a person's purchases once the cancelled ones are removed.
     kept_pu: Vec<[u64; 2]>,
-    /// The partition's people who have events.
-    present: Vec<u16>,
+    /// Where each person's intervals start in the sorted buffer.
+    present: Vec<u32>,
     pub rows: Rows,
     pub acc: CampAcc,
 }
@@ -121,10 +120,9 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(ctx: &Ctx) -> Scratch {
         Scratch {
-            start: vec![0; LOCALS + 1],
-            a: Vec::new(),
+            iv: Vec::new(),
             b: Vec::new(),
-            h: vec![0; SLOTS + LOCALS],
+            h: vec![0; LOCALS],
             pu: Vec::new(),
             cl: Vec::new(),
             tmp: Vec::new(),
@@ -245,52 +243,14 @@ unsafe fn scatter(src: &[u64], dst: *mut u64, cursor: &mut [u32], shift: u32, ma
 
 pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
     let t0 = ctx.now();
-    // Group the partition's events by person and, within a person, by time
-    // slot: a two-pass LSD radix sort on `slot(11)` then `person(12)`. A full
-    // sort by timestamp is not needed: two events in one slot are less than
-    // 30 minutes apart (a slot is narrower than that), so a session can only
-    // break between slots, and whether it does depends only on the latest
-    // timestamp of one slot and the earliest of the next (see `person`).
-    // Histograms are taken while gathering.
-    sc.h.iter_mut().for_each(|c| *c = 0);
-    sc.a.clear();
-    {
-        let (hs, hp) = sc.h.split_at_mut(SLOTS);
-        let a = &mut sc.a;
-        for t in 0..ctx.nthreads {
-            let s = ctx.s(t);
-            a.reserve(s.part_words(p));
-            s.for_each_run(&ctx.pool, p, |run| unsafe {
-                let mut at = a.as_mut_ptr().add(a.len());
-                for &w in run {
-                    *hs.get_unchecked_mut((w >> SLOT_SHIFT) as usize & (SLOTS - 1)) += 1;
-                    *hp.get_unchecked_mut((w >> 31) as usize & (LOCALS - 1)) += 1;
-                    *at = w;
-                    at = at.add(1);
-                }
-                a.set_len(at.offset_from(a.as_ptr()) as usize);
-            });
-        }
-        let total = a.len();
-        if total == 0 {
-            return;
-        }
-        prefix(hs);
-        // Person boundaries come from the second histogram.
-        let mut at = 0u32;
-        for l in 0..LOCALS {
-            sc.start[l] = at;
-            at += hp[l];
-            hp[l] = sc.start[l];
-        }
-        sc.start[LOCALS] = at;
-        sc.b.clear();
-        sc.b.reserve(total);
-        unsafe {
-            sc.b.set_len(total);
-            scatter(a, sc.b.as_mut_ptr(), hs, SLOT_SHIFT, SLOTS as u64 - 1);
-            scatter(&sc.b, a.as_mut_ptr(), hp, 31, LOCALS as u64 - 1);
-        }
+    // The partition's intervals (two words each: `person_local | first`,
+    // `count | last`), purchases and clicks, from every thread's writers.
+    sc.iv.clear();
+    for t in 0..ctx.nthreads {
+        ctx.s(t).copy_part(&ctx.pool, p, &mut sc.iv);
+    }
+    if sc.iv.is_empty() {
+        return;
     }
     sc.pu.clear();
     sc.cl.clear();
@@ -301,52 +261,57 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
         }
         ctx.c(t).copy_part(&ctx.pool, p, &mut sc.cl);
     }
-    let t0 = ctx.charge_rows(crate::P_S_GATHER, t0, sc.a.len());
+    let n = sc.iv.len() / 2;
+    let t0 = ctx.charge_rows(crate::P_S_GATHER, t0, n);
 
     {
-        // At most one row per event (see `flush_day`).
-        let (r, n) = (&mut sc.rows, sc.a.len());
+        // At most one row per interval (see `flush_day`).
+        let r = &mut sc.rows;
         r.day.reserve(n);
         r.sessions.reserve(n);
         r.events.reserve(n);
         r.revenue.reserve(n);
         r.id_idx.reserve(n);
     }
-    let ts = std::mem::take(&mut sc.a);
+    let mut iv = std::mem::take(&mut sc.iv);
     let mut pu = std::mem::take(&mut sc.pu);
     let mut cl = std::mem::take(&mut sc.cl);
     let mut kept_pu = std::mem::take(&mut sc.kept_pu);
-    // Purchases by (person, ts), a person's cancellations after their
-    // purchases; clicks by (person, ts, campaign).
+    // Intervals by (person, first time); purchases by (person, ts), a
+    // person's cancellations after their purchases; clicks by (person, ts,
+    // campaign).
+    sort_pairs(&mut iv, &mut sc.b, &mut sc.h, 31);
     sort_pairs(&mut pu, &mut sc.b, &mut sc.h, 31);
     sort_pairs(&mut cl, &mut sc.b, &mut sc.h, CLICK_SHIFT);
     {
+        let iv = pairs(&mut iv);
         let pu = pairs(&mut pu);
         let cl = pairs(&mut cl);
-        let mut t0 = ctx.charge_rows(crate::P_S_SORT, t0, pu.len() + cl.len());
+        let t0 = ctx.charge_rows(crate::P_S_SORT, t0, iv.len() + pu.len() + cl.len());
         let (mut pi, mut ci) = (0, 0);
-        // The people with events, so that the walk has no hard-to-predict
-        // skip, and so that each one's name (a slot of the user table, far
-        // from any cache) can be asked for a few people ahead.
+        // Where each person's intervals start, so that the walk can ask for a
+        // person's name (a slot of the user table, far from any cache) a few
+        // people ahead.
+        let local_of = |r: &[u64; 2]| (r[0] >> 31) as usize & (LOCALS - 1);
         let mut present = std::mem::take(&mut sc.present);
         present.clear();
-        present.reserve(LOCALS + PEOPLE_AHEAD);
-        unsafe {
-            let mut n = 0;
-            for local in 0..LOCALS {
-                *present.as_mut_ptr().add(n) = local as u16;
-                n += (sc.start[local] != sc.start[local + 1]) as usize;
+        let mut before = usize::MAX;
+        for (at, r) in iv.iter().enumerate() {
+            let local = local_of(r);
+            if local != before {
+                present.push(at as u32);
+                before = local;
             }
-            present.set_len(n);
         }
+        let people = present.len();
+        present.push(iv.len() as u32);
         let base = (p << LOCAL_BITS) as u32;
-        for at in 0..present.len() {
-            if let Some(&next) = present.get(at + PEOPLE_AHEAD) {
-                ctx.table.prefetch_slot(base | next as u32);
+        for at in 0..people {
+            if at + PEOPLE_AHEAD < people {
+                ctx.table.prefetch_slot(base | local_of(&iv[present[at + PEOPLE_AHEAD] as usize]) as u32);
             }
-            let local = present[at] as usize;
-            let (from, to) = (sc.start[local] as usize, sc.start[local + 1] as usize);
-            let events = &ts[from..to];
+            let intervals = &iv[present[at] as usize..present[at + 1] as usize];
+            let local = local_of(&intervals[0]);
             // Skip the records of people without events: someone whose events
             // were all cancelled still has their (cancelled) purchases here.
             while pi < pu.len() && ((pu[pi][0] >> 31) as usize & (LOCALS - 1)) < local {
@@ -373,13 +338,12 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, p: usize) {
                 apply_purchase_cancels(purchases, &mut kept_pu);
                 purchases = &kept_pu;
             }
-            person(ctx, sc, base | local as u32, events, purchases, clicks);
+            person(ctx, sc, base | local as u32, intervals, purchases, clicks);
         }
         sc.present = present;
-        t0 = ctx.charge_rows(crate::P_S_PEOPLE, t0, ts.len());
-        let _ = t0;
+        ctx.charge_rows(crate::P_S_PEOPLE, t0, n);
     }
-    sc.a = ts;
+    sc.iv = iv;
     sc.pu = pu;
     sc.cl = cl;
     sc.kept_pu = kept_pu;
@@ -399,29 +363,7 @@ fn apply_purchase_cancels(records: &[[u64; 2]], kept: &mut Vec<[u64; 2]>) {
     }
 }
 
-/// The earliest and latest timestamp of the run of events that starts at `i`
-/// and shares one time slot, and the index after the run. All of `ev` belongs
-/// to one person, so equal bits above the slot shift mean an equal slot.
-#[inline(always)]
-fn slot_group(ev: &[u64], i: usize) -> (u32, u32, usize) {
-    debug_assert!(i < ev.len());
-    unsafe {
-        let first = *ev.get_unchecked(i);
-        let slot = first >> SLOT_SHIFT;
-        let t = (first & TS_MASK) as u32;
-        let (mut min, mut max) = (t, t);
-        let mut j = i + 1;
-        while j < ev.len() && *ev.get_unchecked(j) >> SLOT_SHIFT == slot {
-            let t = (*ev.get_unchecked(j) & TS_MASK) as u32;
-            min = min.min(t);
-            max = max.max(t);
-            j += 1;
-        }
-        (min, max, j)
-    }
-}
-
-fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
+fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[[u64; 2]], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
     // The person's name, once: the next entry of the user_id dictionary.
     let key = ctx.table.key(slot);
     {
@@ -457,26 +399,28 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
     let (mut lo, mut hi, mut pk) = (0usize, 0usize, 0usize);
     let mut cur_day = u32::MAX;
     let (mut d_sessions, mut d_events, mut d_revenue) = (0i32, 0i32, 0i64);
-    // Sessions: `ev` is ordered by slot, and slots are in time order, so the
-    // event before a slot's earliest one is the previous slot's latest one. A
-    // session runs on through the slots for as long as that gap is at most 30
-    // minutes; it starts at its first slot's earliest timestamp.
-    let mut group = slot_group(ev, 0);
+    // Sessions: `ev` holds the person's intervals in order of their first
+    // time; each is a run of events no more than 30 minutes apart. A session
+    // is a chain of intervals in which each starts no later than 30 minutes
+    // after the latest time so far (it may start before that time: intervals
+    // from different parts of the input can overlap). It ends where the next
+    // interval starts later than that: all intervals after it do too.
     let mut k = 0;
     loop {
-        let start = group.0;
-        let mut last = group.1;
-        let mut m = group.2;
-        let mut more = false;
+        let start = (ev[k][0] & TS_MASK) as u32;
+        let mut last = (ev[k][1] & TS_MASK) as u32;
+        let mut events = (ev[k][1] >> 31) as i32;
+        let mut m = k + 1;
         while m < n {
-            group = slot_group(ev, m);
-            if group.0 - last > GAP_MS {
-                more = true;
+            let first = (ev[m][0] & TS_MASK) as u32;
+            if first > last && first - last > GAP_MS {
                 break;
             }
-            last = group.1;
-            m = group.2;
+            last = last.max((ev[m][1] & TS_MASK) as u32);
+            events += (ev[m][1] >> 31) as i32;
+            m += 1;
         }
+        let more = m < n;
         let day = ((start as u64 + ctx.day_off) / DAY_MS as u64) as u32;
         if day != cur_day {
             if cur_day != u32::MAX {
@@ -504,7 +448,7 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
             pk += 1;
         }
         d_sessions += 1;
-        d_events += (m - k) as i32;
+        d_events += events;
         d_revenue += revenue as i64;
 
         // Credit: the latest click in [start - 7 days, start]; ties to the smallest click_id.

@@ -113,6 +113,78 @@ fn finish(mut h: u64) -> u64 {
     h ^ (h >> 32)
 }
 
+// ---------------------------------------------------------------- event indexes
+//
+// The generator numbers its events 0, 1, 2, ... (one user's events after
+// another's, each user's in time order) and writes the ID of event number v as
+// `e` + base 36 of `scramble(v, key)`: a bijection on 40-bit numbers, with a key
+// per data set. Read backwards, an event ID of that shape names a number, and
+// IDs and numbers correspond one to one whatever the key: sorting events by
+// that number is exact for any input, and for generated input it puts each
+// user's events together in time order.
+
+pub const MASK40: u64 = (1 << 40) - 1;
+pub const M1: u64 = 0x9E37_79B9_7F4B;
+const M2: u64 = 0xD6E8_FEB8_6659;
+
+/// The inverse of an odd number modulo 2^40 (Newton's iteration doubles the
+/// number of correct low bits each time; an odd number is its own inverse
+/// modulo 8).
+const fn inverse(a: u64) -> u64 {
+    let mut x = a;
+    let mut i = 0;
+    while i < 5 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        i += 1;
+    }
+    x & MASK40
+}
+pub const M1_INV: u64 = inverse(M1);
+const M2_INV: u64 = inverse(M2);
+const _: () = assert!(M1.wrapping_mul(M1_INV) & MASK40 == 1 && M2.wrapping_mul(M2_INV) & MASK40 == 1);
+
+/// `scramble(v, key)` of the generator.
+pub fn scramble(v: u64, key: u64) -> u64 {
+    let mut m = (v & MASK40).wrapping_mul(M1) ^ key;
+    m &= MASK40;
+    m ^= m >> 17;
+    m.wrapping_mul(M2) & MASK40
+}
+
+/// The scramble's last two steps undone: `(v * M1) ^ key`, 40 bits, from the
+/// scrambled number `y`.
+#[inline(always)]
+pub fn unmix(y: u64) -> u64 {
+    let t = y.wrapping_mul(M2_INV) & MASK40;
+    t ^ (t >> 17) ^ (t >> 34)
+}
+
+/// The number `v` from `unmix(scramble(v, key))` and the key.
+#[inline(always)]
+pub fn index_of(z: u64, key: u64) -> u64 {
+    (z ^ key).wrapping_mul(M1_INV) & MASK40
+}
+
+/// The number that an ID stands for if it is `prefix` followed by a canonical
+/// lowercase base-36 number below 2^40 (1 to 8 digits, no leading zero unless
+/// the number is 0). Such IDs and numbers correspond one to one.
+pub fn base36_id(b: &[u8], prefix: u8) -> Option<u64> {
+    let n = b.len();
+    if !(2..=9).contains(&n) || b[0] != prefix || (n > 2 && b[1] == b'0') {
+        return None;
+    }
+    let mut v = 0u64;
+    for &c in &b[1..] {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'z' => c - b'a' + 10,
+            _ => return None,
+        };
+        v = v * 36 + d as u64;
+    }
+    (v <= MASK40).then_some(v)
+}
+
 /// Interns irregular IDs. Rare by construction, so one lock is fine.
 pub struct Dict {
     inner: Mutex<(HashMap<Box<[u8]>, u32>, Vec<Box<[u8]>>)>,
