@@ -5,7 +5,7 @@
 # Usage: hotasm.sh START_HEX STOP_HEX [MIN_PERCENT_TO_MARK]
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/env.sh"
 cd "$PROJ"
-PBIN="$PROJ/.toolchain/prof-target/x86_64-unknown-linux-musl/release/sessions"
+PBIN="$PROJ/out/prof-target/x86_64-unknown-linux-musl/release/sessions"
 objdump -d --no-show-raw-insn -C --start-address="0x$1" --stop-address="0x$2" "$PBIN" > /tmp/ss-hotasm.txt
 python3 -I - "${3:-0.05}" <<'EOF'
 import sys, re

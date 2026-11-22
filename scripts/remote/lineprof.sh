@@ -5,8 +5,8 @@
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/env.sh"
 cd "$PROJ"
 name="${1:-m20}"; top="${2:-60}"; filter="${3:-.}"
-(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/.toolchain/prof-target" 2>&1 | grep -E '^error' -A8)
-PBIN="$PROJ/.toolchain/prof-target/x86_64-unknown-linux-musl/release/sessions"
+(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/out/prof-target" 2>&1 | grep -E '^error' -A8)
+PBIN="$PROJ/out/prof-target/x86_64-unknown-linux-musl/release/sessions"
 out=/tmp/ss-lineprof; sudo rm -rf "$out"; mkdir -p "$out"
 cat data/"$name"/*/*.csv > /dev/null
 sudo perf record -q -F 2999 -a -o /tmp/ss-line.data -- env NCPU=8 ${RUN_ENV:-} "$PBIN" "data/$name" "$out" 2>/dev/null

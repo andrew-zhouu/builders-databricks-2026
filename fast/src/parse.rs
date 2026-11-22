@@ -32,6 +32,7 @@ use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline,
 use crate::{Chunk, Ctx};
 
 pub mod splitw;
+mod wide;
 
 pub const PERSON_BITS: u32 = 27;
 pub const TS_MASK: u64 = (1 << 31) - 1;
@@ -281,6 +282,44 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
             | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c)) as u32 as u64) << 32
     };
     (m(b','), m(b'\n'), m(b'"'))
+}
+
+/// `masks64` on a processor with AVX-512: one 64-byte register, three compares
+/// straight into mask registers.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[inline]
+unsafe fn masks64_wide(p: *const u8) -> (u64, u64, u64) {
+    let v = _mm512_loadu_si512(p as *const __m512i);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+
+/// Whether this processor takes the wide path: AVX-512 with VBMI2, which
+/// means Ice Lake or newer. (Skylake and Cascade Lake have AVX-512 as well,
+/// but lower their clock when it is used; they keep the AVX2 path, as does
+/// everything older.) The code of the wide path is reached through this test
+/// and nowhere else. SS_SIMD=0 turns the wide path off.
+pub fn wide() -> bool {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WIDE.get_or_init(|| {
+        !std::env::var("SS_SIMD").is_ok_and(|v| v == "0")
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("avx512vbmi")
+            && is_x86_feature_detected!("avx512vbmi2")
+    })
+}
+
+/// SS_SIMD_CHECK=1: the wide path also runs the ordinary one on every batch
+/// and stops at the first line on which the two disagree.
+fn wide_check() -> bool {
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHECK.get_or_init(|| std::env::var("SS_SIMD_CHECK").is_ok_and(|v| v == "1"))
 }
 
 /// Quote check for the fields ended by the delimiters in `d`, given the quote
@@ -683,6 +722,7 @@ const VIEW: u32 = u32::from_le_bytes(*b"view");
 const CART: u32 = u32::from_le_bytes(*b"cart");
 
 #[repr(C, align(64))]
+#[derive(Clone, Copy)]
 struct Stage {
     /// Where each line starts.
     p: [*const u8; NB],
@@ -705,8 +745,8 @@ struct Stage {
     /// Scratch: the current line's field starts and lengths (see `fields`).
     sl: [u64; 2],
     /// Lines with more to do after `decode`: a lateness check on the value of
-    /// ingest_ts, or a purchase.
-    more: [u8; NB],
+    /// ingest_ts, or a purchase. (The wide path appends four bytes at a time.)
+    more: [u8; NB + 4],
 }
 
 impl Stage {
@@ -722,9 +762,39 @@ impl Stage {
             ts: [0; NB],
             flags: [0; NB],
             sl: [0; 2],
-            more: [0; NB],
+            more: [0; NB + 4],
         }
     }
+}
+
+/// What `id_trace` needs to know about the run.
+#[derive(Clone, Copy)]
+struct IdParams {
+    pd: u64,
+    fp_mask: u64,
+    loc_bits: u32,
+}
+
+impl IdParams {
+    #[inline(always)]
+    fn new(ctx: &Ctx) -> IdParams {
+        IdParams { pd: ctx.pd as u64, fp_mask: ctx.fp_mask, loc_bits: ctx.loc_bits }
+    }
+}
+
+/// How the fast paths turn an event ID into a trace. From the ID's first byte,
+/// the rest of it as a little-endian word (zero-padded) and its length `n`:
+/// the trace's partition (with four more bits of the hash from bit 16, for the
+/// trace's second word), the trace's first word without the line's position,
+/// and whether the ID is not of the regular shape (1 to 9 bytes), so that the
+/// scalar path must take the line (`event_line`, which hashes any ID).
+///
+/// The wide path has the same computation on four lines at once
+/// (`wide::id_trace4`); with `wide::ID_TRACE_WIDE` off it calls this one.
+#[inline(always)]
+fn id_trace(idp: &IdParams, first: u8, rest: u64, n: u64) -> (u32, u64, bool) {
+    let h = hash9(first, rest);
+    ((((h >> 32) * idp.pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16, (h & idp.fp_mask) << idp.loc_bits, n > 9)
 }
 
 /// Every field's content, from a line's `sep` word: byte `k` of the first is
@@ -745,61 +815,72 @@ unsafe fn fields(s: u64) -> (u64, u64) {
 /// Returns the bytes the line takes (0: not understood, the scalar path
 /// decides) and whether it became line `i` of the batch (a line with an empty
 /// event_id is dropped here).
-#[inline(always)]
-unsafe fn split_event(st: &mut Stage, i: usize, p: *const u8) -> (usize, bool) {
-    // Window 1: event_id, user_id, ts and their three commas.
-    let (cm, nm, qm) = masks64(p);
-    let c0 = cm.trailing_zeros() as u64;
-    let cm1 = _blsr_u64(cm);
-    let c1 = cm1.trailing_zeros() as u64;
-    let cm2 = _blsr_u64(cm1);
-    let c2 = cm2.trailing_zeros() as u64;
-    // Three commas (else c2 is 64), and no newline before the third.
-    let mut bad = (c2 >> 6) | _bzhi_u64(nm, c2 as u32);
-    let qa = _bzhi_u64(qm, c2 as u32);
-    let da = cm ^ _blsr_u64(cm2);
-    // Fields that start with a quote, and fields that end with one.
-    let fa = _pext_u64(qa >> 1, da) << 1 | (qa & 1);
-    let la = _pext_u64(qa << 1, da);
+macro_rules! split_event_fn {
+    ($(#[$attr:meta])* $name:ident, $masks:ident) => {
+        $(#[$attr])*
+        unsafe fn $name(st: &mut Stage, i: usize, p: *const u8) -> (usize, bool) {
+            // Window 1: event_id, user_id, ts and their three commas.
+            let (cm, nm, qm) = $masks(p);
+            let c0 = cm.trailing_zeros() as u64;
+            let cm1 = _blsr_u64(cm);
+            let c1 = cm1.trailing_zeros() as u64;
+            let cm2 = _blsr_u64(cm1);
+            let c2 = cm2.trailing_zeros() as u64;
+            // Three commas (else c2 is 64), and no newline before the third.
+            let mut bad = (c2 >> 6) | _bzhi_u64(nm, c2 as u32);
+            let qa = _bzhi_u64(qm, c2 as u32);
+            let da = cm ^ _blsr_u64(cm2);
+            // Fields that start with a quote, and fields that end with one.
+            let fa = _pext_u64(qa >> 1, da) << 1 | (qa & 1);
+            let la = _pext_u64(qa << 1, da);
 
-    // Window 2: ingest_ts, event_type, product_id, price_cents and the newline.
-    let o = (c2 & 63) + 1;
-    let (cm, nm, qm) = masks64(p.add(o as usize));
-    let nl = nm.trailing_zeros() as u64;
-    let cmb = _bzhi_u64(cm, nl as u32);
-    let c3 = cmb.trailing_zeros() as u64;
-    let cmb1 = _blsr_u64(cmb);
-    let c4 = cmb1.trailing_zeros() as u64;
-    let cmb2 = _blsr_u64(cmb1);
-    let c5 = cmb2.trailing_zeros() as u64;
-    // The newline is in the window, with exactly three commas before it.
-    bad |= (nl >> 6) | (cmb.count_ones() as u64 ^ 3);
-    let qb = _bzhi_u64(qm, nl as u32);
-    let db = cmb | 1u64.wrapping_shl(nl as u32);
-    let fb = _pext_u64(qb >> 1, db) << 1 | (qb & 1);
-    let lb = _pext_u64(qb << 1, db);
+            // Window 2: ingest_ts, event_type, product_id, price_cents and the newline.
+            let o = (c2 & 63) + 1;
+            let (cm, nm, qm) = $masks(p.add(o as usize));
+            let nl = nm.trailing_zeros() as u64;
+            let cmb = _bzhi_u64(cm, nl as u32);
+            let c3 = cmb.trailing_zeros() as u64;
+            let cmb1 = _blsr_u64(cmb);
+            let c4 = cmb1.trailing_zeros() as u64;
+            let cmb2 = _blsr_u64(cmb1);
+            let c5 = cmb2.trailing_zeros() as u64;
+            // The newline is in the window, with exactly three commas before it.
+            bad |= (nl >> 6) | (cmb.count_ones() as u64 ^ 3);
+            let qb = _bzhi_u64(qm, nl as u32);
+            let db = cmb | 1u64.wrapping_shl(nl as u32);
+            let fb = _pext_u64(qb >> 1, db) << 1 | (qb & 1);
+            let lb = _pext_u64(qb << 1, db);
 
-    // A field is quoted iff its first and last bytes are quotes; any other
-    // quote makes the line malformed: the same fields start and end with a
-    // quote, and there are exactly two quotes for each of them.
-    let f = fa | fb << 3;
-    bad |= (f ^ (la | lb << 3)) | ((qa.count_ones() + qb.count_ones()) as u64 ^ 2 * f.count_ones() as u64);
-    if bad != 0 {
-        return (0, false);
-    }
-    *st.p.get_unchecked_mut(i) = p;
-    let d = st.sep.as_mut_ptr().add(i) as *mut u8;
-    *d = c0 as u8;
-    *d.add(1) = c1 as u8;
-    *d.add(2) = c2 as u8;
-    *d.add(3) = (o + c3) as u8;
-    *d.add(4) = (o + c4) as u8;
-    *d.add(5) = (o + c5) as u8;
-    *d.add(6) = (o + nl) as u8;
-    *d.add(7) = f as u8;
-    // An empty event_id (nothing, or just two quotes): the line is dropped.
-    ((o + nl + 1) as usize, c0 != 2 * (fa & 1))
+            // A field is quoted iff its first and last bytes are quotes; any other
+            // quote makes the line malformed: the same fields start and end with a
+            // quote, and there are exactly two quotes for each of them.
+            let f = fa | fb << 3;
+            bad |= (f ^ (la | lb << 3)) | ((qa.count_ones() + qb.count_ones()) as u64 ^ 2 * f.count_ones() as u64);
+            if bad != 0 {
+                return (0, false);
+            }
+            *st.p.get_unchecked_mut(i) = p;
+            let d = st.sep.as_mut_ptr().add(i) as *mut u8;
+            *d = c0 as u8;
+            *d.add(1) = c1 as u8;
+            *d.add(2) = c2 as u8;
+            *d.add(3) = (o + c3) as u8;
+            *d.add(4) = (o + c4) as u8;
+            *d.add(5) = (o + c5) as u8;
+            *d.add(6) = (o + nl) as u8;
+            *d.add(7) = f as u8;
+            // An empty event_id (nothing, or just two quotes): the line is dropped.
+            ((o + nl + 1) as usize, c0 != 2 * (fa & 1))
+        }
+    };
 }
+split_event_fn!(#[inline(always)] split_event, masks64);
+split_event_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+    #[inline]
+    split_event_wide,
+    masks64_wide
+);
 
 /// A `ts` field of `n` bytes at `a`. Returns (the scalar path must decide,
 /// valid, epoch ms).
@@ -866,7 +947,7 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
     const HIGH: u64 = 0x8080_8080_8080_8080;
     let dt = &ctx.dates;
     let (ws, t0, span) = (ctx.ws, ctx.t0, (ctx.we - ctx.ws) as u64);
-    let (pd, fp_mask, loc_bits) = (ctx.pd as u64, ctx.fp_mask, ctx.loc_bits);
+    let idp = IdParams::new(ctx);
     let (first_day_ms, last_day) = (dt.first_day_ms, dt.day_text.len() as u64 - 1);
     let day_text = dt.day_text.as_ptr();
     let mut nmore = 0usize;
@@ -887,9 +968,9 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         let n0 = ln(0);
         let a0 = at(0);
         let x = _bzhi_u64((a0.add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
-        let h = hash9(*a0, x);
-        *st.pk.get_unchecked_mut(i) = (((h >> 32) * pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16;
-        *st.trace.get_unchecked_mut(i) = (h & fp_mask) << loc_bits | loc0.wrapping_add(p as u64);
+        let (pk, trace, id_dead) = id_trace(&idp, *a0, x, n0);
+        *st.pk.get_unchecked_mut(i) = pk;
+        *st.trace.get_unchecked_mut(i) = trace | loc0.wrapping_add(p as u64);
 
         // The user: `u` and 1 to 8 ASCII bytes, none of them NUL, is its own
         // key (ids::raw_key). `user_bad` is zero for those.
@@ -912,7 +993,7 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         // event_id (its hash looks at more than one word), a user_id that
         // needs the dictionary, an ingest_ts that cannot be F1, a timestamp
         // out of the ordinary.
-        let mut dead = (n0 > 9) as u64 | (ln(3) ^ 20) | ts_dead as u64;
+        let mut dead = id_dead as u64 | (ln(3) ^ 20) | ts_dead as u64;
         if user_bad != 0 {
             dead |= n1; // an empty user_id is just invalid
         }
@@ -1036,81 +1117,105 @@ unsafe fn check_split(st: &Stage, data: &[u8], from: usize, to: usize, n: usize,
     assert!(m == n && pos == to, "batch split: {n} lines to {to}, line split: {m} lines to {pos}");
 }
 
-pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
-    let data = ctx.files[ch.file as usize].slice();
-    let len = data.len();
-    let fast_hi = fast_end(ctx, len).min(ch.end);
-    let base = ctx.file_base[ch.file as usize];
-    // The input position of a line is `loc0 + its address`.
-    let loc0 = base.wrapping_sub(data.as_ptr() as u64);
-    let ahead = ctx.prefetch_ahead;
-    let mut lines = 0usize;
-    let Some(mut pos) = first_line(data, ch.start) else { return 0 };
-    let mut st = Stage::new();
-    let mut ws = splitw::Wide::new();
-    let wide = ctx.wide_split;
-    while pos < ch.end {
-        let mut n = 0usize;
-        // The line at `pos` after the batch is for the scalar path.
-        let mut stuck = true;
-        if (pos >= HEAD) & wide {
-            if pos < fast_hi {
-                unsafe {
-                    let from = pos;
-                    let (m, to, took, odd) = splitw::split_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
-                    if ctx.split_check {
-                        check_split(&st, data, from, to, m, took);
+macro_rules! events_chunk_fn {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $batch:expr) => {
+        $(#[$attr])*
+        unsafe fn $name(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
+            let data = ctx.files[ch.file as usize].slice();
+            let len = data.len();
+            let fast_hi = fast_end(ctx, len).min(ch.end);
+            let base = ctx.file_base[ch.file as usize];
+            // The input position of a line is `loc0 + its address`.
+            let loc0 = base.wrapping_sub(data.as_ptr() as u64);
+            let ahead = ctx.prefetch_ahead;
+            let mut lines = 0usize;
+            let Some(mut pos) = first_line(data, ch.start) else { return 0 };
+            let mut st = Stage::new();
+            let mut ws = splitw::Wide::new();
+            // The batch splitter, in the instance for processors that have it.
+            let batch = $batch & ctx.wide_split;
+            while pos < ch.end {
+                let mut n = 0usize;
+                // The line at `pos` after the batch is for the scalar path.
+                let mut stuck = true;
+                if (pos >= HEAD) & batch {
+                    if pos < fast_hi {
+                        unsafe {
+                            let from = pos;
+                            let (m, to, took, odd) = splitw::split_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
+                            if ctx.split_check {
+                                check_split(&st, data, from, to, m, took);
+                            }
+                            (n, pos, stuck) = (m, to, odd);
+                            lines += took;
+                        }
                     }
-                    (n, pos, stuck) = (m, to, odd);
-                    lines += took;
-                }
-            }
-        } else if pos >= HEAD {
-            unsafe {
-                while (n < NB) & (pos < fast_hi) {
-                    let p = data.as_ptr().add(pos);
-                    // The hardware streamer stops at page boundaries; reach past them.
-                    // A line is often longer than a cache line, so two requests
-                    // per line: one alone would skip every few cache lines.
-                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead) as *const i8);
-                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead + 64) as *const i8);
-                    let (used, added) = split_event(&mut st, n, p);
-                    if used == 0 {
-                        break;
+                } else if pos >= HEAD {
+                    unsafe {
+                        while (n < NB) & (pos < fast_hi) {
+                            let p = data.as_ptr().add(pos);
+                            // The hardware streamer stops at page boundaries; reach past them.
+                            // A line is often longer than a cache line, so two requests
+                            // per line: one alone would skip every few cache lines.
+                            _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead) as *const i8);
+                            _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead + 64) as *const i8);
+                            let (used, added) = $split(&mut st, n, p);
+                            if used == 0 {
+                                break;
+                            }
+                            pos += used;
+                            lines += 1;
+                            n += added as usize;
+                        }
                     }
-                    pos += used;
-                    lines += 1;
-                    n += added as usize;
+                    stuck = n < NB;
                 }
-            }
-            stuck = n < NB;
-        }
-        if n > 0 {
-            unsafe {
-                let nmore = stage_decode(ctx, &mut st, n, loc0);
-                stage_more(ctx, &mut st, nmore);
-                stage_emit(ctx, out, &st, n);
-                // The scalar path for what the stages could not decide.
-                if st.flags[..n].iter().fold(0, |a, &f| a | f) & F_DEAD != 0 {
-                    for i in 0..n {
-                        if st.flags[i] & F_DEAD != 0 {
-                            let line = std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 48 & 0xFF) as usize);
-                            event_line(ctx, out, line, loc0.wrapping_add(st.p[i] as u64));
+                if n > 0 {
+                    unsafe {
+                        let nmore = $decode(ctx, &mut st, n, loc0);
+                        stage_more(ctx, &mut st, nmore);
+                        stage_emit(ctx, out, &st, n);
+                        // The scalar path for what the stages could not decide.
+                        if st.flags[..n].iter().fold(0, |a, &f| a | f) & F_DEAD != 0 {
+                            for i in 0..n {
+                                if st.flags[i] & F_DEAD != 0 {
+                                    let line = std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 48 & 0xFF) as usize);
+                                    event_line(ctx, out, line, loc0.wrapping_add(st.p[i] as u64));
+                                }
+                            }
                         }
                     }
                 }
+                // The batch ended early: at a line the split did not understand, or
+                // where the fast path may not read (the edges of the file).
+                if stuck & (pos < ch.end) {
+                    lines += 1;
+                    let e = find_newline(data, pos).unwrap_or(len);
+                    event_line(ctx, out, &data[pos..e], base + pos as u64);
+                    pos = e + 1;
+                }
             }
+            lines
         }
-        // The batch ended early: at a line the split did not understand, or
-        // where the fast path may not read (the edges of the file).
-        if stuck & (pos < ch.end) {
-            lines += 1;
-            let e = find_newline(data, pos).unwrap_or(len);
-            event_line(ctx, out, &data[pos..e], base + pos as u64);
-            pos = e + 1;
+    };
+}
+events_chunk_fn!(events_chunk_base, split_event, stage_decode, false);
+events_chunk_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+    events_chunk_wide,
+    split_event_wide,
+    wide::decode,
+    true
+);
+
+pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
+    unsafe {
+        if wide() {
+            events_chunk_wide(ctx, out, ch)
+        } else {
+            events_chunk_base(ctx, out, ch)
         }
     }
-    lines
 }
 
 // ------------------------------------------------------------------ clicks
@@ -1163,30 +1268,41 @@ struct ClickStage {
 /// Split the click line at `p`. Returns the bytes it takes (0: not understood,
 /// the scalar path decides) and whether it became line `i` of the batch (a
 /// line without a click_id or a user_id is dropped here).
-#[inline(always)]
-unsafe fn split_click(st: &mut ClickStage, i: usize, p: *const u8) -> (usize, bool) {
-    let (cm, nm, qm) = masks64(p);
-    let nl = nm.trailing_zeros() as u64;
-    let cmb = _bzhi_u64(cm, nl as u32);
-    let c0 = cmb.trailing_zeros() as u64;
-    let cmb1 = _blsr_u64(cmb);
-    let c1 = cmb1.trailing_zeros() as u64;
-    let c2 = _blsr_u64(cmb1).trailing_zeros() as u64;
-    let q = _bzhi_u64(qm, nl as u32);
-    let d = cmb | 1u64.wrapping_shl(nl as u32);
-    let f = _pext_u64(q >> 1, d) << 1 | (q & 1);
-    let l = _pext_u64(q << 1, d);
-    // The newline is in the window, with exactly three commas before it, and
-    // the quoting is sound (see `split_event`).
-    let bad = (nl >> 6) | (cmb.count_ones() as u64 ^ 3) | (f ^ l) | (q.count_ones() as u64 ^ 2 * f.count_ones() as u64);
-    if bad != 0 {
-        return (0, false);
-    }
-    *st.p.get_unchecked_mut(i) = p;
-    *st.sep.get_unchecked_mut(i) = c0 | c1 << 8 | c2 << 16 | nl << 24 | f << 56;
-    let (q0, q1) = (f & 1, f >> 1 & 1);
-    ((nl + 1) as usize, (c0 != 2 * q0) & (c1 - c0 - 1 != 2 * q1))
+macro_rules! split_click_fn {
+    ($(#[$attr:meta])* $name:ident, $masks:ident) => {
+        $(#[$attr])*
+        unsafe fn $name(st: &mut ClickStage, i: usize, p: *const u8) -> (usize, bool) {
+            let (cm, nm, qm) = $masks(p);
+            let nl = nm.trailing_zeros() as u64;
+            let cmb = _bzhi_u64(cm, nl as u32);
+            let c0 = cmb.trailing_zeros() as u64;
+            let cmb1 = _blsr_u64(cmb);
+            let c1 = cmb1.trailing_zeros() as u64;
+            let c2 = _blsr_u64(cmb1).trailing_zeros() as u64;
+            let q = _bzhi_u64(qm, nl as u32);
+            let d = cmb | 1u64.wrapping_shl(nl as u32);
+            let f = _pext_u64(q >> 1, d) << 1 | (q & 1);
+            let l = _pext_u64(q << 1, d);
+            // The newline is in the window, with exactly three commas before it, and
+            // the quoting is sound (see `split_event`).
+            let bad = (nl >> 6) | (cmb.count_ones() as u64 ^ 3) | (f ^ l) | (q.count_ones() as u64 ^ 2 * f.count_ones() as u64);
+            if bad != 0 {
+                return (0, false);
+            }
+            *st.p.get_unchecked_mut(i) = p;
+            *st.sep.get_unchecked_mut(i) = c0 | c1 << 8 | c2 << 16 | nl << 24 | f << 56;
+            let (q0, q1) = (f & 1, f >> 1 & 1);
+            ((nl + 1) as usize, (c0 != 2 * q0) & (c1 - c0 - 1 != 2 * q1))
+        }
+    };
 }
+split_click_fn!(#[inline(always)] split_click, masks64);
+split_click_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+    #[inline]
+    split_click_wide,
+    masks64_wide
+);
 
 const C_DEAD: u8 = 1;
 const C_VALID: u8 = 2;
@@ -1282,62 +1398,83 @@ unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, n: usize) {
     }
 }
 
-pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
-    let data = ctx.files[ch.file as usize].slice();
-    let len = data.len();
-    let fast_hi = fast_end(ctx, len).min(ch.end);
-    let ahead = ctx.prefetch_ahead;
-    let mut lines = 0usize;
-    let Some(mut pos) = first_line(data, ch.start) else { return 0 };
-    let mut st = ClickStage {
-        p: [std::ptr::null(); NB],
-        sep: [0; NB],
-        user: [0; NB],
-        click: [0; NB],
-        tc: [0; NB],
-        home: [0; NB],
-        flags: [0; NB],
-        ts_at: [0; NB],
-        ts_len: [0; NB],
-        sl: [0; 2],
-    };
-    while pos < ch.end {
-        let mut n = 0usize;
-        if pos >= HEAD {
-            unsafe {
-                while (n < NB) & (pos < fast_hi) {
-                    let p = data.as_ptr().add(pos);
-                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead) as *const i8);
-                    let (used, added) = split_click(&mut st, n, p);
-                    if used == 0 {
-                        break;
-                    }
-                    pos += used;
-                    lines += 1;
-                    n += added as usize;
-                }
-            }
-        }
-        if n > 0 {
-            unsafe {
-                click_decode(ctx, &mut st, n);
-                click_emit(ctx, c, &st, n);
-                // The scalar path for what the stages could not decide.
-                if st.flags[..n].iter().fold(0, |a, &f| a | f) & C_DEAD != 0 {
-                    for i in 0..n {
-                        if st.flags[i] & C_DEAD != 0 {
-                            click_line(ctx, c, std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 24 & 0xFF) as usize));
+macro_rules! clicks_chunk_fn {
+    ($(#[$attr:meta])* $name:ident, $split:ident) => {
+        $(#[$attr])*
+        unsafe fn $name(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
+            let data = ctx.files[ch.file as usize].slice();
+            let len = data.len();
+            let fast_hi = fast_end(ctx, len).min(ch.end);
+            let ahead = ctx.prefetch_ahead;
+            let mut lines = 0usize;
+            let Some(mut pos) = first_line(data, ch.start) else { return 0 };
+            let mut st = ClickStage {
+                p: [std::ptr::null(); NB],
+                sep: [0; NB],
+                user: [0; NB],
+                click: [0; NB],
+                tc: [0; NB],
+                home: [0; NB],
+                flags: [0; NB],
+                ts_at: [0; NB],
+                ts_len: [0; NB],
+                sl: [0; 2],
+            };
+            while pos < ch.end {
+                let mut n = 0usize;
+                if pos >= HEAD {
+                    unsafe {
+                        while (n < NB) & (pos < fast_hi) {
+                            let p = data.as_ptr().add(pos);
+                            _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ahead) as *const i8);
+                            let (used, added) = $split(&mut st, n, p);
+                            if used == 0 {
+                                break;
+                            }
+                            pos += used;
+                            lines += 1;
+                            n += added as usize;
                         }
                     }
                 }
+                if n > 0 {
+                    unsafe {
+                        click_decode(ctx, &mut st, n);
+                        click_emit(ctx, c, &st, n);
+                        // The scalar path for what the stages could not decide.
+                        if st.flags[..n].iter().fold(0, |a, &f| a | f) & C_DEAD != 0 {
+                            for i in 0..n {
+                                if st.flags[i] & C_DEAD != 0 {
+                                    click_line(ctx, c, std::slice::from_raw_parts(st.p[i], (st.sep[i] >> 24 & 0xFF) as usize));
+                                }
+                            }
+                        }
+                    }
+                }
+                if (n < NB) & (pos < ch.end) {
+                    lines += 1;
+                    let e = find_newline(data, pos).unwrap_or(len);
+                    click_line(ctx, c, &data[pos..e]);
+                    pos = e + 1;
+                }
             }
+            lines
         }
-        if (n < NB) & (pos < ch.end) {
-            lines += 1;
-            let e = find_newline(data, pos).unwrap_or(len);
-            click_line(ctx, c, &data[pos..e]);
-            pos = e + 1;
+    };
+}
+clicks_chunk_fn!(clicks_chunk_base, split_click);
+clicks_chunk_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+    clicks_chunk_wide,
+    split_click_wide
+);
+
+pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
+    unsafe {
+        if wide() {
+            clicks_chunk_wide(ctx, c, ch)
+        } else {
+            clicks_chunk_base(ctx, c, ch)
         }
     }
-    lines
 }
