@@ -848,10 +848,16 @@ fn trace_from(idp: &IdParams, h: u64) -> (u32, u64) {
 unsafe fn id_trace_at(idp: &IdParams, a: *const u8, n: u64) -> (u32, u64, bool) {
     let w = |k: usize| (a.add(1 + 8 * k) as *const u64).read_unaligned();
     let long = n == LONG_LEN as u64;
-    let short = hash9(*a, _bzhi_u64(w(0), (8 * n as u32).wrapping_sub(8)));
-    let h = if long { hash33(*a, [w(0), w(1), w(2), w(3)]) } else { short };
+    let bits = (8 * n as u32).wrapping_sub(8);
+    let x = w(0);
+    let short = hash9(*a, _bzhi_u64(x, bits));
+    // A NUL among a short ID's bytes: zero-padded, it would have the hash of
+    // a shorter ID as well (see ids::event_hash, which hashes such an ID's
+    // length with it): the scalar path takes it.
+    let nul = (x.wrapping_sub(0x0101_0101_0101_0101) & !x & _bzhi_u64(0x8080_8080_8080_8080, bits)) | (*a == 0) as u64;
+    let h = if long { hash33(*a, [x, w(1), w(2), w(3)]) } else { short };
     let (pk, trace) = trace_from(idp, h);
-    (pk, trace, (n > 9) & !long)
+    (pk, trace, !long & ((n > 9) | (nul != 0)))
 }
 
 /// Every field's content, from a line's `sep` word: byte `k` of the first is
