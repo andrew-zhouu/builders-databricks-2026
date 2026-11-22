@@ -312,7 +312,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 /// `masks64` on a processor with AVX-512: one 64-byte register, three compares
 /// straight into mask registers.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw")]
 #[inline]
 unsafe fn masks64_wide(p: *const u8) -> (u64, u64, u64) {
     let v = _mm512_loadu_si512(p as *const __m512i);
@@ -328,20 +328,31 @@ unsafe fn masks64_wide(p: *const u8) -> (u64, u64, u64) {
 /// (ids.rs) on the fast path, as the ordinary one does.
 const WIDE_DEFAULT: bool = true;
 
-/// Whether this processor takes the wide path: AVX-512 with VBMI2, which
-/// means Ice Lake or newer. (Skylake and Cascade Lake have AVX-512 as well,
-/// but lower their clock when it is used; they keep the AVX2 path, as does
-/// everything older.) The code of the wide path is reached through this test
-/// and nowhere else. SS_SIMD=0 turns the wide path off.
-pub fn wide() -> bool {
-    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WIDE.get_or_init(|| {
-        let asked = std::env::var("SS_SIMD").ok();
-        (if WIDE_DEFAULT { asked.as_deref() != Some("0") } else { asked.as_deref() == Some("1") }) && wide_capable()
+/// The parser instance of this run, chosen once:
+///
+/// * 0: the ordinary one (AVX2).
+/// * 1: the wide one for processors with AVX-512 VBMI2, which means Ice Lake
+///   or newer. The default where the processor has it.
+/// * 2: the wide one for processors with AVX-512 F, BW, VL, DQ and CD only
+///   (Skylake-X, Cascade Lake): the same code with other instructions where
+///   the first uses VBMI2 or VPOPCNTDQ. Those processors lower their clock
+///   for 512-bit code, so whether it wins there is not known: it is taken
+///   only when asked for.
+///
+/// SS_SIMD=0: the ordinary one; SS_SIMD=1: as the default; SS_SIMD=2: the
+/// third, wherever the processor can run it (one that has VBMI2 can). The
+/// code of the wide instances is reached through this choice and nowhere else.
+pub fn wide_kind() -> u8 {
+    static KIND: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *KIND.get_or_init(|| match std::env::var("SS_SIMD").ok().as_deref() {
+        Some("0") => 0,
+        Some("2") => 2 * wide512_capable() as u8,
+        Some("1") => wide_capable() as u8,
+        _ => (WIDE_DEFAULT && wide_capable()) as u8,
     })
 }
 
-/// Whether this processor has what the wide path needs.
+/// Whether this processor has what the wide instance for VBMI2 needs.
 pub fn wide_capable() -> bool {
     is_x86_feature_detected!("avx512f")
         && is_x86_feature_detected!("avx512bw")
@@ -349,6 +360,19 @@ pub fn wide_capable() -> bool {
         && is_x86_feature_detected!("avx512dq")
         && is_x86_feature_detected!("avx512vbmi")
         && is_x86_feature_detected!("avx512vbmi2")
+}
+
+/// Whether this processor has what the wide instance without VBMI2 needs.
+pub fn wide512_capable() -> bool {
+    is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512dq")
+        && is_x86_feature_detected!("avx512cd")
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("popcnt")
+        && is_x86_feature_detected!("lzcnt")
 }
 
 /// SS_SIMD_CHECK=1: the wide path also runs the ordinary one on every batch
@@ -1011,6 +1035,12 @@ split_event_fn!(
     split_event_wide,
     masks64_wide
 );
+split_event_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,bmi1,bmi2,popcnt,lzcnt")]
+    #[inline]
+    split_event_wide5,
+    masks64_wide
+);
 
 /// A `ts` field of `n` bytes at `a`. Returns (the scalar path must decide,
 /// valid, epoch ms).
@@ -1322,7 +1352,7 @@ unsafe fn check_split(st: &Stage, data: &[u8], from: usize, to: usize, n: usize,
 }
 
 macro_rules! events_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $emit:path, $batch:expr) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $emit:path, $bsplit:path, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1346,7 +1376,7 @@ macro_rules! events_chunk_fn {
                     if pos < fast_hi {
                         unsafe {
                             let from = pos;
-                            let (m, to, took, odd) = splitw::split_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
+                            let (m, to, took, odd) = $bsplit(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
                             if ctx.split_check {
                                 check_split(&st, data, from, to, m, took);
                             }
@@ -1404,22 +1434,32 @@ macro_rules! events_chunk_fn {
         }
     };
 }
-events_chunk_fn!(events_chunk_base, split_event, stage_decode, stage_emit, false);
+events_chunk_fn!(events_chunk_base, split_event, stage_decode, stage_emit, splitw::split_batch, false);
 events_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     events_chunk_wide,
     split_event_wide,
     wide::decode,
     wide::emit,
+    splitw::split_batch,
+    true
+);
+events_chunk_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,bmi1,bmi2,popcnt,lzcnt")]
+    events_chunk_wide5,
+    split_event_wide5,
+    wide::decode,
+    wide::emit,
+    splitw::split_batch5,
     true
 );
 
 pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
     unsafe {
-        if wide() {
-            events_chunk_wide(ctx, out, ch)
-        } else {
-            events_chunk_base(ctx, out, ch)
+        match wide_kind() {
+            1 => events_chunk_wide(ctx, out, ch),
+            2 => events_chunk_wide5(ctx, out, ch),
+            _ => events_chunk_base(ctx, out, ch),
         }
     }
 }
@@ -1529,6 +1569,12 @@ split_click_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     #[inline]
     split_click_wide,
+    masks64_wide
+);
+split_click_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,bmi1,bmi2,popcnt,lzcnt")]
+    #[inline]
+    split_click_wide5,
     masks64_wide
 );
 
@@ -1693,7 +1739,7 @@ unsafe fn check_split_clicks(st: &ClickStage, data: &[u8], from: usize, to: usiz
 }
 
 macro_rules! clicks_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $emit:path, $batch:expr) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $emit:path, $bsplit:path, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1726,7 +1772,7 @@ macro_rules! clicks_chunk_fn {
                         unsafe {
                             let from = pos;
                             let (m, to, took, odd) =
-                                splitw::split_clicks_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
+                                $bsplit(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
                             if ctx.split_check {
                                 check_split_clicks(&st, data, from, to, m, took);
                             }
@@ -1776,22 +1822,32 @@ macro_rules! clicks_chunk_fn {
         }
     };
 }
-clicks_chunk_fn!(clicks_chunk_base, split_click, click_decode, click_emit, false);
+clicks_chunk_fn!(clicks_chunk_base, split_click, click_decode, click_emit, splitw::split_clicks_batch, false);
 clicks_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     clicks_chunk_wide,
     split_click_wide,
     wide::click_decode,
     wide::click_emit,
+    splitw::split_clicks_batch,
+    true
+);
+clicks_chunk_fn!(
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,bmi1,bmi2,popcnt,lzcnt")]
+    clicks_chunk_wide5,
+    split_click_wide5,
+    wide::click_decode,
+    wide::click_emit,
+    splitw::split_clicks_batch5,
     true
 );
 
 pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
     unsafe {
-        if wide() {
-            clicks_chunk_wide(ctx, c, ch)
-        } else {
-            clicks_chunk_base(ctx, c, ch)
+        match wide_kind() {
+            1 => clicks_chunk_wide(ctx, c, ch),
+            2 => clicks_chunk_wide5(ctx, c, ch),
+            _ => clicks_chunk_base(ctx, c, ch),
         }
     }
 }

@@ -1,6 +1,8 @@
-//! The decode stages on processors with AVX-512 (`super::wide`): the same
+//! The decode stages on processors with AVX-512 (`super::wide_kind`): the same
 //! results as `super::stage_decode` and `super::click_decode`, eight lines at
-//! a time.
+//! a time. Nothing here needs more than AVX-512 F, BW, VL and DQ, so both wide
+//! parser instances use this code: the one for processors with VBMI2 and the
+//! one for those without.
 //!
 //! Each 64-bit lane of a 512-bit register holds one line's value. A line's
 //! bytes are fetched with gathers, eight at a time, from wherever its fields
@@ -110,10 +112,14 @@ macro_rules! field {
 /// `super::fields` for eight lines: byte `k` of the first result is where
 /// field `k` starts in its line, of the second its length. (The quoted bits
 /// are bits 56 to 62 of `sep`.)
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn fields8(sep: __m512i) -> (__m512i, __m512i) {
-    let quoted = and!(_mm512_multishift_epi64_epi8(v!(0x3F3E_3D3C_3B3A_3938u64), sep), v!(0x0001_0101_0101_0101u64));
+    // One byte per field, 1 if it is quoted: the top byte of `sep` in every
+    // byte of its lane, bit `k` of it kept in byte `k`, and what is left
+    // made 1. (Three instructions that every processor with AVX-512 BW has.)
+    let top = _mm512_shuffle_epi8(sep, _mm512_broadcast_i32x4(_mm_setr_epi8(7, 7, 7, 7, 7, 7, 7, 7, 15, 15, 15, 15, 15, 15, 15, 15)));
+    let quoted = _mm512_min_epu8(and!(top, v!(0x0040_2010_0804_0201u64)), v!(0x0001_0101_0101_0101u64));
     let seps = and!(sep, v!(0x00FF_FFFF_FFFF_FFFFu64));
     let start = add!(add!(sll!(seps, 8), v!(0x0001_0101_0101_0100u64)), quoted);
     (start, sub!(sub!(seps, start), quoted))
@@ -123,7 +129,7 @@ unsafe fn fields8(sep: __m512i) -> (__m512i, __m512i) {
 /// 8 ASCII bytes, none of them NUL. Returns the lanes whose field (`n` bytes
 /// at `a`) is not of that shape, and the key the bytes after the letter make
 /// (meaningful for the lanes that are).
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn key8(a: __m512i, n: __m512i, first: u8) -> (__mmask8, __m512i) {
     let letter = srl!(gather!(a, -7), 56);
@@ -144,7 +150,7 @@ struct Days {
     base: [__m512i; 2],
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn days(dt: &DateTab) -> Days {
     Days {
@@ -160,7 +166,7 @@ unsafe fn days(dt: &DateTab) -> Days {
 /// months', the next two digits, and the day they spell one of that month's
 /// in the table. Returns the lanes for which that is so, and the epoch ms of
 /// the day's start.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn day_of(d: &Days, q0: __m512i, q1: __m512i) -> (__mmask8, __m512i) {
     let t = xor!(and!(q1, v!(0xFFFFu64)), v!(0x3030u64));
@@ -175,7 +181,7 @@ unsafe fn day_of(d: &Days, q0: __m512i, q1: __m512i) -> (__mmask8, __m512i) {
 /// `super::event_ts` for eight `ts` fields of `n` bytes at `a`: the lanes the
 /// scalar path must decide, the lanes with a valid timestamp, and the epoch
 /// ms (meaningful for those).
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn ts8(d: &Days, a: __m512i, n: __m512i) -> (__mmask8, __mmask8, __m512i) {
     let zero = _mm512_setzero_si512();
@@ -274,7 +280,7 @@ unsafe fn picked(i: usize, which: u64) -> u64 {
 ///
 /// Both hashes of ids.rs are computed and one is chosen, as there: one ID in
 /// eight is long, so most groups of eight lines have one.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn id_trace8(idp: &IdParams, a: __m512i, first: __m512i, w1: __m512i, n: __m512i) -> (__m512i, __m512i, __mmask8) {
     let long = _mm512_cmpeq_epi64_mask(n, v!(LONG_LEN));
@@ -307,7 +313,7 @@ unsafe fn id_trace8(idp: &IdParams, a: __m512i, first: __m512i, w1: __m512i, n: 
 }
 
 /// Decode the batch's event lines: `super::stage_decode`, on this path.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 pub(super) unsafe fn decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
     if !ctx.dates.wide_ok {
         // A window too long for the table of days by day of the month: the
@@ -321,7 +327,7 @@ pub(super) unsafe fn decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> u
     decode8(ctx, st, n, loc0)
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn decode8(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
     let dt = &ctx.dates;
@@ -415,7 +421,7 @@ unsafe fn decode8(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
 /// SS_SIMD_CHECK=1: the batch through both paths. The split of every line
 /// again by the ordinary splitter, then both decoders; any difference that the
 /// later stages could see stops the run with the line.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 unsafe fn checked(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
     let (lines, seps) = (st.p, st.sep);
     let fail = |i: usize, what: &str, a: u64, b: u64| -> ! {
@@ -474,7 +480,7 @@ unsafe fn checked(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize {
 // ------------------------------------------------------------------ clicks
 
 /// Decode the batch's click lines: `super::click_decode`, on this path.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 pub(super) unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
     if !ctx.dates.wide_ok {
         return super::click_decode(ctx, st, n);
@@ -485,7 +491,7 @@ pub(super) unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
     click_decode8(ctx, st, n)
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn click_decode8(ctx: &Ctx, st: &mut ClickStage, n: usize) {
     let table_days = days(&ctx.dates);
@@ -557,7 +563,7 @@ unsafe fn click_decode8(ctx: &Ctx, st: &mut ClickStage, n: usize) {
 }
 
 /// SS_SIMD_CHECK=1 for clicks: see `checked`.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 unsafe fn click_checked(ctx: &Ctx, st: &mut ClickStage, n: usize) {
     let (lines, seps) = (st.p, st.sep);
     let fail = |i: usize, what: &str, a: u64, b: u64| -> ! {
@@ -612,7 +618,7 @@ unsafe fn click_checked(ctx: &Ctx, st: &mut ClickStage, n: usize) {
 /// its home line: a user seen for the first time, or a line that was full.
 /// Those are for `Table::person_at` itself, which knows how to insert.
 /// (`slots` is the table: 16 bytes a slot, the key and then the parent.)
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 #[inline]
 unsafe fn people8(slots: *const u8, want: __mmask8, home: __m512i, key: __m512i) -> (__m512i, __mmask8) {
     let zero = _mm512_setzero_si512();
@@ -689,7 +695,7 @@ unsafe fn emit_reference(ctx: &Ctx, st: &Stage, i: usize) -> (Option<Pushed>, Pu
 /// `super::stage_emit` on this path: the people and the traces' second words
 /// of eight lines at a time, then the pushes, a line at a time as there.
 /// (`SS_SIMD_CHECK=1`: what is pushed must be what `stage_emit` would push.)
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 pub(super) unsafe fn emit(ctx: &Ctx, out: &mut EventOut, st: &Stage, n: usize) {
     if !wide_emit() {
         return stage_emit(ctx, out, st, n);
@@ -750,7 +756,7 @@ pub(super) unsafe fn emit(ctx: &Ctx, out: &mut EventOut, st: &Stage, n: usize) {
 }
 
 /// `super::click_emit` on this path.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
 pub(super) unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, n: usize) {
     if !wide_emit() {
         return super::click_emit(ctx, c, st, n);
