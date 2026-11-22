@@ -37,7 +37,8 @@ if [ "$mode" = split ]; then
   # What a block-wise line splitter has to get right, first of all.
   names=(splitter splitter,shapes splitter,endings shapes,endings splitter,stretches mix,splitter
          splitter,userlengths,values none shapes stretches,splitter,endings mix splitter,clickshapes,linkshapes
-         splitter,copies,endings values,splitter mix,splitter,shapes,endings)
+         splitter,copies,endings values,splitter mix,splitter,shapes,endings interleave interleave,shapes
+         interleave,splitter,endings interleave,interleave,stretches)
 fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
@@ -96,6 +97,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "nowsplit|NCPU=4 SS_WSPLIT=0"
       "nosimd|NCPU=4 SS_SIMD=0"
       "tiny|NCPU=4 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "tinycheck|NCPU=8 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1 SS_CHUNK_BYTES=$((seed * 7 % 97 + 31))"
       "markcheck|NCPU=3 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1 SS_CHUNK_BYTES=${marks[$((seed % ${#marks[@]}))]}"
       "mark|NCPU=5 SS_CHUNK_BYTES=${marks[$(((seed / 3 + 5) % ${#marks[@]}))]}"
       "tiny8|NCPU=8 SS_CHUNK_BYTES=$((seed % 1013 + 300))"

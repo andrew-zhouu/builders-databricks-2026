@@ -1318,6 +1318,43 @@ def splitter(D):
     D.notes.append(f"splitter {placed} placed, {long_ones} long, {runs} runs")
 
 
+def interleave(D):
+    """In a few files, after every line (or every second, third, seventh,
+    eighth, ninth) a line that is not an event: empty, seven empty fields,
+    right shape without an event_id, a few bytes, one field too many. A
+    splitter that takes lines eight at a time then meets its odd lines at
+    every phase, for thousands of lines on end."""
+    R = D.R
+    model = next((list(l.f) for l in D.events if l.f and l.f[0] and parse_ts(l.f[2]) is not None), None)
+    if model is None:
+        D.notes.append("interleave: nothing to copy")
+        return
+    files = list({line.file for line in D.events})
+    R.shuffle(files)
+    plan = {}
+    for number in files[:R.randint(2, 5)]:
+        plan[number] = (R.choice([1, 1, 2, 3, 7, 8, 9]), R.choice(["empty", "seven", "emptyid", "emptyid", "short", "extra", "any"]))
+    body = ",".join([""] + model[1:])
+    count = {number: 0 for number in plan}
+    made = 0
+    out = []
+    for line in D.events:
+        out.append(line)
+        if line.file not in plan or line.new or line.held:
+            continue
+        every, kind = plan[line.file]
+        count[line.file] += 1
+        if count[line.file] % every:
+            continue
+        how = kind if kind != "any" else R.choice(["empty", "seven", "emptyid", "short", "extra"])
+        text = {"empty": "", "seven": ",,,,,,", "emptyid": R.choice([body, '""' + body]),
+                "short": R.choice(["a", "ab", "a,b", "abcdefg", '"', ",,"]), "extra": ",".join(model) + ",x"}[how]
+        out.append(Line(text, None, line.file))
+        made += 1
+    D.events = out
+    D.notes.append(f"interleave {made} lines: " + ", ".join(f"file {n} every {e} {k}" for n, (e, k) in plan.items()))
+
+
 def endings(D):
     """Files that end without a newline after their last line, or with an
     empty line (a malformed line by the rules), in all three folders."""
@@ -1327,10 +1364,10 @@ def endings(D):
 
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
-                                     splitter, endings, identityids, emptyevents, noeventfiles]}
+                                     splitter, interleave, endings, identityids, emptyevents, noeventfiles]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
-           "splitter", "splitter", "endings"]
+           "splitter", "splitter", "interleave", "endings"]
 
 
 # ------------------------------------------------------------------ writing
