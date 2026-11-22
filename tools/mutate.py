@@ -1329,10 +1329,15 @@ def interleave(D):
     if model is None:
         D.notes.append("interleave: nothing to copy")
         return
-    files = list({line.file for line in D.events})
-    R.shuffle(files)
+    sizes = {}
+    for line in D.events:
+        sizes[line.file] = sizes.get(line.file, 0) + 1
+    # The largest files (most of the lines are there), and a few of the others.
+    files = sorted(sizes, key=sizes.get, reverse=True)
+    small = files[3:]
+    R.shuffle(small)
     plan = {}
-    for number in files[:R.randint(2, 5)]:
+    for number in files[:R.randint(1, 3)] + small[:R.randint(1, 3)]:
         plan[number] = (R.choice([1, 1, 2, 3, 7, 8, 9]), R.choice(["empty", "seven", "emptyid", "emptyid", "short", "extra", "any"]))
     body = ",".join([""] + model[1:])
     count = {number: 0 for number in plan}
