@@ -70,13 +70,14 @@ pub fn run(data_dir: &std::path::Path, out_dir: &std::path::Path) -> ! {
         };
         // The one line that decides which parser runs here, kept for the end too.
         key.push(format!(
-            "cpu: family {} model {} stepping {} ({}); wide parser possible here (AVX-512 with VBMI2): {}, its batch splitter: {}; flags: {}",
+            "cpu: family {} model {} stepping {} ({}); wide parser possible here (AVX-512 with VBMI2): {}, its batch splitter: {}; the wide parser without VBMI2 (SS_SIMD=2): {}; flags: {}",
             field("cpu family"),
             field("model\t"),
             field("stepping"),
             field("model name"),
             crate::parse::wide_capable(),
             crate::parse::splitw::available(),
+            crate::parse::wide512_capable(),
             has.join(" ")
         ));
     }
