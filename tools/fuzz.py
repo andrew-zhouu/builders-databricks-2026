@@ -124,9 +124,35 @@ def main():
     events = []          # field lists
     eid = 0
 
+    # FUZZ_IDS=dense: event IDs that are `e` + a small base-36 number, drawn
+    # from a range of about twice the rows, so that many IDs come up more than
+    # once (unrelated rows that are copies of one event by the rules), with the
+    # numbers at every boundary an index-based back end has, and irregular
+    # spellings of the same numbers. (Without it, nothing here draws from R.)
+    dense = os.environ.get("FUZZ_IDS") == "dense"
+
+    def b36(v):
+        s = ""
+        while True:
+            s = "0123456789abcdefghijklmnopqrstuvwxyz"[v % 36] + s
+            v //= 36
+            if v == 0:
+                return s
+
     def new_eid():
         nonlocal eid
         eid += 1
+        if dense:
+            r = R.random()
+            if r < 0.80:
+                return "e" + b36(R.randrange(2 * rows))
+            if r < 0.86:
+                return "e" + b36(R.choice([0, 1, 35, 36, 63, 64, 65, 1499, 1500, 4095, 4096, 4097, 2 * rows, 10 * rows,
+                                           49_999_999, 50_000_000, 2**32 - 1, 2**32, 2**40 - 1, 2**40, 36**8 - 1]))
+            if r < 0.93:
+                v = b36(R.randrange(2 * rows))
+                return R.choice(["e0" + v, "e00" + v, "E" + v, "e" + v.upper(), "e" + v + " ", "x" + v, "e" + v + "0" * 9])
+            return R.choice([f"E{eid}", f"e{eid} ", f" e{eid}", f"e{eid}\r", f"x{eid}", f"e{eid:010d}", "e", f"e_{eid}", f"é{eid}"])
         r = R.random()
         if r < 0.93:
             return "e" + reg("", R.choice([1, 2, 5, 7, 8, 8, 8]))
