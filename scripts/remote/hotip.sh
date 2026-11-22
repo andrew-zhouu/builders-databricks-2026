@@ -6,7 +6,7 @@
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/env.sh"
 cd "$PROJ"
 name="${1:-m20}"; re="${2:-.}"; top="${3:-40}"
-PBIN="$PROJ/.toolchain/prof-target/x86_64-unknown-linux-musl/release/sessions"
+PBIN="$PROJ/out/prof-target/x86_64-unknown-linux-musl/release/sessions"
 if [ "${REUSE:-0}" != 1 ]; then bash scripts/remote/lineprof.sh "$name" 5 . > /dev/null 2>&1; fi
 perf script -i /tmp/ss-line.data -F comm,ip 2>/dev/null | awk '$1 == "sessions" { n[$2]++; t++ } END { for (a in n) printf "%d %s %d\n", n[a], a, t }' \
   | sort -rn | head -3000 > /tmp/ss-hotip.txt
