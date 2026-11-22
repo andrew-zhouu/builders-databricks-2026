@@ -11,11 +11,12 @@
 //! `sep` word put together.
 //!
 //! What it accepts and what it writes are exactly `split_event`'s: the same
-//! lines (first three commas within the first 64 bytes, the rest and the
-//! newline within 64 bytes after the third comma, six commas, sound quoting),
-//! the same `p` and `sep`, lines with an empty event_id consumed and left out,
-//! and it stops at the first line it does not accept, which the caller gives
-//! to the scalar path. `SS_SPLIT_CHECK=1` runs both and compares.
+//! lines (three windows of 64 bytes: the event_id and its comma; from there
+//! the user_id, the ts and their commas; from there three more commas and the
+//! newline; sound quoting), the same `p` and `sep`, lines with an empty
+//! event_id consumed and left out, and it stops at the first line it does not
+//! accept, which the caller gives to the scalar path. `SS_SPLIT_CHECK=1` runs
+//! both and compares.
 
 use core::arch::x86_64::*;
 
@@ -144,9 +145,15 @@ pub unsafe fn split_batch(
     let one = _mm512_set1_epi64(1);
     let ones = _mm512_set1_epi64(-1);
     let c64 = _mm512_set1_epi64(64);
+    let c63 = _mm512_set1_epi64(63);
+    let zero = _mm512_setzero_si512();
     let start0 = _mm512_set1_epi64(p0 as i64);
     let limit_v = _mm512_set1_epi64(limit as i64);
     let (commas, quotes) = (ws.commas.as_ptr() as *const i64, ws.quotes.as_ptr() as *const i64);
+    // The bits below bit `n` of each lane (all of them for 64 or more).
+    let below = |n: __m512i| _mm512_andnot_si512(_mm512_sllv_epi64(ones, n), ones);
+    let after = |c: __m512i| _mm512_add_epi64(c, one);
+    let before = |c: __m512i| _mm512_sub_epi64(c, one);
     let (mut n, mut i, mut stuck) = (0usize, 0usize, false);
     while (i < k) & (n + 8 <= NB) {
         // Lines i..i+8: each starts after the newline before it.
@@ -154,69 +161,65 @@ pub unsafe fn split_batch(
         let e = _mm512_cvtepu16_epi64(_mm_loadu_si128(ends.add(i + 1) as *const __m128i));
         // The lanes that hold a line of this batch that starts in time.
         let live = _bzhi_u32(0xFF, (k - i).min(8) as u32) as u8 & _mm512_cmplt_epu64_mask(s, limit_v);
-        // The line's comma and quote bits: 128 of them from its start, out of
-        // three words each, and none from its newline on.
-        let (word, shift) = (_mm512_srli_epi64::<6>(s), _mm512_and_si512(s, _mm512_set1_epi64(63)));
-        let back = _mm512_sub_epi64(c64, shift);
-        let zero = _mm512_setzero_si512();
-        let cut = |words: *const i64| {
+        // 64 bits of the block words from bit `at` on, out of two words. (A
+        // lane that is not taken may ask for bits up to 130 past a line's
+        // start: the words have room for that.)
+        let cut = |words: *const i64, at: __m512i| {
+            let (word, shift) = (_mm512_srli_epi64::<6>(at), _mm512_and_si512(at, c63));
             let w0 = _mm512_mask_i64gather_epi64::<8>(zero, live, word, words);
             let w1 = _mm512_mask_i64gather_epi64::<8>(zero, live, word, words.add(1));
-            let w2 = _mm512_mask_i64gather_epi64::<8>(zero, live, word, words.add(2));
-            (
-                _mm512_or_si512(_mm512_srlv_epi64(w0, shift), _mm512_sllv_epi64(w1, back)),
-                _mm512_or_si512(_mm512_srlv_epi64(w1, shift), _mm512_sllv_epi64(w2, back)),
-            )
+            _mm512_or_si512(_mm512_srlv_epi64(w0, shift), _mm512_sllv_epi64(w1, _mm512_sub_epi64(c64, shift)))
         };
         let len = _mm512_sub_epi64(e, s);
-        let below_lo = _mm512_andnot_si512(_mm512_sllv_epi64(ones, len), ones);
-        let below_hi = _mm512_andnot_si512(_mm512_sllv_epi64(ones, _mm512_sub_epi64(_mm512_max_epu64(len, c64), c64)), ones);
-        let (c_lo, c_hi) = cut(commas);
-        let (q_lo, q_hi) = cut(quotes);
-        let (c_lo, c_hi) = (_mm512_and_si512(c_lo, below_lo), _mm512_and_si512(c_hi, below_hi));
-        let (q_lo, q_hi) = (_mm512_and_si512(q_lo, below_lo), _mm512_and_si512(q_hi, below_hi));
 
-        // Window 1: the first three commas, within the first 64 bytes.
-        let (c0, x) = lowest(c_lo);
-        let (c1, x) = lowest(x);
+        // Window 1: the event_id and its comma. (No bit from the newline on,
+        // here and below: a comma that is missing is not found in the next line.)
+        let in_a = below(len);
+        let (c_a, q_a) = (_mm512_and_si512(cut(commas, s), in_a), _mm512_and_si512(cut(quotes, s), in_a));
+        let (c0, _) = lowest(c_a);
+        // Window 2, from after that comma: the user_id, the ts, their commas.
+        let o1 = after(c0);
+        let in_b = below(_mm512_sub_epi64(len, o1));
+        let at_b = _mm512_add_epi64(s, o1);
+        let (c_b, q_b) = (_mm512_and_si512(cut(commas, at_b), in_b), _mm512_and_si512(cut(quotes, at_b), in_b));
+        let (c1, x) = lowest(c_b);
         let (c2, _) = lowest(x);
-        // Window 2: 64 bytes from after the third comma; three more commas
-        // and the newline must be in it.
-        let o = _mm512_add_epi64(c2, one);
-        let o_back = _mm512_sub_epi64(c64, o);
-        let c_b = _mm512_or_si512(_mm512_srlv_epi64(c_lo, o), _mm512_sllv_epi64(c_hi, o_back));
-        let q_b = _mm512_or_si512(_mm512_srlv_epi64(q_lo, o), _mm512_sllv_epi64(q_hi, o_back));
+        // Window 3, from after the third comma: three more commas and the newline.
+        let o = _mm512_add_epi64(o1, after(c2));
         let nl = _mm512_sub_epi64(len, o);
-        let (c3, y) = lowest(c_b);
+        let in_c = below(nl);
+        let at_c = _mm512_add_epi64(s, o);
+        let (c_c, q_c) = (_mm512_and_si512(cut(commas, at_c), in_c), _mm512_and_si512(cut(quotes, at_c), in_c));
+        let (c3, y) = lowest(c_c);
         let (c4, y) = lowest(y);
         let (c5, _) = lowest(y);
-        let six = _mm512_cmpeq_epi64_mask(_mm512_add_epi64(_mm512_popcnt_epi64(c_lo), _mm512_popcnt_epi64(c_hi)), _mm512_set1_epi64(6));
-        let shape = six & _mm512_cmplt_epu64_mask(c2, c64) & _mm512_cmplt_epu64_mask(c5, c64) & _mm512_cmplt_epu64_mask(nl, c64);
+        let shape = _mm512_cmplt_epu64_mask(c0, c64)
+            & _mm512_cmplt_epu64_mask(c2, c64)
+            & _mm512_cmpeq_epi64_mask(_mm512_popcnt_epi64(c_c), _mm512_set1_epi64(3))
+            & _mm512_cmplt_epu64_mask(nl, c64);
 
         // Quoting: a field is quoted iff its first and last bytes are quotes,
         // and any other quote makes the line malformed. So: the same fields
         // start and end with a quote, and there are two quotes for each.
-        let q_a = _mm512_andnot_si512(_mm512_sllv_epi64(ones, c2), q_lo);
-        let q_b = _mm512_andnot_si512(_mm512_sllv_epi64(ones, nl), q_b);
-        let after = |c: __m512i| _mm512_add_epi64(c, one);
-        let before = |c: __m512i| _mm512_sub_epi64(c, one);
+        let q_a = _mm512_and_si512(q_a, below(c0));
+        let q_b = _mm512_and_si512(q_b, below(c2));
         let opens = [
             _mm512_and_si512(q_a, one),
-            bit(q_a, after(c0)),
-            bit(q_a, after(c1)),
             _mm512_and_si512(q_b, one),
-            bit(q_b, after(c3)),
-            bit(q_b, after(c4)),
-            bit(q_b, after(c5)),
+            bit(q_b, after(c1)),
+            _mm512_and_si512(q_c, one),
+            bit(q_c, after(c3)),
+            bit(q_c, after(c4)),
+            bit(q_c, after(c5)),
         ];
         let closes = [
             bit(q_a, before(c0)),
-            bit(q_a, before(c1)),
-            bit(q_a, before(c2)),
-            bit(q_b, before(c3)),
-            bit(q_b, before(c4)),
-            bit(q_b, before(c5)),
-            bit(q_b, before(nl)),
+            bit(q_b, before(c1)),
+            bit(q_b, before(c2)),
+            bit(q_c, before(c3)),
+            bit(q_c, before(c4)),
+            bit(q_c, before(c5)),
+            bit(q_c, before(nl)),
         ];
         let mut f = opens[0];
         let mut l = closes[0];
@@ -236,7 +239,7 @@ pub unsafe fn split_batch(
         for open in &opens[1..] {
             quoted = _mm512_add_epi64(quoted, *open);
         }
-        let count = _mm512_add_epi64(_mm512_popcnt_epi64(q_a), _mm512_popcnt_epi64(q_b));
+        let count = _mm512_add_epi64(_mm512_add_epi64(_mm512_popcnt_epi64(q_a), _mm512_popcnt_epi64(q_b)), _mm512_popcnt_epi64(q_c));
         let sound = _mm512_cmpeq_epi64_mask(f, l) & _mm512_cmpeq_epi64_mask(count, _mm512_add_epi64(quoted, quoted));
 
         // Up to the first line that is not taken.
@@ -245,8 +248,8 @@ pub unsafe fn split_batch(
         // An empty event_id (nothing, or just two quotes): consumed, left out.
         let empty = _mm512_cmpeq_epi64_mask(c0, _mm512_add_epi64(opens[0], opens[0]));
         let keep = take & !empty;
-        let mut sep = _mm512_or_si512(c0, _mm512_slli_epi64::<8>(c1));
-        sep = _mm512_or_si512(sep, _mm512_slli_epi64::<16>(c2));
+        let mut sep = _mm512_or_si512(c0, _mm512_slli_epi64::<8>(_mm512_add_epi64(o1, c1)));
+        sep = _mm512_or_si512(sep, _mm512_slli_epi64::<16>(_mm512_add_epi64(o1, c2)));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<24>(_mm512_add_epi64(o, c3)));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<32>(_mm512_add_epi64(o, c4)));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<40>(_mm512_add_epi64(o, c5)));
@@ -268,8 +271,9 @@ pub unsafe fn split_batch(
     (n, pos + (*ends.add(i)).wrapping_add(1) as usize, i, stuck | (i == 0))
 }
 
-/// `split_batch` for click lines: what `split_click` accepts and writes (the
-/// newline within the line's first 64 bytes, three commas, sound quoting; a
+/// `split_batch` for click lines: what `split_click` accepts and writes (three
+/// windows of 64 bytes: the click_id and its comma; from there the user_id and
+/// its comma; from there one more comma and the newline; sound quoting; a
 /// line without a click_id or a user_id is consumed and left out).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi2,avx512vpopcntdq,bmi1,bmi2,popcnt,lzcnt")]
 pub unsafe fn split_clicks_batch(
@@ -288,37 +292,54 @@ pub unsafe fn split_clicks_batch(
     let one = _mm512_set1_epi64(1);
     let ones = _mm512_set1_epi64(-1);
     let c64 = _mm512_set1_epi64(64);
+    let c63 = _mm512_set1_epi64(63);
     let zero = _mm512_setzero_si512();
     let start0 = _mm512_set1_epi64(p0 as i64);
     let limit_v = _mm512_set1_epi64(limit as i64);
     let (commas, quotes) = (ws.commas.as_ptr() as *const i64, ws.quotes.as_ptr() as *const i64);
+    let below = |n: __m512i| _mm512_andnot_si512(_mm512_sllv_epi64(ones, n), ones);
+    let after = |c: __m512i| _mm512_add_epi64(c, one);
+    let before = |c: __m512i| _mm512_sub_epi64(c, one);
     let (mut n, mut i, mut stuck) = (0usize, 0usize, false);
     while (i < k) & (n + 8 <= NB) {
         let s = _mm512_cvtepu16_epi64(_mm_add_epi16(_mm_loadu_si128(ends.add(i) as *const __m128i), _mm_set1_epi16(1)));
         let e = _mm512_cvtepu16_epi64(_mm_loadu_si128(ends.add(i + 1) as *const __m128i));
         let live = _bzhi_u32(0xFF, (k - i).min(8) as u32) as u8 & _mm512_cmplt_epu64_mask(s, limit_v);
-        // The line's comma and quote bits: 64 of them from its start, out of
-        // two words each, and none from its newline on.
-        let (word, shift) = (_mm512_srli_epi64::<6>(s), _mm512_and_si512(s, _mm512_set1_epi64(63)));
-        let back = _mm512_sub_epi64(c64, shift);
-        let cut = |words: *const i64| {
+        // 64 bits of the block words from bit `at` on (see `split_batch`).
+        let cut = |words: *const i64, at: __m512i| {
+            let (word, shift) = (_mm512_srli_epi64::<6>(at), _mm512_and_si512(at, c63));
             let w0 = _mm512_mask_i64gather_epi64::<8>(zero, live, word, words);
             let w1 = _mm512_mask_i64gather_epi64::<8>(zero, live, word, words.add(1));
-            _mm512_or_si512(_mm512_srlv_epi64(w0, shift), _mm512_sllv_epi64(w1, back))
+            _mm512_or_si512(_mm512_srlv_epi64(w0, shift), _mm512_sllv_epi64(w1, _mm512_sub_epi64(c64, shift)))
         };
         let len = _mm512_sub_epi64(e, s);
-        let below = _mm512_andnot_si512(_mm512_sllv_epi64(ones, len), ones);
-        let c = _mm512_and_si512(cut(commas), below);
-        let q = _mm512_and_si512(cut(quotes), below);
-        let (c0, x) = lowest(c);
-        let (c1, x) = lowest(x);
-        let (c2, _) = lowest(x);
-        let shape = _mm512_cmpeq_epi64_mask(_mm512_popcnt_epi64(c), _mm512_set1_epi64(3)) & _mm512_cmplt_epu64_mask(len, c64);
 
-        let after = |c: __m512i| _mm512_add_epi64(c, one);
-        let before = |c: __m512i| _mm512_sub_epi64(c, one);
-        let opens = [_mm512_and_si512(q, one), bit(q, after(c0)), bit(q, after(c1)), bit(q, after(c2))];
-        let closes = [bit(q, before(c0)), bit(q, before(c1)), bit(q, before(c2)), bit(q, before(len))];
+        // Window 1: the click_id and its comma (no bit from the newline on).
+        let in_a = below(len);
+        let (c_a, q_a) = (_mm512_and_si512(cut(commas, s), in_a), _mm512_and_si512(cut(quotes, s), in_a));
+        let (c0, _) = lowest(c_a);
+        // Window 2, from after that comma: the user_id and its comma.
+        let o1 = after(c0);
+        let in_b = below(_mm512_sub_epi64(len, o1));
+        let at_b = _mm512_add_epi64(s, o1);
+        let (c_b, q_b) = (_mm512_and_si512(cut(commas, at_b), in_b), _mm512_and_si512(cut(quotes, at_b), in_b));
+        let (c1, _) = lowest(c_b);
+        // Window 3, from after the second comma: one more comma and the newline.
+        let o = _mm512_add_epi64(o1, after(c1));
+        let nl = _mm512_sub_epi64(len, o);
+        let in_c = below(nl);
+        let at_c = _mm512_add_epi64(s, o);
+        let (c_c, q_c) = (_mm512_and_si512(cut(commas, at_c), in_c), _mm512_and_si512(cut(quotes, at_c), in_c));
+        let (c2, _) = lowest(c_c);
+        let shape = _mm512_cmplt_epu64_mask(c0, c64)
+            & _mm512_cmplt_epu64_mask(c1, c64)
+            & _mm512_cmpeq_epi64_mask(_mm512_popcnt_epi64(c_c), one)
+            & _mm512_cmplt_epu64_mask(nl, c64);
+
+        let q_a = _mm512_and_si512(q_a, below(c0));
+        let q_b = _mm512_and_si512(q_b, below(c1));
+        let opens = [_mm512_and_si512(q_a, one), _mm512_and_si512(q_b, one), _mm512_and_si512(q_c, one), bit(q_c, after(c2))];
+        let closes = [bit(q_a, before(c0)), bit(q_b, before(c1)), bit(q_c, before(c2)), bit(q_c, before(nl))];
         let mut f = opens[0];
         f = _mm512_or_si512(f, _mm512_slli_epi64::<1>(opens[1]));
         f = _mm512_or_si512(f, _mm512_slli_epi64::<2>(opens[2]));
@@ -328,16 +349,17 @@ pub unsafe fn split_clicks_batch(
         l = _mm512_or_si512(l, _mm512_slli_epi64::<2>(closes[2]));
         l = _mm512_or_si512(l, _mm512_slli_epi64::<3>(closes[3]));
         let quoted = _mm512_add_epi64(_mm512_add_epi64(opens[0], opens[1]), _mm512_add_epi64(opens[2], opens[3]));
-        let sound = _mm512_cmpeq_epi64_mask(f, l) & _mm512_cmpeq_epi64_mask(_mm512_popcnt_epi64(q), _mm512_add_epi64(quoted, quoted));
+        let count = _mm512_add_epi64(_mm512_add_epi64(_mm512_popcnt_epi64(q_a), _mm512_popcnt_epi64(q_b)), _mm512_popcnt_epi64(q_c));
+        let sound = _mm512_cmpeq_epi64_mask(f, l) & _mm512_cmpeq_epi64_mask(count, _mm512_add_epi64(quoted, quoted));
 
         let odd = live & !(shape & sound);
         let take = if odd != 0 { live & _bzhi_u32(0xFF, odd.trailing_zeros()) as u8 } else { live };
         // No click_id, or no user_id (nothing, or just two quotes): left out.
         let empty = _mm512_cmpeq_epi64_mask(c0, _mm512_add_epi64(opens[0], opens[0]))
-            | _mm512_cmpeq_epi64_mask(_mm512_sub_epi64(_mm512_sub_epi64(c1, c0), one), _mm512_add_epi64(opens[1], opens[1]));
+            | _mm512_cmpeq_epi64_mask(c1, _mm512_add_epi64(opens[1], opens[1]));
         let keep = take & !empty;
-        let mut sep = _mm512_or_si512(c0, _mm512_slli_epi64::<8>(c1));
-        sep = _mm512_or_si512(sep, _mm512_slli_epi64::<16>(c2));
+        let mut sep = _mm512_or_si512(c0, _mm512_slli_epi64::<8>(_mm512_add_epi64(o1, c1)));
+        sep = _mm512_or_si512(sep, _mm512_slli_epi64::<16>(_mm512_add_epi64(o, c2)));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<24>(len));
         sep = _mm512_or_si512(sep, _mm512_slli_epi64::<56>(f));
         _mm512_mask_compressstoreu_epi64(st.p.as_mut_ptr().add(n) as *mut _, keep, _mm512_add_epi64(start0, s));
