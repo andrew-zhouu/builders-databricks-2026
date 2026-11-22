@@ -25,7 +25,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::ids::{event_hash, hash9, raw_key_fast};
+use crate::ids::{base36_id, event_hash, hash9, index_of, raw_key_fast, unmix};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
@@ -82,7 +82,77 @@ pub struct EventOut<'a> {
 /// The trace partition and the trace word (without the position) of an event-ID hash.
 #[inline(always)]
 pub fn trace_of(ctx: &Ctx, h: u64) -> (usize, u64) {
-    ((((h >> 32) * ctx.pd as u64) >> 32) as usize, (h & ctx.fp_mask) << ctx.loc_bits)
+    ((((h >> 32) * ctx.pd_x as u64) >> 32) as usize, (h & ctx.fp_mask) << ctx.loc_bits)
+}
+
+/// How event IDs become indexes in this run (see ids.rs, "event indexes"). An
+/// ID is *indexed* when it is canonical and its number, un-scrambled with
+/// `key`, is below `bound`: its trace then goes to partition
+/// `base + (index >> pb)` and carries the index's low `pb` bits where other
+/// traces carry a fingerprint. Whether an ID is indexed depends only on the ID,
+/// so all copies of an event take the same road. Only on while the wide parser
+/// runs: it decodes eight IDs at a time, and one at a time the decode costs
+/// more than the index saves.
+#[derive(Clone, Copy)]
+pub struct Ix {
+    pub on: bool,
+    /// Test switch: the index is the ID's number itself.
+    pub identity: bool,
+    pub key: u64,
+    pub bound: u64,
+    pub pb: u32,
+    pub base: u32,
+}
+
+impl Ix {
+    #[inline(always)]
+    fn index(&self, y: u64) -> u64 {
+        if self.identity {
+            y
+        } else {
+            index_of(unmix(y), self.key)
+        }
+    }
+
+    /// The index of an event ID, if it is an indexed one.
+    pub fn of(&self, id: &[u8]) -> Option<u64> {
+        if !self.on {
+            return None;
+        }
+        let v = self.index(base36_id(id, b'e')?);
+        (v < self.bound).then_some(v)
+    }
+
+    /// The trace partition and trace word (without the position) of index `v`.
+    #[inline(always)]
+    pub fn trace(&self, v: u64, loc_bits: u32) -> (usize, u64) {
+        (self.base as usize + (v >> self.pb) as usize, (v & ((1 << self.pb) - 1)) << loc_bits)
+    }
+}
+
+/// For finding the key: `unmix` of the numbers of up to 12 different event IDs
+/// of the indexed shape, from the first lines of an events file.
+pub fn sample_ids(data: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let Some(header) = find_newline(data, 0) else { return out };
+    let (mut pos, mut lines) = (header + 1, 0);
+    while pos < data.len() && lines < 4096 && out.len() < 12 {
+        let end = find_newline(data, pos).unwrap_or(data.len());
+        let line = &data[pos..end];
+        let mut id = &line[..line.iter().position(|&c| c == b',').unwrap_or(line.len())];
+        if id.len() >= 2 && id[0] == b'"' && id[id.len() - 1] == b'"' {
+            id = &id[1..id.len() - 1];
+        }
+        if let Some(y) = base36_id(id, b'e') {
+            let z = unmix(y);
+            if !out.contains(&z) {
+                out.push(z);
+            }
+        }
+        pos = end + 1;
+        lines += 1;
+    }
+    out
 }
 
 // ------------------------------------------------------------------ dates
@@ -563,12 +633,22 @@ pub fn event_records(ctx: &Ctx, e: &Event) -> (usize, u64, u64) {
 #[inline(never)]
 fn event_line(ctx: &Ctx, out: &mut EventOut, line: &[u8], loc: u64) {
     let Some(e) = parse_event(ctx, line) else { return };
-    let h = event_hash(e.id);
-    let (pk, trace) = trace_of(ctx, h);
+    let ix = ctx.index();
+    let (pk, trace, h4) = match ix.of(e.id) {
+        Some(v) => {
+            let (pk, trace) = ix.trace(v, ctx.loc_bits);
+            (pk, trace, 0)
+        }
+        None => {
+            let h = event_hash(e.id);
+            let (pk, trace) = trace_of(ctx, h);
+            (pk, trace, h >> 40)
+        }
+    };
     let mut w2 = 0;
     if e.valid {
         let (sp, rec, extra) = event_records(ctx, &e);
-        w2 = trace_valid(h >> 40, (sp as u64) << LOCAL_BITS | rec >> 31, rec & TS_MASK);
+        w2 = trace_valid(h4, (sp as u64) << LOCAL_BITS | rec >> 31, rec & TS_MASK);
         if e.purchase {
             out.ps.push2(&ctx.pool, sp, rec, extra);
             w2 |= T_PURCHASE;
@@ -799,12 +879,13 @@ struct IdParams {
     pd: u64,
     fp_mask: u64,
     loc_bits: u32,
+    ix: Ix,
 }
 
 impl IdParams {
     #[inline(always)]
     fn new(ctx: &Ctx) -> IdParams {
-        IdParams { pd: ctx.pd as u64, fp_mask: ctx.fp_mask, loc_bits: ctx.loc_bits }
+        IdParams { pd: ctx.pd_x as u64, fp_mask: ctx.fp_mask, loc_bits: ctx.loc_bits, ix: ctx.index() }
     }
 }
 
@@ -819,6 +900,17 @@ impl IdParams {
 /// (`wide::id_trace4`); with `wide::ID_TRACE_WIDE` off it calls this one.
 #[inline(always)]
 fn id_trace(idp: &IdParams, first: u8, rest: u64, n: u64) -> (u32, u64, bool) {
+    if idp.ix.on && (2..=9).contains(&n) {
+        // An indexed ID (see `Ix`): its place among all events. (One line at
+        // a time this is only for checking `wide::id_trace8` against.)
+        let mut id = [0u8; 9];
+        id[0] = first;
+        id[1..].copy_from_slice(&rest.to_le_bytes());
+        if let Some(v) = idp.ix.of(&id[..n as usize]) {
+            let (pk, trace) = idp.ix.trace(v, idp.loc_bits);
+            return (pk as u32, trace, false);
+        }
+    }
     let h = hash9(first, rest);
     ((((h >> 32) * idp.pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16, (h & idp.fp_mask) << idp.loc_bits, n > 9)
 }

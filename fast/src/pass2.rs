@@ -23,12 +23,25 @@
 //! Every valid event that is left is written to its person's partition (as
 //! soon as it is known to count: most during the second reading of the
 //! traces), into the trace blocks of the partitions already done.
+//!
+//! That is the road of event IDs that are not *indexed* (parse::Ix). The
+//! indexed ones, all of them in generated data, have partitions of their own,
+//! one per range of indexes, and `run_indexed` settles a partition without
+//! fingerprints: a trace goes to the slot of its index, and a second trace for
+//! a slot is a copy. A walk over the slots then meets the events of one user
+//! together and, in generated data, in time order, so it can hand a person's
+//! events on as *intervals*: runs of events no more than 30 minutes apart, as
+//! first time, last time and count. An event from the other road is an
+//! interval of one. Pass 3 joins a person's intervals into sessions.
 
 use core::arch::x86_64::{_bzhi_u64, _mm_prefetch, _MM_HINT_T0};
 
-use crate::parse::{can_decode, decode_event, event_records, parse_event, trace_record, Decoded, CANCEL, LOCAL_BITS, T_PURCHASE};
+use crate::parse::{
+    can_decode, decode_event, event_records, parse_event, trace_record, Decoded, CANCEL, LOCAL_BITS, PERSON_BITS, TS_MASK,
+    T_PURCHASE, T_VALID,
+};
 use crate::part::PartWriter;
-use crate::util::find_newline;
+use crate::util::{find_newline, GAP_MS};
 use crate::Ctx;
 
 /// "Use the scalar path" (see `parse::Decoded`).
@@ -110,9 +123,27 @@ pub struct Scratch {
     reread: Vec<u64>,
     copies: Vec<Copy>,
     pending: Vec<Pending>,
+    /// `run_indexed`: the first trace of each index of the partition (second
+    /// word 0: no line has it).
+    place: Vec<[u64; 2]>,
 }
 
-pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, s: &mut PartWriter, p: usize) {
+/// In a slot of `Scratch::place`: some line has this index. (The rest of the
+/// word is the trace's second word, whose bits 58 to 61 are zero for an
+/// indexed event.)
+const PRESENT: u64 = 1 << 61;
+
+/// A person's events as an interval, to the person's partition: two words,
+/// `person_local | first` and `count | last`.
+#[inline(always)]
+unsafe fn send_interval(s: &mut PartWriter, sw: *mut *mut u64, ctx: &Ctx, person: u64, first: u64, last: u64, count: u64) {
+    let local = person & ((1 << LOCAL_BITS) - 1);
+    s.push2_at(sw, &ctx.pool, (person >> LOCAL_BITS) as usize, local << 31 | first, count << 31 | last);
+}
+
+/// `IV`: events are handed on as intervals of one (the run has indexed
+/// IDs, see `run_indexed`), not as plain event records.
+pub fn run<const IV: bool>(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, s: &mut PartWriter, p: usize) {
     let t0 = ctx.now();
     // A trace is two words (parse::T_VALID and friends describe the second).
     let n: usize = (0..ctx.nthreads).map(|t| ctx.k(t).part_words(p)).sum::<usize>() / 2;
@@ -125,7 +156,13 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, s: &mut PartWriter, p
     macro_rules! send {
         ($w2:expr) => {{
             let (part, rec) = trace_record($w2);
-            unsafe { s.push1_at(sw, pool, part as usize, rec) };
+            unsafe {
+                if IV {
+                    s.push2_at(sw, pool, part as usize, rec, 1 << 31 | (rec & TS_MASK))
+                } else {
+                    s.push1_at(sw, pool, part as usize, rec)
+                }
+            };
         }};
     }
 
@@ -243,8 +280,129 @@ pub fn run(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, s: &mut PartWriter, p
     let t0 = ctx.charge_rows(crate::P_D_GROUP, t0, sc.cand.len());
     read_again(ctx, sc);
     let t0 = ctx.charge_rows(crate::P_D_READ, t0, sc.reread.len());
-    settle(&mut sc.copies, out, |part, rec| unsafe { s.push1_at(sw, pool, part as usize, rec) });
+    settle(&mut sc.copies, out, |c| unsafe {
+        if IV {
+            s.push2_at(sw, pool, c.part as usize, c.rec, 1 << 31 | (c.rec & TS_MASK))
+        } else {
+            s.push1_at(sw, pool, c.part as usize, c.rec)
+        }
+    });
     ctx.charge_rows(crate::P_D_EMIT, t0, sc.reread.len());
+}
+
+/// Pass 2 for a partition of indexed events (see the top of the file).
+pub fn run_indexed(ctx: &Ctx, sc: &mut Scratch, out: &mut Cancels, s: &mut PartWriter, p: usize) {
+    let t0 = ctx.now();
+    let n: usize = (0..ctx.nthreads).map(|t| ctx.k(t).part_words(p)).sum::<usize>() / 2;
+    if n == 0 {
+        return;
+    }
+    let pool = &ctx.pool;
+    let size = 1usize << ctx.idx_pb;
+    if sc.place.len() != size {
+        sc.place = vec![[0; 2]; size];
+    }
+    let shift = ctx.loc_bits;
+    let place = sc.place.as_mut_ptr();
+    // Each trace to the slot of its index (always below `size`: the parser
+    // stores the index's low bits only): both words, the second marked
+    // `PRESENT`. A slot already taken means a copy, which is set aside.
+    sc.cand.clear();
+    let mut top = 0usize;
+    for t in 0..ctx.nthreads {
+        ctx.k(t).for_each_run(pool, p, |run| {
+            for r in run.chunks_exact(2) {
+                let i = (r[0] >> shift) as usize;
+                top = top.max(i);
+                unsafe {
+                    let slot = place.add(i);
+                    if (*slot)[1] == 0 {
+                        *slot = [r[0], r[1] | PRESENT];
+                    } else {
+                        sc.cand.push([r[0], r[1] | PRESENT]);
+                    }
+                }
+            }
+        });
+    }
+    // The traces have been read for the last time: intervals go into their blocks.
+    for t in 0..ctx.nthreads {
+        s.free.extend_from_slice(ctx.k(t).part_blocks(p));
+    }
+    let mut t0 = ctx.charge_rows(crate::P_D_DEDUP, t0, n);
+    if !sc.cand.is_empty() {
+        // The copies by index. The usual ones all say the same as the first
+        // trace of their index (passed validation for the same person and
+        // time, or failed it) and are no purchases: whichever of them is the
+        // kept one, exactly that much counts, which is what the slot holds.
+        // For any other index the lines decide: every trace of it is read
+        // again, the first one included.
+        sc.cand.sort_unstable_by_key(|r| r[0] >> shift);
+        sc.reread.clear();
+        let cand = &sc.cand[..];
+        let mut a = 0;
+        while a < cand.len() {
+            let i = (cand[a][0] >> shift) as usize;
+            let first = unsafe { *place.add(i) };
+            let mut same = first[1] & T_PURCHASE == 0;
+            let mut b = a;
+            while b < cand.len() && (cand[b][0] >> shift) as usize == i {
+                same &= cand[b][1] == first[1];
+                b += 1;
+            }
+            if same {
+                out.dropped += if first[1] & T_VALID != 0 { b - a } else { 0 };
+            } else {
+                sc.reread.push(first[0]);
+                sc.reread.extend(cand[a..b].iter().map(|r| r[0]));
+                // Until the lines say otherwise, nothing of this event counts.
+                unsafe { (*place.add(i))[1] = PRESENT };
+            }
+            a = b;
+        }
+        t0 = ctx.charge_rows(crate::P_D_GROUP, t0, sc.cand.len());
+        if !sc.reread.is_empty() {
+            read_again(ctx, sc);
+            t0 = ctx.charge_rows(crate::P_D_READ, t0, sc.reread.len());
+            // (Equal indexes are equal IDs, so each group is one event;
+            // `settle` compares the IDs all the same.)
+            settle(&mut sc.copies, out, |c| unsafe {
+                let person = (c.part as u64) << LOCAL_BITS | c.rec >> 31;
+                (*place.add(c.fp as usize))[1] = PRESENT | T_VALID | person << 31 | (c.rec & TS_MASK);
+            });
+            t0 = ctx.charge_rows(crate::P_D_EMIT, t0, sc.reread.len());
+        }
+    }
+    // The walk. An event joins the interval before it if it is the same
+    // person's and its time lies between the interval's first time and 30
+    // minutes after its last: an interval then is always a run of events no
+    // more than 30 minutes apart, in whatever order the events come. In
+    // generated data they come in time order, user after user, so an interval
+    // is a whole session, or what one user contributes to it.
+    let sw = s.cursors();
+    let gap = GAP_MS as u64;
+    let (mut person, mut first, mut last, mut count) = (u64::MAX, 0u64, 0u64, 0u64);
+    for i in 0..=top {
+        let v = unsafe { (*place.add(i))[1] };
+        unsafe { (*place.add(i))[1] = 0 };
+        if v & T_VALID == 0 {
+            continue;
+        }
+        let (who, t) = (v >> 31 & ((1 << PERSON_BITS) - 1), v & TS_MASK);
+        if (who == person) & (t >= first) & (t <= last + gap) {
+            last = last.max(t);
+            count += 1;
+        } else {
+            if person != u64::MAX {
+                unsafe { send_interval(s, sw, ctx, person, first, last, count) };
+            }
+            (person, first, last, count) = (who, t, t, 1);
+        }
+    }
+    if person != u64::MAX {
+        unsafe { send_interval(s, sw, ctx, person, first, last, count) };
+    }
+    ctx.charge_rows(crate::P_D_GATHER, t0, n);
 }
 
 /// Order traces by fingerprint (the bits of their first word from `shift`
@@ -380,7 +538,7 @@ fn same_id(a: &Copy, b: &Copy) -> bool {
 /// The copies of one event (one or more): the kept one counts if it is valid
 /// (`send`), and every other valid one must not (and takes its purchase back).
 #[inline(always)]
-fn event(copies: &[Copy], out: &mut Cancels, send: &mut impl FnMut(u32, u64)) {
+fn event(copies: &[Copy], out: &mut Cancels, send: &mut impl FnMut(&Copy)) {
     let mut kept = 0;
     for (at, c) in copies.iter().enumerate() {
         if c.ingest < copies[kept].ingest {
@@ -390,7 +548,7 @@ fn event(copies: &[Copy], out: &mut Cancels, send: &mut impl FnMut(u32, u64)) {
     for (at, c) in copies.iter().enumerate() {
         if c.valid {
             if at == kept {
-                send(c.part, c.rec);
+                send(c);
             } else {
                 out.dropped += 1;
                 if c.extra != 0 {
@@ -403,7 +561,7 @@ fn event(copies: &[Copy], out: &mut Cancels, send: &mut impl FnMut(u32, u64)) {
 
 /// Group the copies by fingerprint and then by their actual event IDs, and
 /// settle each event.
-fn settle(copies: &mut [Copy], out: &mut Cancels, mut send: impl FnMut(u32, u64)) {
+fn settle(copies: &mut [Copy], out: &mut Cancels, mut send: impl FnMut(&Copy)) {
     let mut a = 0;
     while a < copies.len() {
         let mut b = a + 1;

@@ -87,8 +87,51 @@ unsafe fn id_trace8(idp: &IdParams, first: __m512i, rest: __m512i, n: __m512i) -
         let x = xor!(rest, _mm512_mullo_epi64(first, v!(0xD6E8_FEB8_6659_FD93u64)));
         let a = _mm512_mullo_epi64(x, v!(0x9E37_79B9_7F4A_7C15u64));
         let h = xor!(a, srl!(a, 32));
-        let pk = or!(srl!(mul!(srl!(h, 32), v!(idp.pd)), 32), sll!(and!(srl!(h, 40), v!(15)), 16));
-        let trace = _mm512_sll_epi64(and!(h, v!(idp.fp_mask)), _mm_cvtsi32_si128(idp.loc_bits as i32));
+        let mut pk = or!(srl!(mul!(srl!(h, 32), v!(idp.pd)), 32), sll!(and!(srl!(h, 40), v!(15)), 16));
+        let mut trace = _mm512_sll_epi64(and!(h, v!(idp.fp_mask)), _mm_cvtsi32_si128(idp.loc_bits as i32));
+        let ix = &idp.ix;
+        if ix.on {
+            // An indexed ID (see `super::Ix`, and `Ix::of` for the same one ID
+            // at a time): `e`, then 1 to 8 base-36 digits with no leading zero
+            // (unless it is the only digit), a number below 2^40 whose index
+            // is below the bound. Such a line's trace goes by its index.
+            let ones = v!(u64::MAX);
+            let digits = sub!(n, v!(1));
+            let from_0 = _mm512_sub_epi8(rest, _mm512_set1_epi8(b'0' as i8));
+            let from_a = _mm512_sub_epi8(rest, _mm512_set1_epi8(b'a' as i8));
+            let is_09 = _mm512_cmple_epu8_mask(from_0, _mm512_set1_epi8(9));
+            let is_az = _mm512_cmple_epu8_mask(from_a, _mm512_set1_epi8(25));
+            // Each byte's value as a digit; 0 for a byte that is none (the
+            // zeros past the ID among them).
+            let value = _mm512_mask_add_epi8(_mm512_maskz_mov_epi8(is_09, from_0), is_az, from_a, _mm512_set1_epi8(10));
+            // Exactly the ID's bytes after the first are digits.
+            let want = _mm512_andnot_si512(_mm512_sllv_epi64(ones, sll!(digits, 3)), ones);
+            let all_digits = _mm512_cmpeq_epi64_mask(_mm512_movm_epi8(is_09 | is_az), want);
+            // Most significant digit first: the last digit to the top byte, so
+            // that the missing leading ones are zeros; then base 36 by pairs.
+            let aligned = _mm512_sllv_epi64(value, sub!(v!(64), sll!(digits, 3)));
+            let pairs = _mm512_maddubs_epi16(aligned, _mm512_set1_epi16(0x0124)); // bytes 36, 1
+            let fours = _mm512_madd_epi16(pairs, _mm512_set1_epi32(0x0001_0510)); // words 1296, 1
+            let y = add!(mul!(fours, v!(1_679_616)), srl!(fours, 32));
+            let canonical = all_digits
+                & _mm512_cmplt_epu64_mask(sub!(n, v!(2)), v!(8))
+                & _mm512_cmpeq_epi64_mask(first, v!(b'e'))
+                & (_mm512_cmpneq_epi64_mask(and!(rest, v!(0xFF)), v!(b'0')) | _mm512_cmpeq_epi64_mask(digits, v!(1)))
+                & _mm512_cmple_epu64_mask(y, v!(crate::ids::MASK40));
+            let index = if ix.identity {
+                y
+            } else {
+                // ids::unmix, ids::index_of
+                let t = and!(_mm512_mullo_epi64(y, v!(crate::ids::M2_INV)), v!(crate::ids::MASK40));
+                let z = xor!(xor!(t, srl!(t, 17)), srl!(t, 34));
+                and!(_mm512_mullo_epi64(xor!(z, v!(ix.key)), v!(crate::ids::M1_INV)), v!(crate::ids::MASK40))
+            };
+            let indexed = canonical & _mm512_cmplt_epu64_mask(index, v!(ix.bound));
+            let part = add!(v!(ix.base), _mm512_srl_epi64(index, _mm_cvtsi32_si128(ix.pb as i32)));
+            let low = _mm512_sll_epi64(and!(index, v!((1u64 << ix.pb) - 1)), _mm_cvtsi32_si128(idp.loc_bits as i32));
+            pk = _mm512_mask_mov_epi64(pk, indexed, part);
+            trace = _mm512_mask_mov_epi64(trace, indexed, low);
+        }
         (pk, trace, _mm512_cmpgt_epu64_mask(n, v!(9)))
     } else {
         let (mut f, mut r, mut len) = ([0u64; W], [0u64; W], [0u64; W]);

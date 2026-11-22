@@ -94,6 +94,9 @@ const SLOTS: usize = 1 << (31 - SLOT_SHIFT);
 const _: () = assert!((1u32 << SLOT_SHIFT) <= GAP_MS);
 
 pub struct Scratch {
+    /// `run_intervals`: the partition's intervals, and where each person's start.
+    iv: Vec<u64>,
+    iv_at: Vec<u32>,
     /// `start[l]..start[l + 1]` are the events of person `l` in the sorted buffer.
     start: Vec<u32>,
     /// Radix sort buffers and histograms (slots, then persons).
@@ -121,6 +124,8 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(ctx: &Ctx) -> Scratch {
         Scratch {
+            iv: Vec::new(),
+            iv_at: Vec::new(),
             start: vec![0; LOCALS + 1],
             a: Vec::new(),
             b: Vec::new(),
@@ -655,3 +660,270 @@ fn assists_by_campaign(sc: &mut Scratch, cl: &[[u64; 2]], ndays: usize) {
         }
     }
 }
+
+
+// ------------------------------------------------------------------ intervals
+//
+// When the run has indexed event IDs (parse::Ix), pass 2 hands a person's
+// events on as intervals (runs of events no more than 30 minutes apart: first
+// time, last time, count; see pass2::run_indexed), and these two take the
+// place of `run` and `person`: everything is the same except where sessions
+// come from.
+
+pub fn run_intervals(ctx: &Ctx, sc: &mut Scratch, p: usize) {
+    let t0 = ctx.now();
+    // The partition's intervals (two words each: `person_local | first`,
+    // `count | last`), purchases and clicks, from every thread's writers.
+    sc.iv.clear();
+    for t in 0..ctx.nthreads {
+        ctx.s(t).copy_part(&ctx.pool, p, &mut sc.iv);
+    }
+    if sc.iv.is_empty() {
+        return;
+    }
+    sc.pu.clear();
+    sc.cl.clear();
+    for t in 0..ctx.nthreads {
+        ctx.ps(t).copy_part(&ctx.pool, p, &mut sc.pu);
+        for &(_, w) in ctx.x(t).purchases(p) {
+            sc.pu.extend_from_slice(&w);
+        }
+        ctx.c(t).copy_part(&ctx.pool, p, &mut sc.cl);
+    }
+    let n = sc.iv.len() / 2;
+    let t0 = ctx.charge_rows(crate::P_S_GATHER, t0, n);
+
+    {
+        // At most one row per interval (see `flush_day`).
+        let r = &mut sc.rows;
+        r.day.reserve(n);
+        r.sessions.reserve(n);
+        r.events.reserve(n);
+        r.revenue.reserve(n);
+        r.id_idx.reserve(n);
+    }
+    let mut iv = std::mem::take(&mut sc.iv);
+    let mut pu = std::mem::take(&mut sc.pu);
+    let mut cl = std::mem::take(&mut sc.cl);
+    let mut kept_pu = std::mem::take(&mut sc.kept_pu);
+    // Intervals by (person, first time); purchases by (person, ts), a
+    // person's cancellations after their purchases; clicks by (person, ts,
+    // campaign).
+    sort_pairs(&mut iv, &mut sc.b, &mut sc.h, 31);
+    sort_pairs(&mut pu, &mut sc.b, &mut sc.h, 31);
+    sort_pairs(&mut cl, &mut sc.b, &mut sc.h, CLICK_SHIFT);
+    {
+        let iv = pairs(&mut iv);
+        let pu = pairs(&mut pu);
+        let cl = pairs(&mut cl);
+        let t0 = ctx.charge_rows(crate::P_S_SORT, t0, iv.len() + pu.len() + cl.len());
+        let (mut pi, mut ci) = (0, 0);
+        // Where each person's intervals start, so that the walk can ask for a
+        // person's name (a slot of the user table, far from any cache) a few
+        // people ahead.
+        let local_of = |r: &[u64; 2]| (r[0] >> 31) as usize & (LOCALS - 1);
+        let mut present = std::mem::take(&mut sc.iv_at);
+        present.clear();
+        let mut before = usize::MAX;
+        for (at, r) in iv.iter().enumerate() {
+            let local = local_of(r);
+            if local != before {
+                present.push(at as u32);
+                before = local;
+            }
+        }
+        let people = present.len();
+        present.push(iv.len() as u32);
+        let base = (p << LOCAL_BITS) as u32;
+        for at in 0..people {
+            if at + PEOPLE_AHEAD < people {
+                ctx.table.prefetch_slot(base | local_of(&iv[present[at + PEOPLE_AHEAD] as usize]) as u32);
+            }
+            let intervals = &iv[present[at] as usize..present[at + 1] as usize];
+            let local = local_of(&intervals[0]);
+            // Skip the records of people without events: someone whose events
+            // were all cancelled still has their (cancelled) purchases here.
+            while pi < pu.len() && ((pu[pi][0] >> 31) as usize & (LOCALS - 1)) < local {
+                pi += 1;
+            }
+            let mut pj = pi;
+            while pj < pu.len() && (pu[pj][0] >> 31) as usize & (LOCALS - 1) == local {
+                pj += 1;
+            }
+            let mut purchases = &pu[pi..pj];
+            pi = pj;
+            let local = local as u64;
+            while ci < cl.len() && cl[ci][0] >> CLICK_SHIFT < local {
+                ci += 1;
+            }
+            let mut cj = ci;
+            while cj < cl.len() && cl[cj][0] >> CLICK_SHIFT == local {
+                cj += 1;
+            }
+            let clicks = &cl[ci..cj];
+            ci = cj;
+            // A person's cancelled purchases sort after their purchases.
+            if purchases.last().is_some_and(|r| r[0] & CANCEL != 0) {
+                apply_purchase_cancels(purchases, &mut kept_pu);
+                purchases = &kept_pu;
+            }
+            person_iv(ctx, sc, base | local as u32, intervals, purchases, clicks);
+        }
+        sc.iv_at = present;
+        ctx.charge_rows(crate::P_S_PEOPLE, t0, n);
+    }
+    sc.iv = iv;
+    sc.pu = pu;
+    sc.cl = cl;
+    sc.kept_pu = kept_pu;
+}
+
+fn person_iv(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[[u64; 2]], pu: &[[u64; 2]], cl: &[[u64; 2]]) {
+    // The person's name, once: the next entry of the user_id dictionary.
+    let key = ctx.table.key(slot);
+    {
+        let r = &mut sc.rows;
+        if key & crate::ids::IRREGULAR == 0 {
+            let mut rec = [0u8; 16];
+            let n = id_record(key, &mut rec);
+            r.ids.reserve(16);
+            unsafe {
+                // Copy a fixed 16 bytes and keep only the record's length.
+                let len = r.ids.len();
+                std::ptr::copy_nonoverlapping(rec.as_ptr(), r.ids.as_mut_ptr().add(len), 16);
+                r.ids.set_len(len + n);
+            }
+        } else {
+            let mut name = Vec::new();
+            ctx.users.bytes(key, &mut name);
+            r.ids.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            r.ids.extend_from_slice(&name);
+        }
+        r.people += 1;
+    }
+    let ndays = ctx.ndays;
+    let organic = ctx.campaigns().organic as usize;
+    let n = ev.len();
+    let nc = cl.len();
+    // With many sessions and many clicks, per-session scans of the click window
+    // are quadratic; assists are then counted per campaign instead (below).
+    let big = (n as u64) * (nc as u64) > 20_000;
+    sc.starts.clear();
+    sc.sdays.clear();
+
+    let (mut lo, mut hi, mut pk) = (0usize, 0usize, 0usize);
+    let mut cur_day = u32::MAX;
+    let (mut d_sessions, mut d_events, mut d_revenue) = (0i32, 0i32, 0i64);
+    // Sessions: `ev` holds the person's intervals in order of their first
+    // time; each is a run of events no more than 30 minutes apart. A session
+    // is a chain of intervals in which each starts no later than 30 minutes
+    // after the latest time so far (it may start before that time: intervals
+    // from different parts of the input can overlap). It ends where the next
+    // interval starts later than that: all intervals after it do too.
+    let mut k = 0;
+    loop {
+        let start = (ev[k][0] & TS_MASK) as u32;
+        let mut last = (ev[k][1] & TS_MASK) as u32;
+        let mut events = (ev[k][1] >> 31) as i32;
+        let mut m = k + 1;
+        while m < n {
+            let first = (ev[m][0] & TS_MASK) as u32;
+            if first > last && first - last > GAP_MS {
+                break;
+            }
+            last = last.max((ev[m][1] & TS_MASK) as u32);
+            events += (ev[m][1] >> 31) as i32;
+            m += 1;
+        }
+        let more = m < n;
+        let day = ((start as u64 + ctx.day_off) / DAY_MS as u64) as u32;
+        if day != cur_day {
+            if cur_day != u32::MAX {
+                flush_day(sc, cur_day, d_sessions, d_events, d_revenue);
+            }
+            cur_day = day;
+            d_sessions = 0;
+            d_events = 0;
+            d_revenue = 0;
+        }
+        // Purchases of this session: every purchase with ts in [start, last].
+        let mut revenue = 0u64;
+        let mut purchasing = false;
+        while pk < pu.len() && (unsafe { pu.get_unchecked(pk) }[0] & TS_MASK) as u32 <= last {
+            let w = unsafe { pu.get_unchecked(pk) }[1];
+            let price = w >> 32;
+            let cat = w as u32;
+            revenue += price;
+            purchasing = true;
+            let cell = unsafe { sc.cat_sum.get_unchecked_mut(cat as usize) };
+            if *cell == 0 {
+                sc.touched.push(cat);
+            }
+            *cell += price;
+            pk += 1;
+        }
+        d_sessions += 1;
+        d_events += events;
+        d_revenue += revenue as i64;
+
+        // Credit: the latest click in [start - 7 days, start]; ties to the smallest click_id.
+        let c0 = |i: usize| unsafe { cl.get_unchecked(i) }[0];
+        while hi < nc && click_ts(c0(hi)) <= start {
+            hi += 1;
+        }
+        while lo < hi && click_ts(c0(lo)) as i64 + REACH_MS < start as i64 {
+            lo += 1;
+        }
+        let campaign = if hi > lo {
+            let tmax = click_ts(c0(hi - 1));
+            let mut best = hi - 1;
+            let mut j = hi - 1;
+            while j > lo && click_ts(c0(j - 1)) == tmax {
+                j -= 1;
+                if ctx.clicks.less(cl[j][1], cl[best][1]) {
+                    best = j;
+                }
+            }
+            click_campaign(c0(best))
+        } else {
+            organic
+        };
+        // (A campaign is an index into the campaign list and a day is inside
+        // the window, by construction of the records.)
+        let cell = unsafe { sc.acc.credit.get_unchecked_mut(campaign * ndays + day as usize) };
+        cell.sessions += 1;
+        cell.purchasing += purchasing as u32;
+        cell.revenue += revenue;
+
+        if big {
+            sc.starts.push(start);
+            sc.sdays.push(day);
+        } else if hi > lo {
+            // Assists: each distinct campaign in the window, once.
+            sc.tag = sc.tag.wrapping_add(1);
+            if sc.tag == 0 {
+                sc.stamp.iter_mut().for_each(|s| *s = 0);
+                sc.tag = 1;
+            }
+            for c in unsafe { cl.get_unchecked(lo..hi) } {
+                let camp = click_campaign(c[0]);
+                unsafe {
+                    let stamp = sc.stamp.get_unchecked_mut(camp);
+                    if *stamp != sc.tag {
+                        *stamp = sc.tag;
+                        *sc.acc.assisted.get_unchecked_mut(camp * ndays + day as usize) += 1;
+                    }
+                }
+            }
+        }
+        if !more {
+            break;
+        }
+        k = m;
+    }
+    flush_day(sc, cur_day, d_sessions, d_events, d_revenue);
+    if big {
+        assists_by_campaign(sc, cl, ndays);
+    }
+}
+
