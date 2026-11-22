@@ -1109,7 +1109,7 @@ fn main() {
         scalar_only: std::env::var("SS_SCALAR").is_ok(),
         prefetch_ahead: std::env::var("SS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
         wide_split: !std::env::var("SS_WSPLIT").is_ok_and(|v| v == "0")
-            && if parse::wide_kind() == 2 { parse::splitw::available5() } else { parse::splitw::available() },
+            && if matches!(parse::wide_kind(), 2 | 3) { parse::splitw::available5() } else { parse::splitw::available() },
         split_check: std::env::var("SS_SPLIT_CHECK").is_ok_and(|v| v == "1"),
         zap: std::env::var("SS_NOZAP").is_err(),
         // SS_OUT_CHUNK (experiment): bytes of rows per user_daily file.
