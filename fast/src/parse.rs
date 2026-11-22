@@ -1274,6 +1274,7 @@ fn click_line(ctx: &Ctx, c: &mut PartWriter, line: &[u8]) {
 /// A batch of click lines, for the same three loops as events (see "events,
 /// staged").
 #[repr(C, align(64))]
+#[derive(Clone, Copy)]
 struct ClickStage {
     p: [*const u8; NB],
     /// Bytes 0..4: the offsets of the line's three commas and its newline;
@@ -1424,8 +1425,12 @@ unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, n: usize) {
     }
 }
 
+/// Whether `splitw` has a batch splitter for click lines (see the place for
+/// it in `clicks_chunk_fn`).
+const CLICK_BATCH: bool = false;
+
 macro_rules! clicks_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1446,9 +1451,20 @@ macro_rules! clicks_chunk_fn {
                 ts_len: [0; NB],
                 sl: [0; 2],
             };
+            // The batch splitter, in the instance for processors that have it.
+            let batch = $batch & ctx.wide_split & CLICK_BATCH;
             while pos < ch.end {
                 let mut n = 0usize;
-                if pos >= HEAD {
+                // The line at `pos` after the batch is for the scalar path.
+                let mut stuck = true;
+                if (pos >= HEAD) & batch {
+                    // The place for the batch splitter, as in `events_chunk_fn`:
+                    //     let (m, to, took, odd) = splitw::split_clicks_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
+                    //     (n, pos, stuck) = (m, to, odd);
+                    //     lines += took;
+                    // inside `if pos < fast_hi`, with `let mut ws = splitw::Wide::new();`
+                    // before the loop, and `CLICK_BATCH` set.
+                } else if pos >= HEAD {
                     unsafe {
                         while (n < NB) & (pos < fast_hi) {
                             let p = data.as_ptr().add(pos);
@@ -1462,10 +1478,11 @@ macro_rules! clicks_chunk_fn {
                             n += added as usize;
                         }
                     }
+                    stuck = n < NB;
                 }
                 if n > 0 {
                     unsafe {
-                        click_decode(ctx, &mut st, n);
+                        $decode(ctx, &mut st, n);
                         click_emit(ctx, c, &st, n);
                         // The scalar path for what the stages could not decide.
                         if st.flags[..n].iter().fold(0, |a, &f| a | f) & C_DEAD != 0 {
@@ -1477,7 +1494,7 @@ macro_rules! clicks_chunk_fn {
                         }
                     }
                 }
-                if (n < NB) & (pos < ch.end) {
+                if stuck & (pos < ch.end) {
                     lines += 1;
                     let e = find_newline(data, pos).unwrap_or(len);
                     click_line(ctx, c, &data[pos..e]);
@@ -1488,11 +1505,13 @@ macro_rules! clicks_chunk_fn {
         }
     };
 }
-clicks_chunk_fn!(clicks_chunk_base, split_click);
+clicks_chunk_fn!(clicks_chunk_base, split_click, click_decode, false);
 clicks_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     clicks_chunk_wide,
-    split_click_wide
+    split_click_wide,
+    wide::click_decode,
+    true
 );
 
 pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
