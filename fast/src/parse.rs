@@ -359,6 +359,7 @@ pub fn wide_kind() -> u8 {
     let kind = match std::env::var("SS_SIMD").ok().as_deref() {
         Some("0") => 0,
         Some("2") => 2 * wide512_capable() as u8,
+        Some("3") => 3 * wide512_capable() as u8,
         Some("1") => wide_capable() as u8,
         _ => wide_by_processor(),
     };
@@ -1498,12 +1499,17 @@ events_chunk_fn!(
     splitw::split_batch5,
     true
 );
+// Instance 3: the ordinary chunk function (and so the ordinary line splitter
+// and emit stage, with nothing in it that AVX2 does not have), around the
+// four-lane decode.
+events_chunk_fn!(events_chunk_quad, split_event, wide::quad::decode, stage_emit, splitw::split_batch, false);
 
 pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
     unsafe {
         match wide_kind() {
             1 => events_chunk_wide(ctx, out, ch),
             2 => events_chunk_wide5(ctx, out, ch),
+            3 => events_chunk_quad(ctx, out, ch),
             _ => events_chunk_base(ctx, out, ch),
         }
     }
@@ -1887,11 +1893,15 @@ clicks_chunk_fn!(
     true
 );
 
+// Instance 3 (see `events_chunk_quad`).
+clicks_chunk_fn!(clicks_chunk_quad, split_click, wide::quad::click_decode, click_emit, splitw::split_clicks_batch, false);
+
 pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
     unsafe {
         match wide_kind() {
             1 => clicks_chunk_wide(ctx, c, ch),
             2 => clicks_chunk_wide5(ctx, c, ch),
+            3 => clicks_chunk_quad(ctx, c, ch),
             _ => clicks_chunk_base(ctx, c, ch),
         }
     }
