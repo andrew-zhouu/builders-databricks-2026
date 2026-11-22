@@ -44,7 +44,7 @@ for k in $(seq "$repeats"); do
 done
 # Once each: the choice switched off, and the instances by name, with 1, 2 and 8 threads.
 for vars in "NCPU=1 SS_CALIBRATE=0" "NCPU=2 SS_CALIBRATE=0" "NCPU=8 SS_CALIBRATE=0" "NCPU=1 SS_SIMD=0" "NCPU=2 SS_SIMD=0" "NCPU=8 SS_SIMD=0" \
-            "NCPU=1 SS_SIMD=2" "NCPU=2 SS_SIMD=2" "NCPU=8 SS_SIMD=2"; do
+            "NCPU=1 SS_SIMD=2" "NCPU=2 SS_SIMD=2" "NCPU=8 SS_SIMD=2" "NCPU=1 SS_SIMD=3" "NCPU=2 SS_SIMD=3" "NCPU=8 SS_SIMD=3"; do
   o="$W/out"; rm -rf "$o"; mkdir -p "$o"; runs=$((runs + 1))
   # shellcheck disable=SC2086
   if ! env $vars timeout 300 "$bin" "$W/data" "$o" 2> "$o.log"; then
