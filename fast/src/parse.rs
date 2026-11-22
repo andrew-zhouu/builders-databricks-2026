@@ -25,7 +25,7 @@
 
 use core::arch::x86_64::*;
 
-use crate::ids::{event_hash, hash9, raw_key_fast};
+use crate::ids::{event_hash, hash33, hash9, hex32, raw_key_fast, ref_word, LONG_LEN};
 use crate::lookup::ABSENT;
 use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
@@ -323,6 +323,12 @@ unsafe fn masks64_wide(p: *const u8) -> (u64, u64, u64) {
     )
 }
 
+/// Whether the wide path is taken where the processor has it, unless SS_SIMD
+/// says otherwise (1: on, 0: off). Off until its decode keeps lines with long
+/// IDs (ids.rs) on the fast path: as it stands it leaves them, a quarter of
+/// all lines, to the scalar path.
+const WIDE_DEFAULT: bool = false;
+
 /// Whether this processor takes the wide path: AVX-512 with VBMI2, which
 /// means Ice Lake or newer. (Skylake and Cascade Lake have AVX-512 as well,
 /// but lower their clock when it is used; they keep the AVX2 path, as does
@@ -331,7 +337,8 @@ unsafe fn masks64_wide(p: *const u8) -> (u64, u64, u64) {
 pub fn wide() -> bool {
     static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WIDE.get_or_init(|| {
-        !std::env::var("SS_SIMD").is_ok_and(|v| v == "0")
+        let asked = std::env::var("SS_SIMD").ok();
+        (if WIDE_DEFAULT { asked.as_deref() != Some("0") } else { asked.as_deref() == Some("1") })
             && is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
@@ -742,6 +749,9 @@ const F_VALID: u8 = 4;
 const F_PURCHASE: u8 = 8;
 /// ingest_ts is not on the UTC day of ts: the lateness rule needs its value.
 const F_INGEST: u8 = 16;
+/// The line is valid if its user_id, which is 33 bytes, is a long ID (ids.rs):
+/// `stage_long` decides, and finds the key.
+const F_LONG: u8 = 32;
 
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 const VIEW: u32 = u32::from_le_bytes(*b"view");
@@ -819,8 +829,29 @@ impl IdParams {
 /// (`wide::id_trace4`); with `wide::ID_TRACE_WIDE` off it calls this one.
 #[inline(always)]
 fn id_trace(idp: &IdParams, first: u8, rest: u64, n: u64) -> (u32, u64, bool) {
-    let h = hash9(first, rest);
-    ((((h >> 32) * idp.pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16, (h & idp.fp_mask) << idp.loc_bits, n > 9)
+    let (pk, trace) = trace_from(idp, hash9(first, rest));
+    (pk, trace, n > 9)
+}
+
+/// A trace's partition (with four more bits of the hash from bit 16) and its
+/// first word without the position, from the hash of the event ID.
+#[inline(always)]
+fn trace_from(idp: &IdParams, h: u64) -> (u32, u64) {
+    ((((h >> 32) * idp.pd) >> 32) as u32 | ((h >> 40) as u32 & 15) << 16, (h & idp.fp_mask) << idp.loc_bits)
+}
+
+/// `id_trace` for the `n` bytes of an event ID at `a`, which also takes the
+/// other usual shape, an ID of exactly 33 bytes (`ids::hash33`, as
+/// `ids::event_hash` has it). Both hashes are computed and one is chosen: one
+/// ID in eight is long, in no order a branch could learn.
+#[inline(always)]
+unsafe fn id_trace_at(idp: &IdParams, a: *const u8, n: u64) -> (u32, u64, bool) {
+    let w = |k: usize| (a.add(1 + 8 * k) as *const u64).read_unaligned();
+    let long = n == LONG_LEN as u64;
+    let short = hash9(*a, _bzhi_u64(w(0), (8 * n as u32).wrapping_sub(8)));
+    let h = if long { hash33(*a, [w(0), w(1), w(2), w(3)]) } else { short };
+    let (pk, trace) = trace_from(idp, h);
+    (pk, trace, (n > 9) & !long)
 }
 
 /// Every field's content, from a line's `sep` word: byte `k` of the first is
@@ -845,23 +876,37 @@ macro_rules! split_event_fn {
     ($(#[$attr:meta])* $name:ident, $masks:ident) => {
         $(#[$attr])*
         unsafe fn $name(st: &mut Stage, i: usize, p: *const u8) -> (usize, bool) {
-            // Window 1: event_id, user_id, ts and their three commas.
+            // Three windows of 64 bytes, each starting after a comma found in
+            // the one before: an ID may be 33 bytes (35 with quotes), so the
+            // first three fields do not fit one window, but an ID and its
+            // comma do, and so do a user_id, a ts and their commas.
+            // Window 1: event_id and its comma.
             let (cm, nm, qm) = $masks(p);
             let c0 = cm.trailing_zeros() as u64;
+            // A comma (else c0 is 64), and no newline before it.
+            let mut bad = (c0 >> 6) | _bzhi_u64(nm, c0 as u32);
+            let q0 = _bzhi_u64(qm, c0 as u32);
+            // The field starts with a quote; it ends with one (the byte before the comma).
+            let f0 = q0 & 1;
+            let l0 = (q0 << 1 >> (c0 & 63)) & 1;
+
+            // Window 2: user_id, ts and their commas.
+            let o1 = (c0 & 63) + 1;
+            let (cm, nm, qm) = $masks(p.add(o1 as usize));
+            let c1 = cm.trailing_zeros() as u64;
             let cm1 = _blsr_u64(cm);
-            let c1 = cm1.trailing_zeros() as u64;
-            let cm2 = _blsr_u64(cm1);
-            let c2 = cm2.trailing_zeros() as u64;
-            // Three commas (else c2 is 64), and no newline before the third.
-            let mut bad = (c2 >> 6) | _bzhi_u64(nm, c2 as u32);
+            let c2 = cm1.trailing_zeros() as u64;
+            // Two commas (else c2 is 64), and no newline before the second.
+            bad |= (c2 >> 6) | _bzhi_u64(nm, c2 as u32);
             let qa = _bzhi_u64(qm, c2 as u32);
-            let da = cm ^ _blsr_u64(cm2);
+            let da = cm ^ _blsr_u64(cm1);
             // Fields that start with a quote, and fields that end with one.
             let fa = _pext_u64(qa >> 1, da) << 1 | (qa & 1);
             let la = _pext_u64(qa << 1, da);
 
-            // Window 2: ingest_ts, event_type, product_id, price_cents and the newline.
-            let o = (c2 & 63) + 1;
+            // Window 3: ingest_ts, event_type, product_id, price_cents and the newline.
+            let o = o1 + (c2 & 63) + 1;
+            let (c1, c2) = (o1 + c1, o1 + c2);
             let (cm, nm, qm) = $masks(p.add(o as usize));
             let nl = nm.trailing_zeros() as u64;
             let cmb = _bzhi_u64(cm, nl as u32);
@@ -880,8 +925,9 @@ macro_rules! split_event_fn {
             // A field is quoted iff its first and last bytes are quotes; any other
             // quote makes the line malformed: the same fields start and end with a
             // quote, and there are exactly two quotes for each of them.
-            let f = fa | fb << 3;
-            bad |= (f ^ (la | lb << 3)) | ((qa.count_ones() + qb.count_ones()) as u64 ^ 2 * f.count_ones() as u64);
+            let f = f0 | fa << 1 | fb << 3;
+            bad |= (f ^ (l0 | la << 1 | lb << 3))
+                | ((q0.count_ones() + qa.count_ones() + qb.count_ones()) as u64 ^ 2 * f.count_ones() as u64);
             if bad != 0 {
                 return (0, false);
             }
@@ -896,7 +942,7 @@ macro_rules! split_event_fn {
             *d.add(6) = (o + nl) as u8;
             *d.add(7) = f as u8;
             // An empty event_id (nothing, or just two quotes): the line is dropped.
-            ((o + nl + 1) as usize, c0 != 2 * (fa & 1))
+            ((o + nl + 1) as usize, c0 != 2 * f0)
         }
     };
 }
@@ -989,25 +1035,29 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
         let at = |k: usize| p.add(sl.add(k).read_volatile() as usize);
         let ln = |k: usize| sl.add(8 + k).read_volatile() as u64;
 
-        // The trace: a hash of the event_id's bytes after the first (1 to 9
-        // bytes in all; see ids::event_hash).
+        // The trace: a hash of the event_id's bytes (1 to 9 of them, or 33;
+        // see ids::event_hash).
         let n0 = ln(0);
         let a0 = at(0);
-        let x = _bzhi_u64((a0.add(1) as *const u64).read_unaligned(), (8 * n0 as u32).wrapping_sub(8));
-        let (pk, trace, id_dead) = id_trace(&idp, *a0, x, n0);
+        let (pk, trace, id_dead) = id_trace_at(&idp, a0, n0);
         *st.pk.get_unchecked_mut(i) = pk;
         *st.trace.get_unchecked_mut(i) = trace | loc0.wrapping_add(p as u64);
 
         // The user: `u` and 1 to 8 ASCII bytes, none of them NUL, is its own
-        // key (ids::raw_key). `user_bad` is zero for those.
+        // key (ids::raw_key). `user_bad` is zero for those. A user_id of 33
+        // bytes is taken for a long ID here, and for good; `stage_long` looks
+        // at it and finds its key.
         let n1 = ln(1);
         let a1 = at(1);
         let bits = (8 * n1 as u32).wrapping_sub(8);
         let raw = (a1.add(1) as *const u64).read_unaligned();
-        let user_bad = (((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits))
-            | (*a1 ^ b'u') as u64
-            | (n1.wrapping_sub(2) > 7) as u64;
-        let key = if user_bad == 0 { _bzhi_u64(raw, bits).swap_bytes() } else { 0 };
+        let user_long = n1 == LONG_LEN as u64;
+        let user_bad = if user_long {
+            0
+        } else {
+            (((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits)) | (*a1 ^ b'u') as u64 | (n1.wrapping_sub(2) > 7) as u64
+        };
+        let key = if (user_bad == 0) & !user_long { _bzhi_u64(raw, bits).swap_bytes() } else { 0 };
         *st.key.get_unchecked_mut(i) = key;
         *st.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
 
@@ -1051,11 +1101,55 @@ unsafe fn stage_decode(ctx: &Ctx, st: &mut Stage, n: usize, loc0: u64) -> usize 
 
         *st.ts.get_unchecked_mut(i) = ms.wrapping_sub(t0) as u32;
         *st.flags.get_unchecked_mut(i) =
-            (dead != 0) as u8 | (valid as u8) << 2 | (purchase as u8) << 3 | (ingest as u8) << 4;
+            (dead != 0) as u8 | (valid as u8) << 2 | (purchase as u8) << 3 | (ingest as u8) << 4 | ((valid & user_long) as u8) << 5;
         *st.more.get_unchecked_mut(nmore) = i as u8;
         nmore += (ingest | purchase) as usize;
     }
     nmore
+}
+
+/// The users of the valid lines that `decode` flagged `F_LONG`: 33 bytes,
+/// which is a long ID if they are `u` and 32 lowercase hexadecimal digits
+/// (ids.rs). Its key is its slot in the table of long IDs, which is asked for
+/// in one loop and read in the next, where the key's home in the user table
+/// is asked for in turn, for `emit`. Anything else of 33 bytes is for the
+/// scalar path. Runs after `stage_more`, which may have found a line invalid.
+#[inline(never)]
+unsafe fn stage_long(ctx: &Ctx, st: &mut Stage, n: usize) {
+    let mut list = [0u8; NB];
+    let mut m = 0usize;
+    for i in 0..n {
+        *list.get_unchecked_mut(m) = i as u8;
+        m += (*st.flags.get_unchecked(i) & (F_LONG | F_VALID | F_DEAD) == F_LONG | F_VALID) as usize;
+    }
+    if m == 0 {
+        return;
+    }
+    let table = ctx.users.long.as_ref().unwrap_unchecked();
+    let mut value = [(0u64, 0u64); NB];
+    for k in 0..m {
+        let i = *list.get_unchecked(k) as usize;
+        let (start, _) = fields(*st.sep.get_unchecked(i));
+        let a = (*st.p.get_unchecked(i)).add((start >> 8) as usize & 0xFF);
+        let (hex, hi, lo) = hex32(a.add(1));
+        if !hex | (*a != b'u') | (hi == 0) | (lo == 0) {
+            *st.flags.get_unchecked_mut(i) = F_DEAD;
+            continue;
+        }
+        table.prefetch(hi, lo);
+        *value.get_unchecked_mut(k) = (hi, lo);
+    }
+    for k in 0..m {
+        let i = *list.get_unchecked(k) as usize;
+        if *st.flags.get_unchecked(i) & F_DEAD != 0 {
+            continue;
+        }
+        let (hi, lo) = *value.get_unchecked(k);
+        // (Neither half is zero, so there is a key.)
+        let key = ctx.users.long_key(hi, lo).unwrap_unchecked();
+        *st.key.get_unchecked_mut(i) = key;
+        *st.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
+    }
 }
 
 /// The rest of validation for the lines `decode` listed: the lateness rule by
@@ -1200,6 +1294,7 @@ macro_rules! events_chunk_fn {
                     unsafe {
                         let nmore = $decode(ctx, &mut st, n, loc0);
                         stage_more(ctx, &mut st, nmore);
+                        stage_long(ctx, &mut st, n);
                         $emit(ctx, out, &st, n);
                         // The scalar path for what the stages could not decide.
                         if st.flags[..n].iter().fold(0, |a, &f| a | f) & F_DEAD != 0 {
@@ -1300,27 +1395,48 @@ macro_rules! split_click_fn {
     ($(#[$attr:meta])* $name:ident, $masks:ident) => {
         $(#[$attr])*
         unsafe fn $name(st: &mut ClickStage, i: usize, p: *const u8) -> (usize, bool) {
+            // Three windows of 64 bytes, as in `split_event`: one for each ID
+            // (33 bytes, 35 with quotes) and its comma, one for the rest.
+            // Window 1: click_id and its comma (no newline before it).
             let (cm, nm, qm) = $masks(p);
+            let c0 = cm.trailing_zeros() as u64;
+            let mut bad = (c0 >> 6) | _bzhi_u64(nm, c0 as u32);
+            let q0 = _bzhi_u64(qm, c0 as u32);
+            // The field starts with a quote; it ends with one.
+            let f0 = q0 & 1;
+            let l0 = (q0 << 1 >> (c0 & 63)) & 1;
+
+            // Window 2: user_id and its comma.
+            let o1 = (c0 & 63) + 1;
+            let (cm, nm, qm) = $masks(p.add(o1 as usize));
+            let c1 = cm.trailing_zeros() as u64;
+            bad |= (c1 >> 6) | _bzhi_u64(nm, c1 as u32);
+            let q1 = _bzhi_u64(qm, c1 as u32);
+            let f1 = q1 & 1;
+            let l1 = (q1 << 1 >> (c1 & 63)) & 1;
+
+            // Window 3: campaign_id, ts and the newline.
+            let o = o1 + (c1 & 63) + 1;
+            let (cm, nm, qm) = $masks(p.add(o as usize));
             let nl = nm.trailing_zeros() as u64;
             let cmb = _bzhi_u64(cm, nl as u32);
-            let c0 = cmb.trailing_zeros() as u64;
-            let cmb1 = _blsr_u64(cmb);
-            let c1 = cmb1.trailing_zeros() as u64;
-            let c2 = _blsr_u64(cmb1).trailing_zeros() as u64;
+            let c2 = cmb.trailing_zeros() as u64;
             let q = _bzhi_u64(qm, nl as u32);
             let d = cmb | 1u64.wrapping_shl(nl as u32);
-            let f = _pext_u64(q >> 1, d) << 1 | (q & 1);
-            let l = _pext_u64(q << 1, d);
-            // The newline is in the window, with exactly three commas before it, and
+            let f = f0 | f1 << 1 | (_pext_u64(q >> 1, d) << 1 | (q & 1)) << 2;
+            let l = l0 | l1 << 1 | _pext_u64(q << 1, d) << 2;
+            // The newline is in the window, with exactly one comma before it, and
             // the quoting is sound (see `split_event`).
-            let bad = (nl >> 6) | (cmb.count_ones() as u64 ^ 3) | (f ^ l) | (q.count_ones() as u64 ^ 2 * f.count_ones() as u64);
+            bad |= (nl >> 6)
+                | (cmb.count_ones() as u64 ^ 1)
+                | (f ^ l)
+                | ((q0.count_ones() + q1.count_ones() + q.count_ones()) as u64 ^ 2 * f.count_ones() as u64);
             if bad != 0 {
                 return (0, false);
             }
             *st.p.get_unchecked_mut(i) = p;
-            *st.sep.get_unchecked_mut(i) = c0 | c1 << 8 | c2 << 16 | nl << 24 | f << 56;
-            let (q0, q1) = (f & 1, f >> 1 & 1);
-            ((nl + 1) as usize, (c0 != 2 * q0) & (c1 - c0 - 1 != 2 * q1))
+            *st.sep.get_unchecked_mut(i) = c0 | (o1 + c1) << 8 | (o + c2) << 16 | (o + nl) << 24 | f << 56;
+            ((o + nl + 1) as usize, (c0 != 2 * f0) & (c1 != 2 * f1))
         }
     };
 }
@@ -1334,6 +1450,9 @@ split_click_fn!(
 
 const C_DEAD: u8 = 1;
 const C_VALID: u8 = 2;
+/// With `C_VALID`: the click is valid if its user_id, which is 33 bytes, is a
+/// long ID (ids.rs): `click_long` decides, and finds the key.
+const C_LONG: u8 = 4;
 
 /// Decode the batch's click lines, in two loops with few values each: the
 /// IDs, then the timestamp. Conditions are integers that are zero when all is
@@ -1354,22 +1473,28 @@ unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
         let at = |k: usize| p.add(sl.add(k).read_volatile() as usize);
         let ln = |k: usize| sl.add(8 + k).read_volatile() as u64;
 
-        // click_id and user_id: a letter and 1 to 8 ASCII bytes, none of them
-        // NUL, are their own keys (ids::raw_key); `odd` stays zero for those.
+        // click_id: a letter and 1 to 8 ASCII bytes, none of them NUL, is its
+        // own key (ids::raw_key); any other is keyed by where it is
+        // (ids::ref_key; the line is at most 255 bytes).
         let (n0, a0) = (ln(0), at(0));
         let bits = (8 * n0 as u32).wrapping_sub(8);
         let raw = (a0.add(1) as *const u64).read_unaligned();
-        let mut odd = ((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits);
-        odd |= (*a0 ^ b'k') as u64;
-        odd |= n0.wrapping_sub(2) >> 3;
-        *st.click.get_unchecked_mut(i) = _bzhi_u64(raw, bits).swap_bytes();
+        let click_odd =
+            (((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits)) | (*a0 ^ b'k') as u64 | n0.wrapping_sub(2) >> 3;
+        *st.click.get_unchecked_mut(i) = if click_odd == 0 { _bzhi_u64(raw, bits).swap_bytes() } else { ref_word(a0, n0) };
 
+        // user_id: the same shape with `u` is its own key, and `odd` stays
+        // zero for it; one of 33 bytes is taken for a long ID, for
+        // `click_long` to look at.
         let (n1, a1) = (ln(1), at(1));
         let bits = (8 * n1 as u32).wrapping_sub(8);
         let raw = (a1.add(1) as *const u64).read_unaligned();
-        odd |= ((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits);
-        odd |= (*a1 ^ b'u') as u64;
-        odd |= n1.wrapping_sub(2) >> 3;
+        let user_long = n1 == LONG_LEN as u64;
+        let mut odd = if user_long {
+            0
+        } else {
+            (((raw.wrapping_sub(LOW) & !raw) | raw) & _bzhi_u64(HIGH, bits)) | (*a1 ^ b'u') as u64 | n1.wrapping_sub(2) >> 3
+        };
         let user = _bzhi_u64(raw, bits).swap_bytes();
         *st.user.get_unchecked_mut(i) = user;
         *st.home.get_unchecked_mut(i) = table.prefetch_home(user) as u32;
@@ -1393,7 +1518,7 @@ unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
         let pairs = t.wrapping_mul(10).wrapping_add(t >> 8);
         let number = (pairs & 0xFF) * 100 + (pairs >> 16 & 0xFF);
         *st.tc.get_unchecked_mut(i) = index.by_number(number as usize) as u64;
-        *st.flags.get_unchecked_mut(i) = (odd != 0) as u8;
+        *st.flags.get_unchecked_mut(i) = (odd != 0) as u8 | (user_long as u8) << 2;
         *st.ts_at.get_unchecked_mut(i) = sl.add(3).read_volatile();
         *st.ts_len.get_unchecked_mut(i) = sl.add(11).read_volatile();
     }
@@ -1405,10 +1530,53 @@ unsafe fn click_decode(ctx: &Ctx, st: &mut ClickStage, n: usize) {
         let (ts_dead, ts_ok, ms) = event_ts(dt, a, *st.ts_len.get_unchecked(i) as usize);
         let rel = ms.wrapping_sub(t0) as u64;
         let campaign = *st.tc.get_unchecked(i);
-        let dead = *st.flags.get_unchecked(i) | ts_dead as u8;
+        let fl = *st.flags.get_unchecked(i);
+        let dead = (fl & C_DEAD) | ts_dead as u8;
         let valid = ts_ok & (rel < span) & (campaign != ABSENT as u64) & (dead == 0);
         *st.tc.get_unchecked_mut(i) = rel << CAMPAIGN_BITS | campaign;
-        *st.flags.get_unchecked_mut(i) = dead | (valid as u8) << 1;
+        // (`C_LONG` only on a valid line: nobody asks for an invalid click's user.)
+        *st.flags.get_unchecked_mut(i) = dead | (valid as u8) << 1 | (fl & ((valid as u8) << 2));
+    }
+}
+
+/// The users of the valid click lines flagged `C_LONG`, as `stage_long` has
+/// them for events: a long ID gets its key and loses the flag, anything else
+/// of 33 bytes is for the scalar path.
+#[inline(never)]
+unsafe fn click_long(ctx: &Ctx, st: &mut ClickStage, n: usize) {
+    let mut list = [0u8; NB];
+    let mut m = 0usize;
+    for i in 0..n {
+        *list.get_unchecked_mut(m) = i as u8;
+        m += (*st.flags.get_unchecked(i) == C_VALID | C_LONG) as usize;
+    }
+    if m == 0 {
+        return;
+    }
+    let table = ctx.users.long.as_ref().unwrap_unchecked();
+    let mut value = [(0u64, 0u64); NB];
+    for k in 0..m {
+        let i = *list.get_unchecked(k) as usize;
+        let (start, _) = fields(*st.sep.get_unchecked(i));
+        let a = (*st.p.get_unchecked(i)).add((start >> 8) as usize & 0xFF);
+        let (hex, hi, lo) = hex32(a.add(1));
+        if !hex | (*a != b'u') | (hi == 0) | (lo == 0) {
+            *st.flags.get_unchecked_mut(i) = C_DEAD;
+            continue;
+        }
+        table.prefetch(hi, lo);
+        *value.get_unchecked_mut(k) = (hi, lo);
+    }
+    for k in 0..m {
+        let i = *list.get_unchecked(k) as usize;
+        if *st.flags.get_unchecked(i) == C_DEAD {
+            continue;
+        }
+        let (hi, lo) = *value.get_unchecked(k);
+        let key = ctx.users.long_key(hi, lo).unwrap_unchecked();
+        *st.user.get_unchecked_mut(i) = key;
+        *st.home.get_unchecked_mut(i) = ctx.table.prefetch_home(key) as u32;
+        *st.flags.get_unchecked_mut(i) = C_VALID;
     }
 }
 
@@ -1506,6 +1674,7 @@ macro_rules! clicks_chunk_fn {
                 if n > 0 {
                     unsafe {
                         $decode(ctx, &mut st, n);
+                        click_long(ctx, &mut st, n);
                         $emit(ctx, c, &st, n);
                         // The scalar path for what the stages could not decide.
                         if st.flags[..n].iter().fold(0, |a, &f| a | f) & C_DEAD != 0 {
