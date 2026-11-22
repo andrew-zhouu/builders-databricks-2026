@@ -26,6 +26,18 @@ case "$mode" in
   plain) outer=("auto|") ;;
   simd) outer=("auto|" "nosimd|SS_SIMD=0" "check|SS_SIMD_CHECK=1") ;;
   split) outer=("auto|" "check|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1" "nowsplit|SS_WSPLIT=0") ;;
+  wix) outer=(
+    "auto|"
+    "checks|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+    "off|SS_INDEX=0"
+    "nosimd|SS_SIMD=0"
+    "id64|SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=64"
+    "id1500|SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=1500 SS_INDEX_PB=8"
+    "id4096|SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=4096"
+    "id50m|SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=50000000"
+    "idpb8|SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=50000000 SS_INDEX_PB=8 SS_SIMD_CHECK=1"
+    "idpb9|SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=6000 SS_INDEX_PB=9"
+    "key|SS_INDEX_KEY=123456789a SS_INDEX_BOUND=100000") ;;
   index) outer=(
     "auto|"
     "off|SS_INDEX=0"

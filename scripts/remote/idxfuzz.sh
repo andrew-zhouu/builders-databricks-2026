@@ -15,6 +15,8 @@
 #                        (SS_SPLIT_CHECK=1, SS_SIMD_CHECK=1), SS_WSPLIT=0, SS_SIMD=0, chunk ends
 #                        at and around multiples of 64; and mutations chosen for it
 #        SETTINGS=index  the switches of the index back end (branch exp-index)
+#        SETTINGS=wix    the index back end on the wide parser (branch exp-wix): both sets of
+#                        switches, with small index partitions (SS_INDEX_PB)
 #        MUTATION=name   every seed with this mutation (default: by seed)
 #        EVENTS=n        every seed with this many events (default: by seed)
 #        ONLY=label      one setting only
@@ -38,7 +40,9 @@ if [ "$mode" = split ]; then
   names=(splitter splitter,shapes splitter,endings shapes,endings splitter,stretches mix,splitter
          splitter,userlengths,values none shapes stretches,splitter,endings mix splitter,clickshapes,linkshapes
          splitter,copies,endings values,splitter mix,splitter,shapes,endings interleave interleave,shapes
-         interleave,splitter,endings interleave,interleave,stretches)
+         interleave,splitter,endings interleave,interleave,stretches clicksplit clicksplit,endings
+         clicksplit,clickshapes,splitter clicksplit,userlengths,endings clicksplit,splitter,interleave,endings
+         clicksplit,mix)
 fi
 marks=(63 64 65 127 128 129 191 192 193 257 511 513 1023 4097 10000 10240 20480)
 sizes=(5000 20000 60000 200000 12000 35000 9000)
@@ -104,6 +108,26 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "chunkcheck|NCPU=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed % 4096 + 2048))"
       "scalar|NCPU=2 SS_SCALAR=1"
       "manyparts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))") ;;
+    wix) settings=(
+      "default|NCPU=3"
+      "one|NCPU=1"
+      "eight|NCPU=8"
+      "checks|NCPU=4 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+      "noindex|NCPU=4 SS_INDEX=0"
+      "nosimd|NCPU=4 SS_SIMD=0"
+      "nowsplit|NCPU=3 SS_WSPLIT=0"
+      "id4096|NCPU=4 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=4096"
+      "id100k|NCPU=2 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=100000"
+      "id50m|NCPU=8 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=50000000"
+      "wrongkey|NCPU=4 SS_INDEX_KEY=123456789a"
+      "halfbound|NCPU=5 SS_INDEX_BOUND=$((events / 2))"
+      "bound64|NCPU=3 SS_INDEX_BOUND=64"
+      "pb8|NCPU=4 SS_INDEX_PB=8"
+      "pb9check|NCPU=3 SS_INDEX_PB=9 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+      "idpb|NCPU=3 SS_INDEX_IDENTITY=1 SS_INDEX_BOUND=50000000 SS_INDEX_PB=$((seed % 6 + 8))"
+      "tiny|NCPU=4 SS_CHUNK_BYTES=$((seed % 1013 + 300))"
+      "tinypb|NCPU=8 SS_INDEX_PB=8 SS_CHUNK_BYTES=$((seed % 97 + 31))"
+      "scalar|NCPU=2 SS_SCALAR=1") ;;
     index) settings=(
       "default|NCPU=3"
       "one|NCPU=1"
