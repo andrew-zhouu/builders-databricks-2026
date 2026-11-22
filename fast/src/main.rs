@@ -109,6 +109,10 @@ pub struct Ctx {
     next_main: AtomicUsize,
     next_d: AtomicUsize,
     next_s: AtomicUsize,
+    /// The next piece of memory to give back at the end (see `worker`), and
+    /// the input files in pieces for it: (file, from, to).
+    next_zap: AtomicUsize,
+    zap_pieces: Vec<(u32, usize, usize)>,
     /// Person partitions, the ones with the most events first.
     s_order: std::sync::OnceLock<Vec<u32>>,
     /// Trace partitions and person partitions.
@@ -478,15 +482,26 @@ fn worker(ctx: &Ctx, tid: usize) {
     }
     if ctx.zap {
         drop(sc);
-        let n = ctx.nthreads;
-        let share = |len: usize| (len / n * tid, if tid + 1 == n { len } else { len / n * (tid + 1) });
-        let (a, b) = share(ctx.pool.used_bytes());
-        ctx.pool.zap(a, b);
-        let (a, b) = share(ctx.table.cap);
-        ctx.table.zap(a, b);
-        for (i, file) in ctx.files.iter().enumerate() {
-            if i % n == tid {
-                file.release(0, file.len);
+        // In pieces handed out one at a time (the input files, which are most
+        // of the work, then eighths of the pool and of the table), so that
+        // the thread that wrote campaign_daily meanwhile joins the others
+        // where they are instead of finding a share of its own left over.
+        const PIECES: usize = 8;
+        let nfiles = ctx.zap_pieces.len();
+        let piece = |len: usize, k: usize| (len / PIECES * k, if k + 1 == PIECES { len } else { len / PIECES * (k + 1) });
+        loop {
+            let i = ctx.next_zap.fetch_add(1, Relaxed);
+            if i < nfiles {
+                let (file, from, to) = ctx.zap_pieces[i];
+                ctx.files[file as usize].release(from, to);
+            } else if i < nfiles + PIECES {
+                let (a, b) = piece(ctx.pool.used_bytes(), i - nfiles);
+                ctx.pool.zap(a, b);
+            } else if i < nfiles + 2 * PIECES {
+                let (a, b) = piece(ctx.table.cap, i - nfiles - PIECES);
+                ctx.table.zap(a, b);
+            } else {
+                break;
             }
         }
     } else {
@@ -1000,6 +1015,13 @@ fn main() {
         unsafe { sys::_exit(0) }
     }
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1) as usize;
+    // The input files in pieces of at most 32 MB (a multiple of the page
+    // size), for giving their pages back at the end.
+    let zap_pieces: Vec<(u32, usize, usize)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(i, f)| (0..f.len.div_ceil(32 << 20)).map(move |k| (i as u32, k << 25, ((k + 1) << 25).min(f.len))))
+        .collect();
 
     let ctx = Ctx {
         ws,
@@ -1039,6 +1061,8 @@ fn main() {
         next_main: AtomicUsize::new(0),
         next_d: AtomicUsize::new(0),
         next_s: AtomicUsize::new(0),
+        next_zap: AtomicUsize::new(0),
+        zap_pieces,
         s_order: std::sync::OnceLock::new(),
         pd,
         ps,
@@ -1075,7 +1099,15 @@ fn main() {
         bench(&ctx);
         unsafe { sys::_exit(0) }
     }
+    // SS_PREFAULT (experiment): a helper thread faults in this share (percent)
+    // of what the pool is expected to hold, ahead of the workers.
+    let prefault: usize = std::env::var("SS_PREFAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let prefault_bytes = (events_bytes / 100 * 22 + clicks_bytes / 100 * 35) / 100 * prefault;
     std::thread::scope(|scope| {
+        if prefault_bytes > 0 {
+            let ctx = &ctx;
+            scope.spawn(move || ctx.pool.prefault(prefault_bytes));
+        }
         for tid in 1..nthreads {
             let ctx = &ctx;
             scope.spawn(move || worker(ctx, tid));
