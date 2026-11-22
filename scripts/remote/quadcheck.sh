@@ -5,13 +5,15 @@
 # AVX-512 enabled for a function, makes 512-bit instructions of pairs of
 # 256-bit ones and multiplications of sums of shifts on its own, so the
 # binary is what is looked at: every function of the instance (those of
-# parse::wide::quad and the chunk functions named ..._quad).
+# parse::wide::quad and parse::splitw::quad, and the chunk functions named
+# ..._quad where they are not part of their caller; those are ordinary
+# functions, compiled without AVX-512).
 # Prints what it finds; exits 1 on a 512-bit register or a multiplication on a
 # 256-bit one there, or if the instance is not in the binary at all.
 # Usage: quadcheck.sh BINARY
 bin="$1"
 objdump -d -C --no-show-raw-insn "$bin" | awk '
-  /^[0-9a-f]+ <.*>:$/ { fn = $2; sub(/^</, "", fn); sub(/>:$/, "", fn); on = (fn ~ /parse::wide::quad::|_chunk_quad/); if (on) seen[fn] = 1; next }
+  /^[0-9a-f]+ <.*>:$/ { fn = $2; sub(/^</, "", fn); sub(/>:$/, "", fn); on = (fn ~ /parse::wide::quad::|parse::splitw::quad::|_chunk_quad/); if (on) seen[fn] = 1; next }
   !on { next }
   /%ymm/ { y[fn]++ }
   /%k[0-7]/ { k[fn]++ }

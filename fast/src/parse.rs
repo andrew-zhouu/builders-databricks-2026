@@ -1499,10 +1499,10 @@ events_chunk_fn!(
     splitw::split_batch5,
     true
 );
-// Instance 3: the ordinary chunk function (and so the ordinary line splitter
-// and emit stage, with nothing in it that AVX2 does not have), around the
-// four-lane decode.
-events_chunk_fn!(events_chunk_quad, split_event, wide::quad::decode, stage_emit, splitw::split_batch, false);
+// Instance 3: the ordinary chunk function (and so the ordinary emit stage,
+// with nothing in it that AVX2 does not have), around the four-lane batch
+// splitter and decode.
+events_chunk_fn!(events_chunk_quad, split_event, wide::quad::decode, stage_emit, splitw::quad::split_batch4, true);
 
 pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
     unsafe {
@@ -1894,7 +1894,7 @@ clicks_chunk_fn!(
 );
 
 // Instance 3 (see `events_chunk_quad`).
-clicks_chunk_fn!(clicks_chunk_quad, split_click, wide::quad::click_decode, click_emit, splitw::split_clicks_batch, false);
+clicks_chunk_fn!(clicks_chunk_quad, split_click, wide::quad::click_decode, click_emit, splitw::quad::split_clicks_batch4, true);
 
 pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
     unsafe {
