@@ -2409,7 +2409,11 @@ def onefile(D):
     style = R.choice(["all", "all", "all", "at", "at", "at", "equal"])
     note = "all in one"
     D.file_bytes = {}
-    if style == "at" and total > LIMIT * 0.9:
+    if os.environ.get("MUTATE_FILE_BYTES"):
+        # (To ask for an exact size of the one file.)
+        D.file_bytes[big] = int(os.environ["MUTATE_FILE_BYTES"])
+        note = f"largest file written at {D.file_bytes[big]} bytes"
+    elif style == "at" and total > LIMIT * 0.9:
         D.file_bytes[big] = LIMIT + R.choice([0, 0, 1, -1, -1, 2, 64, -64, 100, -100, 4096, -4096, REGION, -REGION])
         note = f"largest file written at {D.file_bytes[big]} bytes"
     elif style == "equal" and len(D.event_files) >= 3:

@@ -30,6 +30,17 @@ settings=(
   "w2nowsplit|NCPU=8 SS_SIMD=2 SS_WSPLIT=0"
   "w2nowemit|NCPU=8 SS_SIMD=2 SS_WEMIT=0"
   "w2chunk1m|NCPU=8 SS_SIMD=2 SS_CHUNK_BYTES=1000003"
+  # The default command over and over (ONLY=cal): a pipeline that chooses its
+  # parser instance by a timing at the start chooses anew each time.
+  "cal8a|NCPU=8 SS_TIMING=1"
+  "cal8b|NCPU=8 SS_TIMING=1"
+  "cal8c|NCPU=8 SS_TIMING=1"
+  "cal8d|NCPU=8 SS_TIMING=1"
+  "cal4|NCPU=4 SS_TIMING=1"
+  "cal2a|NCPU=2 SS_TIMING=1"
+  "cal2b|NCPU=2 SS_TIMING=1"
+  "cal1|NCPU=1 SS_TIMING=1"
+  "calnone|NCPU=8 SS_CALIBRATE=0 SS_TIMING=1"
 )
 runs=0; fails=0
 for name in "$@"; do
@@ -43,6 +54,7 @@ for name in "$@"; do
     if ! env $vars timeout 900 "$BIN" "data/$name" "$out" 2> "$out.log"; then
       echo "FAIL $name $label ($vars): exit code; $(tail -2 "$out.log" | tr '\n' ' ' | cut -c1-300)"; fails=$((fails + 1)); rm -rf "$out"; continue
     fi
+    case "$label" in cal*) echo "   $name $label: $(grep -h 'parser instance' "$out.log" | tr -s ' ' | cut -c1-130)" ;; esac
     if .venv/bin/python -I tools/cmp.py "expected/$name.slow" "$out" > "$out.cmp" 2>&1; then
       rm -rf "$out" "$out.log" "$out.cmp"
     else

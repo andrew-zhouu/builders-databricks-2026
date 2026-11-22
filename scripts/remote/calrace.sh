@@ -42,6 +42,18 @@ for k in $(seq "$repeats"); do
     fi
   done
 done
+# Once each: the choice switched off, and the instances by name, with 1, 2 and 8 threads.
+for vars in "NCPU=1 SS_CALIBRATE=0" "NCPU=2 SS_CALIBRATE=0" "NCPU=8 SS_CALIBRATE=0" "NCPU=1 SS_SIMD=0" "NCPU=2 SS_SIMD=0" "NCPU=8 SS_SIMD=0" \
+            "NCPU=1 SS_SIMD=2" "NCPU=2 SS_SIMD=2" "NCPU=8 SS_SIMD=2"; do
+  o="$W/out"; rm -rf "$o"; mkdir -p "$o"; runs=$((runs + 1))
+  # shellcheck disable=SC2086
+  if ! env $vars timeout 300 "$bin" "$W/data" "$o" 2> "$o.log"; then
+    wrong=$((wrong + 1)); echo "   FAIL ($vars): exit code; $(tail -2 "$o.log" | tr '\n' ' ' | cut -c1-300)"; continue
+  fi
+  if ! "$PY" -I tools/cmp.py "$W/slow" "$o" > "$o.cmp" 2>&1; then
+    wrong=$((wrong + 1)); echo "   FAIL ($vars): $(grep -m5 -E 'rows|A:|B:' "$o.cmp" | tr '\n' ' ' | cut -c1-400)"
+  fi
+done
 echo "calrace $(basename "$bin") seed $seed ($events events, front: $frontstyle): $runs runs, $wrong wrong; the wide instance chosen in $wide, the ordinary one in $ordinary"
 [ "$wrong" = 0 ] && rm -rf "$W"
 [ "$wrong" = 0 ]
