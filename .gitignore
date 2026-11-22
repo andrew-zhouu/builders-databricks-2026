@@ -1,15 +1,16 @@
-# Local-only: datasets, outputs, toolchains, downloaded official materials
-/data/
-/out/
-/expected/
-/official/
-/.toolchain/
-/.local/
-/.venv/
+# Local-only: datasets, outputs, toolchains, downloaded official materials.
+# (No trailing slash: in a secondary work tree these are links, not directories.)
+/data
+/out
+/expected
+/official
+/.toolchain
+/.local
+/.venv
 /bench/results/
 /bench/prof-disasm.txt
 /bench/*.hist
-/bin/
+/bin
 target/
 __pycache__/
 *.pyc

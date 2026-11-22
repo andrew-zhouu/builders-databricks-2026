@@ -239,7 +239,9 @@ impl Ctx {
     }
 
     fn failed(&self) -> bool {
-        self.bail.load(Relaxed) || self.table.overflow.load(Relaxed)
+        self.bail.load(Relaxed)
+            || self.table.overflow.load(Relaxed)
+            || self.users.long.as_ref().is_some_and(|long| long.overflow.load(Relaxed))
     }
 
     fn sync(&self, what: &str) {
@@ -1009,8 +1011,11 @@ fn main() {
         nthreads,
         lookups: Shared::new(None),
         data_dir: data_dir.clone(),
-        users: KeySpace::new(b'u'),
-        clicks: KeySpace::new(b'k'),
+        // Long IDs (ids.rs) are one user in eight; their table has room for
+        // several times that, and a run that fills it half starts over with
+        // the plain implementation (`failed`).
+        users: KeySpace::new(b'u', cap / 4),
+        clicks: KeySpace::by_reference(b'k'),
         dates: parse::DateTab::new(ws, day0, ndays),
         scalar_only: std::env::var("SS_SCALAR").is_ok(),
         prefetch_ahead: std::env::var("SS_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
@@ -1088,11 +1093,12 @@ fn main() {
         prof::write_samples();
         let cancels: usize = (0..nthreads).map(|t| ctx.x(t).len()).sum();
         eprintln!(
-            "[{:8.2} ms] done; table {} of {} slots used, pool used {} MB, irregular ids: users {}, clicks {}; {} cancellations",
+            "[{:8.2} ms] done; table {} of {} slots used, pool used {} MB, long user ids {}, irregular ids: users {}, clicks {}; {} cancellations",
             t_start.elapsed().as_secs_f64() * 1e3,
             ctx.table.used.load(Relaxed),
             ctx.table.cap,
             ctx.pool.used_bytes() >> 20,
+            ctx.users.long.as_ref().map_or(0, |long| long.len()),
             ctx.users.dict.len(),
             ctx.clicks.dict.len(),
             cancels
