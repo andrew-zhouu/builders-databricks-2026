@@ -37,7 +37,7 @@ case "$cmd" in
     # not protect from --delete.)
     rsync -rlpzc --delete -e "ssh -i $REMOTE_KEY -o ControlPath=/tmp/ss-remote-%r@%h" \
       --exclude '/.git' --exclude '/data' --exclude '/out' --exclude '/expected' --exclude '/official' \
-      --exclude '/.toolchain' --exclude '/.venv' --exclude '/bin' --exclude '/.local' --exclude 'target/' \
+      --exclude '/.toolchain' --exclude '/.venv' --exclude '/bin' --exclude '/.local' --exclude 'target/' --exclude '/build' \
       --exclude '/bench/prof-disasm.txt' --exclude '/bench/results/' --exclude '__pycache__/' \
       "$PROJ/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/" ;;
   tmux)
