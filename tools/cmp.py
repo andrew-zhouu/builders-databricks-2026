@@ -12,6 +12,7 @@ import datetime
 import os
 import sys
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 TABLES = {
@@ -56,8 +57,14 @@ def load_parquet(folder, columns):
         assert set(table.column_names) == set(columns), f"{name}: columns {table.column_names}"
         cols = []
         for column in columns:
-            values = table.column(column).to_pylist()
             typ = table.schema.field(column).type
+            data = table.column(column)
+            if column in STRINGS and str(typ) in ("string", "large_string"):
+                # As bytes: a string that is not UTF-8 (the input's, written out
+                # faithfully, or a pipeline's mistake) must be compared like
+                # any other, not stop the comparison.
+                data = data.cast(pa.large_binary() if str(typ) == "large_string" else pa.binary())
+            values = data.to_pylist()
             if column in STRINGS:
                 values = [None if v is None else (v.encode() if isinstance(v, str) else bytes(v)) for v in values]
             elif column == "day":

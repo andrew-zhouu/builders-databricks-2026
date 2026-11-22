@@ -352,15 +352,49 @@ const WIDE5_DEFAULT: bool = true;
 /// can run it (one that has VBMI2 can). The code of the wide instances is
 /// reached through this choice and nowhere else.
 pub fn wide_kind() -> u8 {
-    static KIND: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KIND.get_or_init(|| match std::env::var("SS_SIMD").ok().as_deref() {
+    let kind = KIND.load(std::sync::atomic::Ordering::Relaxed);
+    if kind != UNDECIDED {
+        return kind;
+    }
+    let kind = match std::env::var("SS_SIMD").ok().as_deref() {
         Some("0") => 0,
         Some("2") => 2 * wide512_capable() as u8,
         Some("1") => wide_capable() as u8,
-        _ if WIDE_DEFAULT && wide_capable() => 1,
-        _ if WIDE5_DEFAULT && wide512_capable() => 2,
-        _ => 0,
-    })
+        _ => wide_by_processor(),
+    };
+    set_wide_kind(kind);
+    kind
+}
+
+const UNDECIDED: u8 = 0xFF;
+static KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNDECIDED);
+
+/// The wide instance this processor would take by the rules above, 0 if none.
+fn wide_by_processor() -> u8 {
+    if WIDE_DEFAULT && wide_capable() {
+        1
+    } else if WIDE5_DEFAULT && wide512_capable() {
+        2
+    } else {
+        0
+    }
+}
+
+/// Make `kind` the parser instance from now on. Only while no thread parses
+/// events or clicks (see `main::calibrate`), and only a kind this processor
+/// can run.
+pub fn set_wide_kind(kind: u8) {
+    KIND.store(kind, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The wide instance worth timing against the ordinary one on this run's own
+/// input (`main::calibrate`): the one the processor would take, unless the
+/// environment has chosen an instance (SS_SIMD) or asks for a self-check,
+/// which is of a wide instance and must not depend on a measurement.
+pub fn wide_to_try() -> Option<u8> {
+    let env = |name: &str| std::env::var(name).is_ok();
+    let kind = wide_by_processor();
+    (kind != 0 && !env("SS_SIMD") && !env("SS_SIMD_CHECK") && !env("SS_SPLIT_CHECK") && !env("SS_SCALAR")).then_some(kind)
 }
 
 /// Whether this processor has what the wide instance for VBMI2 needs.
