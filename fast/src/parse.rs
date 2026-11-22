@@ -388,14 +388,31 @@ pub fn set_wide_kind(kind: u8) {
     KIND.store(kind, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The wide instance worth timing against the ordinary one on this run's own
-/// input (`main::calibrate`): the one the processor would take, unless the
-/// environment has chosen an instance (SS_SIMD) or asks for a self-check,
-/// which is of a wide instance and must not depend on a measurement.
-pub fn wide_to_try() -> Option<u8> {
+/// The wide instances worth timing against the ordinary one on this run's own
+/// input (`main::calibrate`), and how many: first the four-lane one (3), which
+/// leaves the clock alone, then the 512-bit one the processor would take.
+/// None when the environment has chosen an instance (SS_SIMD) or asks for a
+/// self-check, which is of a wide instance and must not depend on a
+/// measurement.
+pub fn wide_candidates() -> ([u8; 2], usize) {
     let env = |name: &str| std::env::var(name).is_ok();
-    let kind = wide_by_processor();
-    (kind != 0 && !env("SS_SIMD") && !env("SS_SIMD_CHECK") && !env("SS_SPLIT_CHECK") && !env("SS_SCALAR")).then_some(kind)
+    let mut out = ([0u8; 2], 0);
+    if env("SS_SIMD") || env("SS_SIMD_CHECK") || env("SS_SPLIT_CHECK") || env("SS_SCALAR") {
+        return out;
+    }
+    for kind in [3 * wide512_capable() as u8, wide_by_processor()] {
+        if kind != 0 {
+            out.0[out.1] = kind;
+            out.1 += 1;
+        }
+    }
+    out
+}
+
+/// Whether an instance uses 512-bit registers (for which some processors
+/// lower their clock).
+pub fn is_512(kind: u8) -> bool {
+    kind == 1 || kind == 2
 }
 
 /// Whether this processor has what the wide instance for VBMI2 needs.
