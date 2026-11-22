@@ -377,6 +377,12 @@ def main():
                 links.append([a, b] if R.random() < 0.5 else [b, a])
                 if R.random() < 0.2:
                     links.append([b, b])
+        # IDs of the lengths that put a link line's comma, or its newline, at
+        # the edge of a 32-byte or a 64-byte window, linked to users with rows
+        for n in (29, 30, 31, 32, 33, 34, 35, 60, 61, 62, 63, 64, 65, 66):
+            for _ in range(2):
+                s = (R.choice(["u", "U", "u0", "uz"]) + reg("", n))[:n]
+                links.append([s, R.choice(users)] if R.random() < 0.5 else [R.choice(users), s])
     for _ in range(len(users) // 2):
         a, b = R.choice(pool), R.choice(pool)
         links.append([a, b])
