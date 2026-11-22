@@ -1448,7 +1448,7 @@ events_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,bmi1,bmi2,popcnt,lzcnt")]
     events_chunk_wide5,
     split_event_wide5,
-    wide::decode,
+    wide::half::decode,
     wide::emit,
     splitw::split_batch5,
     true
@@ -1836,7 +1836,7 @@ clicks_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512cd,bmi1,bmi2,popcnt,lzcnt")]
     clicks_chunk_wide5,
     split_click_wide5,
-    wide::click_decode,
+    wide::half::click_decode,
     wide::click_emit,
     splitw::split_clicks_batch5,
     true
