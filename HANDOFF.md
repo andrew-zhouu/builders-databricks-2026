@@ -62,12 +62,35 @@ the line splitters, a wide emit (`SS_WEMIT=0` turns it off; worth 1 to 2 ms at 2
 and a short event ID with a NUL byte is no longer hashed like the same ID without it
 (found by the tests fork; the generator writes no NUL; the fault dates from c1).
 
+**04:00 UTC.** v2 passed its full gate (`CANDIDATE-OK`, tag `cand-v2`) and went to the
+user at 03:41 together with v1 and the diagnostic commit; the tests fork ran 2,558
+adversarial runs on it (long-ID shapes and near misses, the three windows, whole
+batches of long IDs, NUL-tailed IDs, both parser instances and both self-checks)
+without a failure. `exp-v5` has since moved to `7236be4` = v2 + the SIMD fork's fast
+path for link lines with long IDs (`link_fast`, checked by `SS_SPLIT_CHECK=1`) and the
+long-ID loops taking their list from the flags at once: 20M 443 / 446 wide and
+565 / 569 base, 60M 1396 / 1402 and 1772 / 1778, i.e. 1.5% better than v2 on both
+paths. Not gated yet: the base of a v3, to be gated when something larger joins it.
+
 Known and open:
 
-* Whether the scorer's processors have AVX-512 VBMI2 is still unknown (the diagnostic
-  image answers it). The wide path is worth 22% on version-5 data on our Ice Lake box.
-* Links with a long ID took the scalar path (`link_line`) in v1 and v2; `exp-sw` has a
-  fast path for them (`link_long`), not yet measured on a quiet machine.
+* **The scorer's processor is unknown**, and it decides most of what is left: on a
+  processor with AVX-512 VBMI2 v2 is 22% faster than v1; on Cascade Lake / Skylake-X
+  (AVX-512 without VBMI2) both run the base path. The diagnostic image answers it. The
+  SIMD fork is building a second wide instance without VBMI / VBMI2 / VPOPCNTDQ,
+  chosen only by `SS_SIMD=2`: whether 512-bit code wins there (it lowers the clock)
+  can only be measured on such a machine, i.e. by a diagnostic run on the scorer.
+* Accepted, not a fault to fix tonight: two different event IDs made to have the same
+  64-bit hash, on events of one person at one millisecond, count as one event (equal
+  fingerprints with equal person and time are taken for copies without reading the
+  lines; so since c1). It takes input built against our hash functions
+  (`tools/collide.py` on `exp-tests` makes such pairs); generated data cannot do it.
+* Where the time is now (sampled, wide path, new 20M): the session and dedup passes
+  24%, batch split 9%, decode 9%, emit and partition writes 9%, **the kernel zeroing
+  fresh pages 7 to 9%** (about 630 MB: 463 MB of partition blocks, the user table, the
+  long table), `stage_long` 2%, clicks 5%. Fresh memory costs about 0.5 ms of CPU per
+  MB with eight threads at it. Tried without gain: a four times smaller table of long
+  IDs. A trace cannot be less than 16 bytes (fingerprint, position, person, time).
 * Never push sources to `~/db` on the box while a gate runs there (its later steps
   rebuild from that directory): use a secondary tree (`scripts/newtree.sh`).
 
