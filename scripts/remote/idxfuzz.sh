@@ -172,6 +172,10 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "markbase|NCPU=1 SS_SIMD=0 SS_CHUNK_BYTES=${marks[$(((seed / 2 + 3) % ${#marks[@]}))]}"
       "chunk4k|NCPU=3 SS_CHUNK_BYTES=$((seed % 4096 + 2048))"
       "chunk4kchecks|NCPU=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 3 % 4096 + 2048))"
+      # Chunks of some 70 to 130 lines: a full batch of 64, then a short one.
+      "chunk10k|NCPU=3 SS_CHUNK_BYTES=$((seed % 3000 + 9000))"
+      "chunk10kbase|NCPU=2 SS_SIMD=0 SS_CHUNK_BYTES=$((seed * 5 % 5000 + 7000))"
+      "chunk10kchecks|NCPU=4 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 11 % 6000 + 7000))"
       "scalar|NCPU=2 SS_SCALAR=1"
       "tinyscalar|NCPU=3 SS_SCALAR=1 SS_CHUNK_BYTES=$((seed % 97 + 31))"
       "manyparts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))"
