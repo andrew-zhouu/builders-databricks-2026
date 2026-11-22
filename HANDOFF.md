@@ -100,6 +100,20 @@ started 04:45 UTC:
   (`diag-v5b`): processor model and flags, and the practice data three times with each
   instance.
 
+**05:20 UTC: v3 passed its full gate** (`CANDIDATE-OK`, tag `cand-v3`) and went to the
+user; the tests fork ran 6,373 runs on it without a failure, 2,758 of them with the
+third instance forced (among them a sweep of timestamps and prices in which one
+millisecond or cent changes the answer, since that instance's multiplications were
+rewritten by hand). `scripts/remote/icxonly.sh` (now part of `image.sh gate`) confirms
+that instructions newer than Cascade Lake occur only in the VBMI2 instance's batch
+splitters. Not done: a run under an emulator of such a processor (Intel SDE needs a
+licence accepted by hand; QEMU has no AVX-512).
+
+How to read v3's official score against v2's 0.6919 s: about 0.60 to 0.62 = the
+scorer has AVX-512 without VBMI2 and the third instance pays; about 0.68 to 0.69 = no
+AVX-512 there at all (v3 is then 1.5% better than v2); clearly worse = the third
+instance loses on that processor: set `WIDE5_DEFAULT` to false, gate, submit that.
+
 Tried since v2 without gain (all removed): a table of long IDs a quarter the size; a
 helper thread faulting the partition pool in ahead of the writers (by
 `MADV_POPULATE_WRITE`: system time halved, wall time 3% worse; by one write fault per
