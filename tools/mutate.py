@@ -1332,6 +1332,105 @@ def splitter(D):
     D.notes.append(f"splitter {placed} placed, {long_ones} long, {runs} runs")
 
 
+def clicksplit(D):
+    """The same for click lines (four fields, a splitter that takes lines whose
+    newline is within 64 bytes): lines of 60 to 66 bytes and of 126 to 129, a
+    few of thousands of bytes (zeros in front of an F3 ts change nothing);
+    runs of empty lines, of `,,,` (four empty fields in three bytes: sixteen
+    line ends in one block, all of the right shape), of lines without click_id
+    or without user_id, quoted and not; lines with 0, 2 and 4 commas; a lone
+    quote for a field; all among copies of real lines."""
+    R = D.R
+    if D.clicks is None:
+        D.clicks = [Line(raw, split_fields(raw, 4), number)
+                    for number, (_, _, lines) in enumerate(D.click_files) for raw in lines]
+    groups = {}
+    for line in D.clicks:
+        if line.f and line.f[0]:
+            groups.setdefault(line.f[0], []).append(line)
+    ids = list(groups)
+    R.shuffle(ids)
+    placed = 0
+    for at, cid in enumerate(ids[:max(60, len(ids) // 3)]):
+        lines = groups[cid]
+        f = list(lines[0].f)
+        ms = parse_ts(f[3])
+        if any(l.f != f for l in lines) or ms is None or not 0 <= ms < 10 ** 14:
+            continue
+        mask = quote_mask(R, 4)
+        want = R.choice([60, 61, 62, 63, 64, 65, 66, 126, 127, 128, 129]) if at >= 3 else R.randint(9000, 20000)
+        other = len(f[0]) + len(f[1]) + len(f[2]) + 3 + 2 * bin(mask).count("1")
+        if want - other >= len(str(ms)):
+            f[3] = str(ms).zfill(want - other)
+        for line in lines:
+            line.f = list(f)
+            line.changed = True
+            line.quotes = mask
+        placed += 1
+    model = next((list(l.f) for l in D.clicks if l.f and l.f[0] and l.f[1] and parse_ts(l.f[3]) is not None), None)
+    if model is None or not D.click_files:
+        D.notes.append(f"clicksplit {placed} placed")
+        return
+    fresh = [0]
+
+    def new_id():
+        fresh[0] += 1
+        return "kZ" + base36(fresh[0]) + "".join(R.choice(DIGITS) for _ in range(R.randint(0, 6)))
+
+    def ordinary():
+        source = R.choice(D.clicks)
+        if source.f is None or source.members is not None:
+            return None
+        copy = Line(source.raw, list(source.f), source.file)
+        copy.changed, copy.quotes, copy.held = source.changed, source.quotes, True
+        D.clicks.append(copy)
+        return copy
+
+    body = ",".join(model)
+    # (One text per click_id: copies of a click are identical.)
+    shorts = ["", "", "", ",,,", ",,,", '"",,,', ',"",,', ',,,""', "a,b,c,d", '"a",b,c,d', ",", ",,", ",,,,", "a", "ab", "abcdefg",
+              '"', '""', "\r", " ", ",,,x", "x,,,"]
+    runs = 0
+    for _ in range(R.randint(6, 14)):
+        kind = R.choice(["short", "short", "empty", "fours", "fours", "noclick", "nouser", "commas", "quotes", "long", "mixed"])
+        size = R.choice([1, 2, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 70, 130, 300])
+        members = []
+        for _ in range(size):
+            if kind == "short":
+                members.append(R.choice(shorts))
+            elif kind == "empty":
+                members.append("")
+            elif kind == "fours":
+                members.append(R.choice([",,,", ",,,", ",,,", '"",,,', ',"",,', ',,,""', '"","","",""']) if R.random() < 0.9 else (ordinary() or ",,,"))
+            elif kind == "noclick":
+                rest = ",".join(model[1:])
+                members.append(R.choice(["," + rest, '"",' + rest, '"",' + ",".join('"' + v + '"' for v in model[1:])]) if R.random() < 0.8 else (ordinary() or ""))
+            elif kind == "nouser":
+                members.append(R.choice([f"{new_id()},,{model[2]},{model[3]}", f'{new_id()},"",{model[2]},{model[3]}',
+                                         f'"{new_id()}","","{model[2]}","{model[3]}"']) if R.random() < 0.8 else (ordinary() or ""))
+            elif kind == "commas":
+                members.append(R.choice(["x" * R.randint(1, 120), body.rsplit(",", 1)[0], body.rsplit(",", 2)[0], body + ",x", body + ",",
+                                         "," + body, body.replace(",", ";"), body[:R.randrange(body.rfind(","))]]))
+            elif kind == "quotes":
+                k = R.randrange(4)
+                members.append(R.choice([",".join(model[:k] + ['"'] + model[k + 1:]), ",".join(model[:k] + ['"' + model[k]] + model[k + 1:]),
+                                         ",".join(model[:k] + [model[k] + '"'] + model[k + 1:]), '"' + body + '"',
+                                         ",".join(model[:k] + ['"' + model[k] + '""'] + model[k + 1:])]))
+            elif kind == "long":
+                members.append(R.choice(["x" * R.randint(9000, 20000), body + "9" * R.randint(9000, 20000) + '"', "," * R.randint(9000, 12000)]))
+                members += [ordinary() or "" for _ in range(R.randint(1, 20))]
+                break
+            else:
+                members.append(R.choice(shorts) if R.random() < 0.6 else (ordinary() or ""))
+        block = Line(None, None, 0)
+        block.members = members
+        at = R.randrange(len(D.clicks))
+        block.file = D.clicks[at].file
+        D.clicks.insert(at + 1, block)
+        runs += 1
+    D.notes.append(f"clicksplit {placed} placed, {runs} runs")
+
+
 def interleave(D):
     """In a few files, after every line (or every second, third, seventh,
     eighth, ninth) a line that is not an event: empty, seven empty fields,
@@ -1383,10 +1482,10 @@ def endings(D):
 
 MUTATIONS = {f.__name__: f for f in [irregular, outrange, copies, disorder, gaps, nested, links, wide, drop, irrfile, badhead,
                                      purchases, shapes, clickshapes, linkshapes, userlengths, lateness, values, stretches,
-                                     splitter, interleave, endings, identityids, emptyevents, noeventfiles]}
+                                     splitter, clicksplit, interleave, endings, identityids, emptyevents, noeventfiles]}
 MIXABLE = ["irregular", "outrange", "copies", "disorder", "gaps", "nested", "links", "wide", "drop", "irrfile", "badhead",
            "purchases", "shapes", "shapes", "clickshapes", "linkshapes", "userlengths", "lateness", "values", "stretches",
-           "splitter", "splitter", "interleave", "endings"]
+           "splitter", "splitter", "clicksplit", "clicksplit", "interleave", "endings"]
 
 
 # ------------------------------------------------------------------ writing
@@ -1477,7 +1576,13 @@ def write(D, out_dir):
         os.makedirs(os.path.join(out_dir, "clicks"), exist_ok=True)
         click_lines = [[] for _ in D.click_files]
         for line in D.clicks:
-            click_lines[line.file].append(encode(D, line.f, line.quotes) if line.f is not None and line.changed else line.raw)
+            if line.held:
+                continue
+            for member in [line] if line.members is None else line.members:
+                if isinstance(member, str):
+                    click_lines[line.file].append(member)
+                else:
+                    click_lines[line.file].append(encode(D, member.f, member.quotes) if member.f is not None and member.changed else member.raw)
         for (name, header, _), lines in zip(D.click_files, click_lines):
             with open(os.path.join(out_dir, "clicks", name), "wb") as f:
                 f.write(body(D, header or "click_id,user_id,campaign_id,ts", lines))
