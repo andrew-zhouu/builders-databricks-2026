@@ -7,8 +7,8 @@
 cd "$PROJ"
 fn="${1:-events_chunk}"; name="${2:-dev}"; min="${3:-0.02}"
 command -v valgrind >/dev/null || sudo apt-get install -y -qq valgrind >/dev/null 2>&1
-(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/.toolchain/prof-target" 2>&1 | grep -E '^error' -A8)
-PBIN="$PROJ/.toolchain/prof-target/x86_64-unknown-linux-musl/release/sessions"
+(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/out/prof-target" 2>&1 | grep -E '^error' -A8)
+PBIN="$PROJ/out/prof-target/x86_64-unknown-linux-musl/release/sessions"
 out=/tmp/ss-cgasm; rm -rf "$out"; mkdir -p "$out"
 rows=$(cat "data/$name"/events/*.csv | wc -l)
 NCPU=1 SS_NOHUGE=1 ${RUN_ENV:-} valgrind --tool=callgrind --dump-instr=yes --compress-pos=no --compress-strings=no \

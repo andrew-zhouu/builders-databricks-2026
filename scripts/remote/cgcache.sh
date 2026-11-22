@@ -9,8 +9,8 @@
 cd "$PROJ"
 name="${1:-m5}"; top="${2:-45}"; filter="${3:-.}"
 ll=$(( ${LL_MB:-2} * 1048576 ))
-(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/.toolchain/prof-target" 2>&1 | grep -E '^error' -A8)
-PBIN="$PROJ/.toolchain/prof-target/x86_64-unknown-linux-musl/release/sessions"
+(cd fast && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --target-dir "$PROJ/out/prof-target" 2>&1 | grep -E '^error' -A8)
+PBIN="$PROJ/out/prof-target/x86_64-unknown-linux-musl/release/sessions"
 out=/tmp/ss-cgcache; rm -rf "$out"; mkdir -p "$out"
 rows=$(cat "data/$name"/events/*.csv | wc -l)
 NCPU=1 SS_NOHUGE=1 valgrind --tool=cachegrind --cache-sim=yes --D1=49152,12,64 --LL=$ll,16,64 --cachegrind-out-file="$out/cg.out" \
