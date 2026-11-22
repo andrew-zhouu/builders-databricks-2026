@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Runs ON the remote machine: a correctness battery in short steps, each under
-# the machine's rule for work that measures nothing: while a gate holds the
-# lock for a long time (a tmux session named w<N> exists) a step runs without
-# the lock; otherwise it takes the lock like `remote.sh run`, for the few
-# minutes the step lasts. Start it with `remote.sh quick`.
+# Runs ON the remote machine: a correctness battery in short steps, each of
+# which takes the machine's lock like `remote.sh run`, for the minute or two
+# it lasts, so that others get their turn in between. Start it with
+# `remote.sh quick` (which takes no lock itself; under `remote.sh run` the
+# steps would wait for their own caller). Only with GATE_OK=1, and while a
+# gate holds the lock for a long time (a tmux session named like w2 or v1
+# exists), do the steps run without the lock: an exception the lead grants
+# for the length of a gate.
 #
 # Usage: gsteps.sh KIND BINARY MODE FIRST COUNT [STEP] [ROWS]
 #   KIND   mut    idxfuzz.sh (mutated generator sets; env MUTATION, EVENTS pass through)
@@ -23,7 +26,7 @@ while [ "$s" -lt "$last" ]; do
     dense|plain|long) cmd="SETTINGS=$mode FUZZ_IDS=$kind bash scripts/remote/fuzzidx.sh $bin $n $s $rows" ;;
     *) echo "unknown kind $kind"; exit 2 ;;
   esac
-  if tmux ls 2>/dev/null | grep -q -E '^[a-z]+[0-9]+:'; then
+  if [ -n "${GATE_OK:-}" ] && tmux ls 2>/dev/null | grep -q -E '^[a-z]+[0-9]+:'; then
     bash -c "$cmd" 2>&1 | tee -a "$log" | grep -v -E '^(idxfuzz|fuzzidx) .* 0 failing sets' | cut -c1-900
   else
     flock /tmp/ss-heavy.lock bash -c "$cmd" 2>&1 | tee -a "$log" | grep -v -E '^(idxfuzz|fuzzidx) .* 0 failing sets' | cut -c1-900
