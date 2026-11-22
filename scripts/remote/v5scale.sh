@@ -30,6 +30,15 @@ settings=(
   "w2nowsplit|NCPU=8 SS_SIMD=2 SS_WSPLIT=0"
   "w2nowemit|NCPU=8 SS_SIMD=2 SS_WEMIT=0"
   "w2chunk1m|NCPU=8 SS_SIMD=2 SS_CHUNK_BYTES=1000003"
+  # The four-lane instance (ONLY=w3).
+  "w3|NCPU=8 SS_SIMD=3"
+  "w3one|NCPU=1 SS_SIMD=3"
+  "w3three|NCPU=3 SS_SIMD=3"
+  "w3checks|NCPU=8 SS_SIMD=3 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+  "w3splitcheck|NCPU=5 SS_SIMD=3 SS_SPLIT_CHECK=1"
+  "w3nowsplit|NCPU=8 SS_SIMD=3 SS_WSPLIT=0"
+  "w3chunk64k|NCPU=7 SS_SIMD=3 SS_CHUNK_BYTES=65537 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+  "w3chunk1m|NCPU=8 SS_SIMD=3 SS_CHUNK_BYTES=1000003"
   # The default command over and over (ONLY=cal): a pipeline that chooses its
   # parser instance by a timing at the start chooses anew each time.
   "cal8a|NCPU=8 SS_TIMING=1"

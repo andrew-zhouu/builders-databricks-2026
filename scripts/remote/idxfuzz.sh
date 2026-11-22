@@ -66,7 +66,7 @@ if [ "$mode" = wix ]; then
           identityids,gaps,nested identityids,splitter,copies copies,irregular,outrange badhead,drop,links
           idbytes idbytes,copies identityids,idbytes,disorder idbytes,shapes,splitter idbytes,mix)
 fi
-if [ "$mode" = v5 ] || [ "$mode" = v5w ] || [ "$mode" = v5x ] || [ "$mode" = w2 ]; then
+if [ "$mode" = v5 ] || [ "$mode" = v5w ] || [ "$mode" = v5x ] || [ "$mode" = w2 ] || [ "$mode" = w3 ]; then
   # Version 5 of the generator: IDs are opaque, one in eight is 33 bytes long.
   # The long forms and their near misses for users, events and clicks, alone
   # and with everything else.
@@ -197,7 +197,7 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "parts|NCPU=4 SS_PD_BYTES=$((seed % 900 + 100))"
       "parts2|NCPU=2 SS_PD_BYTES=$((seed % 300 + 64))"
       "onepart|NCPU=5 SS_PD_BYTES=1000000000") ;;
-    v5w|v5x|w2) settings=(
+    v5w|v5x|w2|w3) settings=(
       # The wide parser is the default where the processor has it, the base
       # path (SS_SIMD=0) what runs elsewhere: both count.
       "default|NCPU=3"
@@ -262,9 +262,17 @@ for seed in $(seq "$first" $((first + count - 1))); do
       "w2scalar|NCPU=2 SS_SIMD=2 SS_SCALAR=1"
       "w2onepart|NCPU=5 SS_SIMD=2 SS_PD_BYTES=1000000000"
       "w2simdcheck|NCPU=8 SS_SIMD=2 SS_SIMD_CHECK=1"
-      "w2splitcheck|NCPU=2 SS_SIMD=2 SS_SPLIT_CHECK=1")
+      "w2splitcheck|NCPU=2 SS_SIMD=2 SS_SPLIT_CHECK=1"
+      "w2tinysplit|NCPU=4 SS_SIMD=2 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed % 211 + 97))"
+      "w2marksplit|NCPU=2 SS_SIMD=2 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=${marks[$(((seed / 5 + 1) % ${#marks[@]}))]}"
+      "w2tiny1|NCPU=1 SS_SIMD=2 SS_SIMD_CHECK=1 SS_SPLIT_CHECK=1 SS_CHUNK_BYTES=$((seed * 3 % 400 + 150))")
       [ "$mode" = v5x ] && settings+=("${w2set[@]}")
-      [ "$mode" = w2 ] && settings=("${w2set[@]}") ;;
+      [ "$mode" = w2 ] && settings=("${w2set[@]}")
+      # w3: the same list for the four-lane instance (SS_SIMD=3).
+      if [ "$mode" = w3 ]; then
+        w3set=("${w2set[@]//SS_SIMD=2/SS_SIMD=3}")
+        settings=("${w3set[@]/#w2/w3}")
+      fi ;;
     v5) settings=("${plain[@]}"
       # (On exp-v5 the wide parser runs only with SS_SIMD=1; without it the
       # settings above are the ones that count.)

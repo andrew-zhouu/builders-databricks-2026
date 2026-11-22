@@ -1607,7 +1607,7 @@ def interleave(D):
     R.shuffle(small)
     plan = {}
     for number in files[:R.randint(1, 3)] + small[:R.randint(1, 3)]:
-        plan[number] = (R.choice([1, 1, 2, 3, 7, 8, 9]), R.choice(["empty", "seven", "emptyid", "emptyid", "short", "extra", "any"]))
+        plan[number] = (R.choice([1, 1, 2, 3, 3, 4, 4, 5, 5, 7, 8, 9]), R.choice(["empty", "seven", "emptyid", "emptyid", "short", "extra", "any"]))
     body = ",".join([""] + model[1:])
     count = {number: 0 for number in plan}
     made = 0
@@ -2265,7 +2265,8 @@ def grouping(D):
             return f is not None and len(f[at]) == 33
 
         style = R.choice(["users", "ids", "both", "both", "period2", "period8", "period9", "length", "length_down", "quoted", "blocks",
-                          "period63", "period64", "period64", "period65", "allbut64", "allbut64", "runs64", "userslast", "userslast"])
+                          "period63", "period64", "period64", "period65", "allbut64", "allbut64", "runs64", "userslast", "userslast",
+                          "period3", "period4", "period4", "period5"])
         if style == "users":
             return sorted(lines, key=lambda l: not is33(l, user_at)), style
         if style == "userslast":
