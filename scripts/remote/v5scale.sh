@@ -26,12 +26,18 @@ settings=(
   "w2one|NCPU=1 SS_SIMD=2"
   "w2checks|NCPU=8 SS_SIMD=2 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
   "w2chunk64k|NCPU=7 SS_SIMD=2 SS_CHUNK_BYTES=65537 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1"
+  "w2three|NCPU=3 SS_SIMD=2"
+  "w2nowsplit|NCPU=8 SS_SIMD=2 SS_WSPLIT=0"
+  "w2nowemit|NCPU=8 SS_SIMD=2 SS_WEMIT=0"
+  "w2chunk1m|NCPU=8 SS_SIMD=2 SS_CHUNK_BYTES=1000003"
 )
 runs=0; fails=0
 for name in "$@"; do
   [ -d "data/$name" ] && [ -d "expected/$name.slow" ] || { echo "skip $name: no data or no reference answer"; continue; }
   for s in "${settings[@]}"; do
     label="${s%%|*}"; vars="${s#*|}"
+    # ONLY=w2: the settings whose label starts so (the second wide instance).
+    if [ -n "${ONLY:-}" ]; then case "$label" in "$ONLY"*) ;; *) continue ;; esac; fi
     out="out/v5scale-$name-$label"; rm -rf "$out"; mkdir -p "$out"; runs=$((runs + 1))
     # shellcheck disable=SC2086
     if ! env $vars timeout 900 "$BIN" "data/$name" "$out" 2> "$out.log"; then

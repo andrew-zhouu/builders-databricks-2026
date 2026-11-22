@@ -29,6 +29,9 @@ case "$stage" in
     SLOW_BIN="$yard" REF_EVERY=2 bash scripts/remote/gsteps.sh mut "$bin" "$mode" "$first" "$count" 3 ;;
   long)
     bash scripts/remote/gsteps.sh long "$bin" "$mode" "$first" "$count" 3 ;;
+  sweep)
+    # Timestamps and prices where a millisecond or a cent shows (tools/tssweep.py), 4,000 users a set.
+    bash scripts/remote/gsteps.sh tssweep "$bin" "$mode" "$first" "$count" 3 "${ROWS:-4000}" ;;
   fuzz)
     bash scripts/remote/gsteps.sh plain "$bin" "$mode" "$first" "$count" 3
     bash scripts/remote/gsteps.sh dense "$bin" "$mode" "$first" "$count" 3 ;;

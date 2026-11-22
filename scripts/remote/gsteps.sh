@@ -24,6 +24,7 @@ while [ "$s" -lt "$last" ]; do
   case "$kind" in
     mut) cmd="SETTINGS=$mode bash scripts/remote/idxfuzz.sh $bin $n $s" ;;
     dense|plain|long) cmd="SETTINGS=$mode FUZZ_IDS=$kind bash scripts/remote/fuzzidx.sh $bin $n $s $rows" ;;
+    tssweep) cmd="SETTINGS=$mode FUZZ_GEN=tssweep bash scripts/remote/fuzzidx.sh $bin $n $s $rows" ;;
     *) echo "unknown kind $kind"; exit 2 ;;
   esac
   if [ -n "${GATE_OK:-}" ] && tmux ls 2>/dev/null | grep -q -E '^[a-z]+[0-9]+:'; then

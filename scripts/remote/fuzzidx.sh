@@ -8,7 +8,12 @@
 #   env: FUZZ_IDS   dense (default), plain (the corpus's usual IDs) or long (the
 #                   33-byte form of version 5 of the generator and its near misses,
 #                   for events, users and clicks)
+#        FUZZ_GEN   the generator in tools/ (default fuzz); tssweep: timestamps and prices
+#                   where one millisecond or one cent changes the answer (tools/tssweep.py;
+#                   ROWS is then the number of users)
 #        SETTINGS   plain (default): every mode once
+#                   v5w / v5x / w2: as in idxfuzz.sh (wide and base; with the second wide
+#                   instance; the second wide instance alone)
 #                   v5: also with both self-checks, SS_WSPLIT=0, SS_SIMD=0
 #                   simd: also with SS_SIMD=0 and SS_SIMD_CHECK=1
 #                   index: the switches of the index back end (branch exp-index):
@@ -23,7 +28,9 @@ count="${2:-10}"; first="${3:-1}"; rows="${4:-3000}"
 ids="${FUZZ_IDS:-dense}"
 mode="${SETTINGS:-plain}"
 PY="$PROJ/.venv/bin/python"
-W="$PROJ/out/fuzzidx"; mkdir -p "$W"
+gen="${FUZZ_GEN:-fuzz}"
+W="$PROJ/out/fuzzidx"; [ "$gen" = fuzz ] || { W="$PROJ/out/$gen"; ids="$gen"; }
+mkdir -p "$W"
 fails=0; runs=0
 case "$mode" in
   plain) outer=("auto|") ;;
@@ -66,8 +73,8 @@ case "$mode" in
 esac
 for seed in $(seq "$first" $((first + count - 1))); do
   d="$W/$seed"; rm -rf "$d"; mkdir -p "$d"
-  if ! FUZZ_IDS="$ids" "$PY" -I tools/fuzz.py "$seed" "$d/data" "$rows" 2> "$d/gen.log"; then
-    echo "FAIL seed $seed: fuzz.py failed: $(tail -1 "$d/gen.log")"; fails=$((fails + 1)); continue
+  if ! FUZZ_IDS="$ids" "$PY" -I "tools/$gen.py" "$seed" "$d/data" "$rows" 2> "$d/gen.log"; then
+    echo "FAIL seed $seed: $gen.py failed: $(tail -1 "$d/gen.log")"; fails=$((fails + 1)); continue
   fi
   if ! "$PY" -I reference/reference.py "$d/data" "$d/expected" 2> "$d/ref.log"; then
     echo "FAIL seed $seed: reference failed: $(tail -1 "$d/ref.log")"; fails=$((fails + 1)); continue
