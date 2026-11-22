@@ -552,12 +552,23 @@ fn calibrate(ctx: &Ctx) {
         ns
     };
     // Once without the clock, for the page table and the caches. Then the
-    // ordinary instance first each round: its first time is taken before any
-    // 512-bit instruction has run, at the clock it would have for the run.
+    // ordinary instance, three times in a row, before any 512-bit instruction
+    // has run: at the clock it would have for the whole run. Then the wide
+    // one, after five runs without the clock: where 512-bit code lowers the
+    // clock, the first of it runs at a fraction of its speed while the
+    // processor changes over (and the lower clock lingers a few milliseconds
+    // after the last of it), so only what comes two or three milliseconds
+    // later is what the run would get. (The first version of this timed the
+    // two in turn, and on Cascade Lake found the wide one slower: v4.)
     run(0);
     let mut best = [u64::MAX; 2];
     for _ in 0..3 {
         best[0] = best[0].min(run(0));
+    }
+    for _ in 0..5 {
+        run(wide);
+    }
+    for _ in 0..3 {
         best[1] = best[1].min(run(wide));
     }
     // Clearly: within a few percent the ordinary instance is the safer one.
@@ -590,21 +601,24 @@ static CALIBRATED: [std::sync::atomic::AtomicU64; 3] =
 /// scorer that reports nothing but a time. The finished run sleeps a whole
 /// number of seconds:
 ///
-/// * 1 + bucket: the wide instance tried was the one for processors without VBMI2;
-/// * 7 + bucket: it was the one for processors with VBMI2;
-/// * 13: none was tried (no AVX-512, or the calibration did not run);
+/// * 1 to 17: the wide instance tried was the one for processors without
+///   VBMI2, and its best time was this share of the ordinary one's: 1 = under
+///   55%, then a second for every 5% (2 = 55 to 60%, ..., 9 = 90 to 95%: up to
+///   here the wide one is taken; 10 = 95 to 100%, ...), 17 = 130% or more;
+/// * 18: it was the one for processors with VBMI2;
+/// * 19: none was tried (no AVX-512, or the calibration did not run).
 ///
-/// bucket = the wide instance's best time as a share of the ordinary one's:
-/// 0 under 65%, 1 under 75%, 2 under 85%, 3 under 95% (up to here the wide
-/// one is taken), 4 under 105%, 5 above.
+/// (The first probe, of v4's calibration, had another scale: 1 + one of six
+/// steps, 7 + step for VBMI2, 13 for none; it read 6 on the scorer: no VBMI2,
+/// the wide instance at 105% or more.)
 fn signal() {
     let (wide, base, best) = (CALIBRATED[0].load(Relaxed), CALIBRATED[1].load(Relaxed), CALIBRATED[2].load(Relaxed));
     let seconds = if wide == 0 || base == 0 {
-        13
+        19
+    } else if wide == 1 {
+        18
     } else {
-        let share = best * 100 / base;
-        let bucket = [65, 75, 85, 95, 105].iter().filter(|&&b| share >= b).count() as u64;
-        1 + bucket + if wide == 1 { 6 } else { 0 }
+        1 + (best * 100 / base / 5).clamp(10, 26) - 10
     };
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 }
