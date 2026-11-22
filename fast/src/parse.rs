@@ -31,6 +31,7 @@ use crate::part::PartWriter;
 use crate::util::{civil_from_days, days_from_civil, days_in_month, find_newline, parse_price, parse_ts, split, DAY_MS};
 use crate::{Chunk, Ctx};
 
+pub mod splitw;
 mod wide;
 
 pub const PERSON_BITS: u32 = 27;
@@ -1122,8 +1123,28 @@ unsafe fn stage_emit(ctx: &Ctx, out: &mut EventOut, st: &Stage, n: usize) {
     }
 }
 
+/// SS_SPLIT_CHECK: what `splitw::split_batch` made of the lines from `from`
+/// to `to` must be what `split_event` makes of them, line by line.
+unsafe fn check_split(st: &Stage, data: &[u8], from: usize, to: usize, n: usize, took: usize) {
+    let mut one = Stage::new();
+    let (mut pos, mut m) = (from, 0usize);
+    for line in 0..took {
+        let p = data.as_ptr().add(pos);
+        let (used, added) = split_event(&mut one, 0, p);
+        let show = || String::from_utf8_lossy(&data[pos..(pos + 160).min(data.len())]).into_owned();
+        assert!(used != 0, "batch split took line {line} at {pos}, which the line split refuses: {}", show());
+        if added {
+            assert!(m < n, "batch split left out line {line} at {pos}: {}", show());
+            assert!(st.p[m] == p && st.sep[m] == one.sep[0], "line {line} at {pos}: sep {:016x}, line split {:016x}: {}", st.sep[m], one.sep[0], show());
+            m += 1;
+        }
+        pos += used;
+    }
+    assert!(m == n && pos == to, "batch split: {n} lines to {to}, line split: {m} lines to {pos}");
+}
+
 macro_rules! events_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $decode:path, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1136,9 +1157,26 @@ macro_rules! events_chunk_fn {
             let mut lines = 0usize;
             let Some(mut pos) = first_line(data, ch.start) else { return 0 };
             let mut st = Stage::new();
+            let mut ws = splitw::Wide::new();
+            // The batch splitter, in the instance for processors that have it.
+            let batch = $batch & ctx.wide_split;
             while pos < ch.end {
                 let mut n = 0usize;
-                if pos >= HEAD {
+                // The line at `pos` after the batch is for the scalar path.
+                let mut stuck = true;
+                if (pos >= HEAD) & batch {
+                    if pos < fast_hi {
+                        unsafe {
+                            let from = pos;
+                            let (m, to, took, odd) = splitw::split_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
+                            if ctx.split_check {
+                                check_split(&st, data, from, to, m, took);
+                            }
+                            (n, pos, stuck) = (m, to, odd);
+                            lines += took;
+                        }
+                    }
+                } else if pos >= HEAD {
                     unsafe {
                         while (n < NB) & (pos < fast_hi) {
                             let p = data.as_ptr().add(pos);
@@ -1156,6 +1194,7 @@ macro_rules! events_chunk_fn {
                             n += added as usize;
                         }
                     }
+                    stuck = n < NB;
                 }
                 if n > 0 {
                     unsafe {
@@ -1175,7 +1214,7 @@ macro_rules! events_chunk_fn {
                 }
                 // The batch ended early: at a line the split did not understand, or
                 // where the fast path may not read (the edges of the file).
-                if (n < NB) & (pos < ch.end) {
+                if stuck & (pos < ch.end) {
                     lines += 1;
                     let e = find_newline(data, pos).unwrap_or(len);
                     event_line(ctx, out, &data[pos..e], base + pos as u64);
@@ -1186,12 +1225,13 @@ macro_rules! events_chunk_fn {
         }
     };
 }
-events_chunk_fn!(events_chunk_base, split_event, stage_decode);
+events_chunk_fn!(events_chunk_base, split_event, stage_decode, false);
 events_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     events_chunk_wide,
     split_event_wide,
-    wide::decode
+    wide::decode,
+    true
 );
 
 pub fn events_chunk(ctx: &Ctx, out: &mut EventOut, ch: &Chunk) -> usize {
