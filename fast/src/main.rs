@@ -514,19 +514,20 @@ fn worker(ctx: &Ctx, tid: usize) {
 /// Which parser instance is the faster one here? A processor's flags say
 /// which instances it can run, not which wins: 512-bit code lowers the clock
 /// on some processors, and single instructions are slow on others. So where
-/// the processor offers a wide instance and nothing has been asked for, the
-/// first megabyte of the largest events file is parsed three times by the
-/// ordinary instance and by the wide one in turn, into writers of their own
-/// (the traces are thrown away; what else the parser does, entering users in
-/// the table, the real run does again with the same result), and the wide
-/// one is taken if its best time is clearly the better. Run by the first
-/// thread while the others are on the links, before any of them parses
-/// events: about three milliseconds of one thread. ("Megabyte" below: half
-/// of one.)
+/// the processor offers wide instances and nothing has been asked for, the
+/// first 512 KB of the largest events file are parsed by the ordinary
+/// instance and by each wide one, three times each and one instance after the
+/// other, into writers of their own (the traces are thrown away; what else
+/// the parser does, entering users in the table, the real run does again with
+/// the same result), and the fastest wide one is taken if its best time is
+/// clearly better than the ordinary one's. Run by the first thread while the
+/// others are on the links, before any of them parses events: six to eight
+/// milliseconds of one thread.
 fn calibrate(ctx: &Ctx) {
     const REGION: usize = 1 << 19;
-    let Some(wide) = parse::wide_to_try() else { return };
-    if std::env::var("SS_CALIBRATE").is_ok_and(|v| v == "0") {
+    let (wides, nwides) = parse::wide_candidates();
+    let wides = &wides[..nwides];
+    if wides.is_empty() || std::env::var("SS_CALIBRATE").is_ok_and(|v| v == "0") {
         return;
     }
     let Some(&(_, file)) = ctx.event_files.iter().max_by_key(|&&(_, f)| ctx.files[f as usize].len) else { return };
@@ -560,23 +561,31 @@ fn calibrate(ctx: &Ctx) {
     // after the last of it), so only what comes two or three milliseconds
     // later is what the run would get. (The first version of this timed the
     // two in turn, and on Cascade Lake found the wide one slower: v4.)
+    // (The instances come with those that leave the clock alone first, so
+    // that a 512-bit one is the last thing timed.)
     run(0);
-    let mut best = [u64::MAX; 2];
+    let mut best = [u64::MAX; 4];
     for _ in 0..3 {
         best[0] = best[0].min(run(0));
     }
-    for _ in 0..5 {
-        run(wide);
+    for &wide in wides {
+        for _ in 0..if parse::is_512(wide) { 5 } else { 1 } {
+            run(wide);
+        }
+        for _ in 0..3 {
+            best[wide as usize] = best[wide as usize].min(run(wide));
+        }
     }
-    for _ in 0..3 {
-        best[1] = best[1].min(run(wide));
-    }
-    // Clearly: within a few percent the ordinary instance is the safer one.
-    let kind = if best[1] * 100 < best[0] * 95 { wide } else { 0 };
+    // The fastest, if it is clearly faster: within a few percent the ordinary
+    // instance is the safer one.
+    let fastest = wides.iter().copied().min_by_key(|&w| best[w as usize]).unwrap_or(0);
+    let kind = if best[fastest as usize] * 100 < best[0] * 95 { fastest } else { 0 };
     parse::set_wide_kind(kind);
+    let wide = wides.iter().copied().find(|&w| parse::is_512(w)).unwrap_or(0);
     CALIBRATED[0].store(wide as u64, Relaxed);
     CALIBRATED[1].store(best[0], Relaxed);
-    CALIBRATED[2].store(best[1], Relaxed);
+    CALIBRATED[2].store(best[wide as usize], Relaxed);
+    CALIBRATED[3].store(best[3], Relaxed);
     // The blocks go to this thread's own writers.
     unsafe {
         (*ctx.k[0].0.get()).free.append(&mut free[0]);
@@ -584,17 +593,22 @@ fn calibrate(ctx: &Ctx) {
     }
     if ctx.timing {
         eprintln!(
-            "              parser instance {kind}: the first 512 KB of events in {} us by the ordinary one, {} us by wide instance {wide}",
+            "              parser instance {kind}: the first 512 KB of events in {} us by the ordinary one, {} us by the four-lane one, {} us by wide instance {wide}",
             best[0] / 1000,
-            best[1] / 1000
+            best[3] / 1000,
+            best[wide as usize] / 1000
         );
     }
 }
 
 /// What `calibrate` tried and found: the wide instance (0: none), the
 /// ordinary instance's best time and the wide one's, in nanoseconds.
-static CALIBRATED: [std::sync::atomic::AtomicU64; 3] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static CALIBRATED: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// SS_SIGNAL (set by a probe image's Dockerfile, never by a candidate's): say
 /// through the run's duration what `calibrate` found on this machine, for a
@@ -611,11 +625,18 @@ static CALIBRATED: [std::sync::atomic::AtomicU64; 3] =
 /// (The first probe, of v4's calibration, had another scale: 1 + one of six
 /// steps, 7 + step for VBMI2, 13 for none; it read 6 on the scorer: no VBMI2,
 /// the wide instance at 105% or more.)
+///
+/// With SS_SIGNAL=3 the same scale (1 to 17) reports the four-lane instance
+/// instead, whatever the processor; 19 if it was not tried.
 fn signal() {
-    let (wide, base, best) = (CALIBRATED[0].load(Relaxed), CALIBRATED[1].load(Relaxed), CALIBRATED[2].load(Relaxed));
-    let seconds = if wide == 0 || base == 0 {
+    let (wide, base, mut best) = (CALIBRATED[0].load(Relaxed), CALIBRATED[1].load(Relaxed), CALIBRATED[2].load(Relaxed));
+    let quad = std::env::var("SS_SIGNAL").is_ok_and(|v| v == "3");
+    if quad {
+        best = CALIBRATED[3].load(Relaxed);
+    }
+    let seconds = if base == 0 || best == 0 || best == u64::MAX || (wide == 0 && !quad) {
         19
-    } else if wide == 1 {
+    } else if wide == 1 && !quad {
         18
     } else {
         1 + (best * 100 / base / 5).clamp(10, 26) - 10
