@@ -436,6 +436,12 @@ fn person(ctx: &Ctx, sc: &mut Scratch, slot: u32, ev: &[u64], pu: &[[u64; 2]], c
                 std::ptr::copy_nonoverlapping(rec.as_ptr(), r.ids.as_mut_ptr().add(len), 16);
                 r.ids.set_len(len + n);
             }
+        } else if key & crate::ids::LONG != 0 {
+            // A long ID (one person in eight): `u` and the 32 digits of its
+            // value, from the table of long IDs.
+            let (hi, lo) = unsafe { ctx.users.long.as_ref().unwrap_unchecked() }.get(key as u32);
+            r.ids.extend_from_slice(&(crate::ids::LONG_LEN as u32).to_le_bytes());
+            r.ids.extend_from_slice(&crate::ids::long_bytes(b'u', hi, lo));
         } else {
             let mut name = Vec::new();
             ctx.users.bytes(key, &mut name);

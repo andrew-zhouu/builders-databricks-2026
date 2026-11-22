@@ -12,6 +12,9 @@
 cd "$PROJ"
 n="${1:-150}"; first="${2:-1000}"
 log=/tmp/ss-fullcheck.$$.log
+# While the wide parser is only taken when asked for (parse.rs, WIDE_DEFAULT),
+# a default run and a run with it off are the same thing.
+scales=2; grep -q 'const WIDE_DEFAULT: bool = false' fast/src/parse.rs && scales=1
 {
   echo "== build + fixtures + dev + fuzz $first..$((first + n - 1))"
   bash scripts/remote/try.sh "$n" "$first" 2>&1 | grep -v -e '^warning' -e '^ *|' -e '^ *-->' -e '^ *= note' -e '^$' | tail -6
@@ -19,18 +22,24 @@ log=/tmp/ss-fullcheck.$$.log
   bash scripts/seeds.sh 200000 50000 2 3 4 5 6 7 2>&1 | tail -13
   echo "== scale"
   bash scripts/remote/scalecheck.sh
-  echo "== wide parser off: fuzz, seeds, scale"
-  SS_SIMD=0 bash scripts/fuzz.sh "$((first + 1000))" 40 3000 2>&1 | tail -2
-  SS_SIMD=0 bash scripts/seeds.sh 200000 50000 2 5 2>&1 | tail -4
-  SS_SIMD=0 bash scripts/remote/scalecheck.sh m5 m20 m60
-  echo "== wide parser self-checks"
-  [ -f scripts/remote/splitcheck.sh ] && bash scripts/remote/splitcheck.sh 30 "$((first + 2000))" dev m5 m20 n20
-  [ -f scripts/remote/widecheck.sh ] && FUZZ=30 FIRST="$((first + 3000))" bash scripts/remote/widecheck.sh dev m5 m20 n20
+  echo "== unit tests"
+  (cd fast && cargo test --release 2>&1 | grep -E '^test result|FAILED|panicked' | cut -c1-160)
+  if [ "$scales" = 2 ]; then
+    echo "== wide parser off: fuzz, seeds, scale"
+    SS_SIMD=0 bash scripts/fuzz.sh "$((first + 1000))" 40 3000 2>&1 | tail -2
+    SS_SIMD=0 bash scripts/seeds.sh 200000 50000 2 5 2>&1 | tail -4
+    SS_SIMD=0 bash scripts/remote/scalecheck.sh m5 m20 m60
+    echo "== wide parser self-checks"
+    [ -f scripts/remote/splitcheck.sh ] && bash scripts/remote/splitcheck.sh 30 "$((first + 2000))" dev m5 m20 n20
+    [ -f scripts/remote/widecheck.sh ] && FUZZ=30 FIRST="$((first + 3000))" bash scripts/remote/widecheck.sh dev m5 m20 n20
+  else
+    echo "== (the wide parser is off unless asked for: its sections are skipped)"
+  fi
   echo "== fullcheck done"
 } 2>&1 | tee "$log"
 if grep -qE 'FAIL|: [1-9][0-9]* failing|, [1-9][0-9]* failed|panicked|^error' "$log" || ! grep -q 'fullcheck done' "$log"; then
   echo "FULLCHECK-FAILED"; rm -f "$log"; exit 1
 fi
-[ "$(grep -c SCALE-OK "$log")" = 2 ] || { echo "FULLCHECK-FAILED (scale)"; rm -f "$log"; exit 1; }
+[ "$(grep -c SCALE-OK "$log")" = "$scales" ] || { echo "FULLCHECK-FAILED (scale)"; rm -f "$log"; exit 1; }
 rm -f "$log"
 echo FULLCHECK-OK
