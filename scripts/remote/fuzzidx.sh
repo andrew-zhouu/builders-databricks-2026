@@ -30,6 +30,7 @@ case "$mode" in
   simd) outer=("auto|" "nosimd|SS_SIMD=0" "check|SS_SIMD_CHECK=1") ;;
   split) outer=("auto|" "check|SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1" "nowsplit|SS_WSPLIT=0") ;;
   v5) outer=("auto|" "simd|SS_SIMD=1" "simdnowsplit|SS_SIMD=1 SS_WSPLIT=0")
+      [ -n "${SPLIT_CHECKS:-}" ] && outer+=("simdsplit|SS_SIMD=1 SS_SPLIT_CHECK=1")
       # The wide parser's self-checks, on request (SIMD_CHECKS=1).
       [ -n "${SIMD_CHECKS:-}" ] && outer+=("simdcheck|SS_SIMD=1 SS_SPLIT_CHECK=1 SS_SIMD_CHECK=1") ;;
   wix) outer=(
