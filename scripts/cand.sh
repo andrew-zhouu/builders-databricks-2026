@@ -13,6 +13,7 @@ cd "$PROJ"
 name="$1"; first="${2:-5000}"
 [ -z "$(git status --porcelain)" ] || { echo "working tree not clean: commit first"; exit 1; }
 rev=$(git rev-parse HEAD)
+if git ls-tree -r HEAD | grep -q '^120000'; then echo "the commit holds a symbolic link: remove it first"; exit 1; fi
 bash scripts/remote.sh push > /dev/null
 bash scripts/remote.sh export "$rev" "/home/ubuntu/img/$name" > /dev/null
 bash scripts/remote.sh tmux "$name" "echo candidate $rev; bash scripts/remote/fullcheck.sh 150 $first && bash scripts/remote/image.sh gate /home/ubuntu/img/$name m5 m20 m60 && echo CANDIDATE-OK $rev"
