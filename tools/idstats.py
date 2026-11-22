@@ -53,6 +53,10 @@ def main():
         ids = {name: set() for name in columns}
         lines = bad = 0
         over = [0, 0, 0]
+        # The longest stretch of consecutive lines whose column is 33 bytes
+        # long, and how many stretches reach eight lines.
+        longest = {name: 0 for name in columns}
+        eights = {name: 0 for name in columns}
         for name in sorted(os.listdir(path)) if os.path.isdir(path) else []:
             if not name.endswith(".csv"):
                 continue
@@ -60,6 +64,7 @@ def main():
                 rows = f.read().split(b"\n")[1:]
             if rows and rows[-1] == b"":
                 rows.pop()
+            run = {name: 0 for name in columns}
             for row in rows:
                 lines += 1
                 for k, limit in enumerate((64, 128, 255)):
@@ -67,12 +72,20 @@ def main():
                 f = fields(row, count)
                 if f is None:
                     bad += 1
-                    continue
                 for column, at in columns.items():
-                    ids[column].add(f[at])
+                    if f is not None:
+                        ids[column].add(f[at])
+                    if f is not None and len(f[at]) == 33:
+                        run[column] += 1
+                        eights[column] += run[column] == 8
+                        longest[column] = max(longest[column], run[column])
+                    else:
+                        run[column] = 0
         print(f"{folder}: {lines} lines, {bad} malformed, longer than 64/128/255 bytes: {over[0]}/{over[1]}/{over[2]}")
         for column in columns:
             describe(column, ids[column])
+            if folder != "links":
+                print(f"    consecutive lines with a 33-byte {column}: longest stretch {longest[column]}, stretches of 8 or more: {eights[column]}")
 
 
 if __name__ == "__main__":
