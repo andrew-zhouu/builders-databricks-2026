@@ -140,8 +140,12 @@ pub fn long_bytes(prefix: u8, hi: u64, lo: u64) -> [u8; LONG_LEN] {
 #[inline]
 pub fn event_hash(b: &[u8]) -> u64 {
     let n = b.len();
-    if n <= 9 {
-        // The usual shape, a letter and up to 8 more bytes.
+    if n <= 9 && !b.contains(&0) {
+        // The usual shape, a letter and up to 8 more bytes. (None of them
+        // NUL: padded with zeros, `x` and `x\0` would be one ID here, and
+        // equal hashes of the same person at the same time are taken for
+        // copies without a look at the IDs. Such an ID goes on below, where
+        // its length is hashed with it.)
         let mut w = [0u8; 8];
         if n > 1 {
             w[..n - 1].copy_from_slice(&b[1..]);
