@@ -1,6 +1,73 @@
 # Handoff: where the work stands
 
-Last updated 2026-11-22, 03:00 UTC. Deadline: 2026-11-22 16:00 UTC (11:00 ET).
+Last updated 2026-11-22, 08:50 UTC. Deadline: 2026-11-22 16:00 UTC (11:00 ET).
+
+## 22 November, 08:50 UTC: development stopped here; notes for a new implementation
+
+This line of work is now the validated fallback. Nothing of it runs on the EC2 box.
+
+- **Submit / fallback:** candidate v5 = `37023b2caeeac3b0c363538e87a09cd46cbd2b8c` (tag
+  `cand-v5`), full gate passed (`CANDIDATE-OK`), not yet scored officially. Official best so
+  far: v4 = `ca5f5f91958909da54b1acff50c570b957e139bc` (tag `cand-v4`), 0.6745 s.
+- v5 against v4: a 4-lane 256-bit parser instance and a start-up timing that picks the
+  fastest instance in steady state. On EC2 (Ice Lake) at 20M: AVX2 565 ms, 256-bit 510 ms,
+  512-bit without VBMI2 454 ms, with VBMI2 439 ms. What the scorer picks is unknown.
+  Official is about 1.067 x (EC2 program time + 0.07 s) for the AVX2 path.
+
+### The data (measured, scorer version 5)
+
+- Lines are fully shuffled: the same user follows itself on 0.1% of lines; ingest order is
+  random. File sizes are very uneven (20M: 87 event files, the largest 344 MB).
+- Files are not shards: 99% of event rows belong to users spread over several files, and
+  34,393 of 35,834 repeated event IDs (dev) have their copies in different files. So
+  de-duplication has to be global, and no file can be finished on its own.
+- One distinct ID in eight is a letter plus 32 hex digits (33 bytes). IDs come out of a
+  keyed bijection: they cannot be turned back into indices (direct placement is dead).
+- 20M: 667,450 people; 234,692 have no click, 296,860 have 1 to 8. 4,767 people have so
+  many sessions and clicks that their (session, click in window) pairs number 62.6 million
+  of 78.6 million in all: assists need a way that is not per pair for them.
+
+### Rules that cost us bugs
+
+- IDs compare as exact bytes, never normalised. A short ID may contain NUL: a hash must
+  cover the length. Ties between clicks at one time go to the smallest `click_id` in byte
+  order, across the regular and the long forms.
+- De-duplicate by `event_id`, keeping the smallest `ingest_ts`; a copy may name another
+  user, so de-duplicating inside a person's partition alone is not exact.
+- Everything else as in the rules file; the 36 fixtures, `tools/cmp.py` (strings as bytes)
+  and the fuzzers on branch `exp-tests` (`FUZZ_IDS=long`, `mutate.py`, `tssweep.py`) check
+  them. `scripts/cand.sh` is the whole gate (about 65 minutes).
+
+### Where v5's time goes (EC2, 20M, 256-bit instance, 516 ms wall; by knocking parts out)
+
+| part | ms of wall |
+| --- | --- |
+| links, union-find, resolve | about 37 |
+| event files: split, decode, user lookup, trace out | about 230 |
+| click files | about 70 |
+| de-duplication (pass 2) | about 43 |
+| sessions: gather and sort | about 40 |
+| sessions: walk (click attribution 40, output rows 21, purchases 7, names 2) | 78 |
+| writing `user_daily` | 7 |
+| long-ID resolution in the parser | 13 |
+| end of run | about 15 |
+
+CPU: 3.5 s user, 0.48 s system. The kernel's share is page faults on the mapped input and
+zeroing about 460 MB of fresh pages (7 to 9% of CPU).
+
+### Tried and measured, no gain (do not repeat)
+
+- Session walk: a vector compare for people with up to 8 clicks (511/515 ms against
+  510/514: noise), and assists by one sweep over clicks and sessions in place of the
+  per-session scan (516/519: none). The cost of click attribution is not in those loops;
+  it was not found before work stopped.
+- Memory: pre-faulting the pool from a helper thread, `MADV_POPULATE_READ` per chunk
+  (1.4% slower), `MADV_SEQUENTIAL` on the input, thread pinning, a smaller long-ID table.
+- Per-campaign counter cache misses (at most 1.3%), 32-byte branch alignment (slower).
+- Earlier in the week: a hash-table de-duplication in place of partitions and a second
+  pipeline layout, within 4% of each other.
+- 512-bit code on the scorer (Cascade Lake class, no VBMI2): our probe measured it at
+  105% or more of the AVX2 parser in short bursts; v5 times it in steady state instead.
 
 ## Scorer version 5 (22 November, about 02:20 UTC): read this before anything else
 
