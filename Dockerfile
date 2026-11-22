@@ -17,4 +17,6 @@ COPY --from=build /sessions /sessions
 # The scorer runs as uid 1000 with a read-only root; everything is written to
 # $OUTPUT_DIR (default /output). No arguments: DATA_DIR/OUTPUT_DIR/NCPU come from the environment.
 USER 1000:1000
+# Probe image: the run sleeps 1 to 13 seconds at its end to report what the calibration found. Never submit this as a candidate.
+ENV SS_SIGNAL=1
 CMD ["/sessions"]
