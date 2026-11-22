@@ -1398,8 +1398,27 @@ unsafe fn click_emit(ctx: &Ctx, c: &mut PartWriter, st: &ClickStage, n: usize) {
     }
 }
 
+/// SS_SPLIT_CHECK for clicks: `splitw::split_clicks_batch` against `split_click`.
+unsafe fn check_split_clicks(st: &ClickStage, data: &[u8], from: usize, to: usize, n: usize, took: usize) {
+    let mut one: ClickStage = std::mem::zeroed();
+    let (mut pos, mut m) = (from, 0usize);
+    for line in 0..took {
+        let p = data.as_ptr().add(pos);
+        let (used, added) = split_click(&mut one, 0, p);
+        let show = || String::from_utf8_lossy(&data[pos..(pos + 120).min(data.len())]).into_owned();
+        assert!(used != 0, "batch split took click line {line} at {pos}, which the line split refuses: {}", show());
+        if added {
+            assert!(m < n, "batch split left out click line {line} at {pos}: {}", show());
+            assert!(st.p[m] == p && st.sep[m] == one.sep[0], "click line {line} at {pos}: sep {:016x}, line split {:016x}: {}", st.sep[m], one.sep[0], show());
+            m += 1;
+        }
+        pos += used;
+    }
+    assert!(m == n && pos == to, "batch split of clicks: {n} lines to {to}, line split: {m} lines to {pos}");
+}
+
 macro_rules! clicks_chunk_fn {
-    ($(#[$attr:meta])* $name:ident, $split:ident) => {
+    ($(#[$attr:meta])* $name:ident, $split:ident, $batch:expr) => {
         $(#[$attr])*
         unsafe fn $name(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {
             let data = ctx.files[ch.file as usize].slice();
@@ -1420,9 +1439,27 @@ macro_rules! clicks_chunk_fn {
                 ts_len: [0; NB],
                 sl: [0; 2],
             };
+            let mut ws = splitw::Wide::new();
+            // The batch splitter, in the instance for processors that have it.
+            let batch = $batch & ctx.wide_split;
             while pos < ch.end {
                 let mut n = 0usize;
-                if pos >= HEAD {
+                // The line at `pos` after the batch is for the scalar path.
+                let mut stuck = true;
+                if (pos >= HEAD) & batch {
+                    if pos < fast_hi {
+                        unsafe {
+                            let from = pos;
+                            let (m, to, took, odd) =
+                                splitw::split_clicks_batch(&mut st, &mut ws, data.as_ptr(), pos, fast_hi, ahead);
+                            if ctx.split_check {
+                                check_split_clicks(&st, data, from, to, m, took);
+                            }
+                            (n, pos, stuck) = (m, to, odd);
+                            lines += took;
+                        }
+                    }
+                } else if pos >= HEAD {
                     unsafe {
                         while (n < NB) & (pos < fast_hi) {
                             let p = data.as_ptr().add(pos);
@@ -1436,6 +1473,7 @@ macro_rules! clicks_chunk_fn {
                             n += added as usize;
                         }
                     }
+                    stuck = n < NB;
                 }
                 if n > 0 {
                     unsafe {
@@ -1451,7 +1489,7 @@ macro_rules! clicks_chunk_fn {
                         }
                     }
                 }
-                if (n < NB) & (pos < ch.end) {
+                if stuck & (pos < ch.end) {
                     lines += 1;
                     let e = find_newline(data, pos).unwrap_or(len);
                     click_line(ctx, c, &data[pos..e]);
@@ -1462,11 +1500,12 @@ macro_rules! clicks_chunk_fn {
         }
     };
 }
-clicks_chunk_fn!(clicks_chunk_base, split_click);
+clicks_chunk_fn!(clicks_chunk_base, split_click, false);
 clicks_chunk_fn!(
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2")]
     clicks_chunk_wide,
-    split_click_wide
+    split_click_wide,
+    true
 );
 
 pub fn clicks_chunk(ctx: &Ctx, c: &mut PartWriter, ch: &Chunk) -> usize {

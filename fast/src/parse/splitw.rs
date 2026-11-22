@@ -19,7 +19,7 @@
 
 use core::arch::x86_64::*;
 
-use super::{Stage, NB};
+use super::{ClickStage, Stage, NB};
 
 /// Blocks looked at for one batch: more than 64 ordinary lines take.
 const BLOCKS: usize = 160;
@@ -79,25 +79,13 @@ unsafe fn bit(x: __m512i, at: __m512i) -> __m512i {
     _mm512_and_si512(_mm512_srlv_epi64(x, at), _mm512_set1_epi64(1))
 }
 
-/// Split lines from `data + pos` on, as many as fit a batch, while they start
-/// before `fast_hi`. Returns (lines in the batch, the position after the
-/// lines consumed, lines consumed, stuck). `stuck`: the line at the new
-/// position is one this does not take (or none was consumed at all): the
-/// caller must take it by the scalar path.
-///
-/// As for `split_event`, `MARGIN` bytes must be readable from every line start.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi2,avx512vpopcntdq,bmi1,bmi2,popcnt,lzcnt")]
-pub unsafe fn split_batch(
-    st: &mut Stage,
-    ws: &mut Wide,
-    data: *const u8,
-    pos: usize,
-    fast_hi: usize,
-    ahead: usize,
-) -> (usize, usize, usize, bool) {
-    let p0 = data.add(pos);
-    // Lines must start below this (from the batch's start).
-    let limit = fast_hi - pos;
+/// Block by block from `p0`, while blocks start below `limit`: the comma and
+/// quote bits of each block into `ws`, and the positions of the newlines into
+/// `ws.ends`, until there are lines enough for a batch. Returns the number of
+/// newlines found.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,popcnt")]
+unsafe fn scan(ws: &mut Wide, p0: *const u8, limit: usize, ahead: usize) -> usize {
     let (comma, newline, quote) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(b'"' as i8));
     let iota = _mm512_loadu_si512(IOTA.as_ptr() as *const _);
     let ends = ws.ends.as_mut_ptr();
@@ -128,6 +116,30 @@ pub unsafe fn split_batch(
         k += count;
         b += 1;
     }
+    k
+}
+
+/// Split lines from `data + pos` on, as many as fit a batch, while they start
+/// before `fast_hi`. Returns (lines in the batch, the position after the
+/// lines consumed, lines consumed, stuck). `stuck`: the line at the new
+/// position is one this does not take (or none was consumed at all): the
+/// caller must take it by the scalar path.
+///
+/// As for `split_event`, `MARGIN` bytes must be readable from every line start.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi2,avx512vpopcntdq,bmi1,bmi2,popcnt,lzcnt")]
+pub unsafe fn split_batch(
+    st: &mut Stage,
+    ws: &mut Wide,
+    data: *const u8,
+    pos: usize,
+    fast_hi: usize,
+    ahead: usize,
+) -> (usize, usize, usize, bool) {
+    let p0 = data.add(pos);
+    // Lines must start below this (from the batch's start).
+    let limit = fast_hi - pos;
+    let k = scan(ws, p0, limit, ahead);
+    let ends = ws.ends.as_mut_ptr();
 
     let one = _mm512_set1_epi64(1);
     let ones = _mm512_set1_epi64(-1);
@@ -250,6 +262,93 @@ pub unsafe fn split_batch(
         }
         if take != 0xFF {
             // Fewer than eight lines were left, or the rest start too late.
+            break;
+        }
+    }
+    (n, pos + (*ends.add(i)).wrapping_add(1) as usize, i, stuck | (i == 0))
+}
+
+/// `split_batch` for click lines: what `split_click` accepts and writes (the
+/// newline within the line's first 64 bytes, three commas, sound quoting; a
+/// line without a click_id or a user_id is consumed and left out).
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi2,avx512vpopcntdq,bmi1,bmi2,popcnt,lzcnt")]
+pub unsafe fn split_clicks_batch(
+    st: &mut ClickStage,
+    ws: &mut Wide,
+    data: *const u8,
+    pos: usize,
+    fast_hi: usize,
+    ahead: usize,
+) -> (usize, usize, usize, bool) {
+    let p0 = data.add(pos);
+    let limit = fast_hi - pos;
+    let k = scan(ws, p0, limit, ahead);
+    let ends = ws.ends.as_mut_ptr();
+
+    let one = _mm512_set1_epi64(1);
+    let ones = _mm512_set1_epi64(-1);
+    let c64 = _mm512_set1_epi64(64);
+    let zero = _mm512_setzero_si512();
+    let start0 = _mm512_set1_epi64(p0 as i64);
+    let limit_v = _mm512_set1_epi64(limit as i64);
+    let (commas, quotes) = (ws.commas.as_ptr() as *const i64, ws.quotes.as_ptr() as *const i64);
+    let (mut n, mut i, mut stuck) = (0usize, 0usize, false);
+    while (i < k) & (n + 8 <= NB) {
+        let s = _mm512_cvtepu16_epi64(_mm_add_epi16(_mm_loadu_si128(ends.add(i) as *const __m128i), _mm_set1_epi16(1)));
+        let e = _mm512_cvtepu16_epi64(_mm_loadu_si128(ends.add(i + 1) as *const __m128i));
+        let live = _bzhi_u32(0xFF, (k - i).min(8) as u32) as u8 & _mm512_cmplt_epu64_mask(s, limit_v);
+        // The line's comma and quote bits: 64 of them from its start, out of
+        // two words each, and none from its newline on.
+        let (word, shift) = (_mm512_srli_epi64::<6>(s), _mm512_and_si512(s, _mm512_set1_epi64(63)));
+        let back = _mm512_sub_epi64(c64, shift);
+        let cut = |words: *const i64| {
+            let w0 = _mm512_mask_i64gather_epi64::<8>(zero, live, word, words);
+            let w1 = _mm512_mask_i64gather_epi64::<8>(zero, live, word, words.add(1));
+            _mm512_or_si512(_mm512_srlv_epi64(w0, shift), _mm512_sllv_epi64(w1, back))
+        };
+        let len = _mm512_sub_epi64(e, s);
+        let below = _mm512_andnot_si512(_mm512_sllv_epi64(ones, len), ones);
+        let c = _mm512_and_si512(cut(commas), below);
+        let q = _mm512_and_si512(cut(quotes), below);
+        let (c0, x) = lowest(c);
+        let (c1, x) = lowest(x);
+        let (c2, _) = lowest(x);
+        let shape = _mm512_cmpeq_epi64_mask(_mm512_popcnt_epi64(c), _mm512_set1_epi64(3)) & _mm512_cmplt_epu64_mask(len, c64);
+
+        let after = |c: __m512i| _mm512_add_epi64(c, one);
+        let before = |c: __m512i| _mm512_sub_epi64(c, one);
+        let opens = [_mm512_and_si512(q, one), bit(q, after(c0)), bit(q, after(c1)), bit(q, after(c2))];
+        let closes = [bit(q, before(c0)), bit(q, before(c1)), bit(q, before(c2)), bit(q, before(len))];
+        let mut f = opens[0];
+        f = _mm512_or_si512(f, _mm512_slli_epi64::<1>(opens[1]));
+        f = _mm512_or_si512(f, _mm512_slli_epi64::<2>(opens[2]));
+        f = _mm512_or_si512(f, _mm512_slli_epi64::<3>(opens[3]));
+        let mut l = closes[0];
+        l = _mm512_or_si512(l, _mm512_slli_epi64::<1>(closes[1]));
+        l = _mm512_or_si512(l, _mm512_slli_epi64::<2>(closes[2]));
+        l = _mm512_or_si512(l, _mm512_slli_epi64::<3>(closes[3]));
+        let quoted = _mm512_add_epi64(_mm512_add_epi64(opens[0], opens[1]), _mm512_add_epi64(opens[2], opens[3]));
+        let sound = _mm512_cmpeq_epi64_mask(f, l) & _mm512_cmpeq_epi64_mask(_mm512_popcnt_epi64(q), _mm512_add_epi64(quoted, quoted));
+
+        let odd = live & !(shape & sound);
+        let take = if odd != 0 { live & _bzhi_u32(0xFF, odd.trailing_zeros()) as u8 } else { live };
+        // No click_id, or no user_id (nothing, or just two quotes): left out.
+        let empty = _mm512_cmpeq_epi64_mask(c0, _mm512_add_epi64(opens[0], opens[0]))
+            | _mm512_cmpeq_epi64_mask(_mm512_sub_epi64(_mm512_sub_epi64(c1, c0), one), _mm512_add_epi64(opens[1], opens[1]));
+        let keep = take & !empty;
+        let mut sep = _mm512_or_si512(c0, _mm512_slli_epi64::<8>(c1));
+        sep = _mm512_or_si512(sep, _mm512_slli_epi64::<16>(c2));
+        sep = _mm512_or_si512(sep, _mm512_slli_epi64::<24>(len));
+        sep = _mm512_or_si512(sep, _mm512_slli_epi64::<56>(f));
+        _mm512_mask_compressstoreu_epi64(st.p.as_mut_ptr().add(n) as *mut _, keep, _mm512_add_epi64(start0, s));
+        _mm512_mask_compressstoreu_epi64(st.sep.as_mut_ptr().add(n) as *mut _, keep, sep);
+        n += keep.count_ones() as usize;
+        i += take.count_ones() as usize;
+        if odd != 0 {
+            stuck = true;
+            break;
+        }
+        if take != 0xFF {
             break;
         }
     }
