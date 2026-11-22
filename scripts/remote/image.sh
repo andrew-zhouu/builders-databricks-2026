@@ -52,6 +52,10 @@ case "$mode" in
         rm -rf "$W/base-$name"
       done
     done
+    if [ -f scripts/remote/icxonly.sh ]; then
+      if bash scripts/remote/icxonly.sh "$W/sessions" > "$W/icxonly.log" 2>&1; then echo "ok   instructions newer than Cascade Lake $(tail -1 "$W/icxonly.log")"
+      else echo "FAIL: instructions newer than Cascade Lake outside the instance for VBMI2"; tail -8 "$W/icxonly.log"; rc=1; fi
+    fi
     if [ -f scripts/remote/mulcount.sh ]; then
       if bash scripts/remote/mulcount.sh "$W/sessions" > "$W/mulcount.log" 2>&1; then echo "ok   $(tail -1 "$W/mulcount.log")"
       else echo "FAIL: 512-bit multiplications in the instance for processors without VBMI2"; tail -8 "$W/mulcount.log"; rc=1; fi
