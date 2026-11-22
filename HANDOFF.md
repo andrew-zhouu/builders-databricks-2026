@@ -72,6 +72,40 @@ long-ID loops taking their list from the flags at once: 20M 443 / 446 wide and
 565 / 569 base, 60M 1396 / 1402 and 1772 / 1778, i.e. 1.5% better than v2 on both
 paths. Not gated yet: the base of a v3, to be gated when something larger joins it.
 
+**04:25 UTC: v2 scored 0.6919 s officially** (our entry in the final as of then; the
+leader's 0.7257 s was the best visible before). On EC2 v2 takes 0.444 s with the wide
+parser and 0.570 s without; with the container's 0.07 s and the usual 1.08 to 1.15
+between EC2 and the scorer, 0.69 is what the *base* path gives. So the scorer's
+processor very probably has no AVX-512 VBMI2.
+
+**Candidate v3**, `cb4dae1df7cca24cfd127506fc1beadb11d4f5b9` (`exp-v5`), gate `v3`
+started 04:45 UTC:
+
+* a third parser instance for processors with AVX-512 F / BW / VL / DQ / CD but no
+  VBMI2 (Skylake-X, Cascade Lake), by the SIMD fork: the wide decode and batch
+  splitters with other instructions where the VBMI2 instance uses VBMI2 or VPOPCNTDQ,
+  and with every multiplication done on 256-bit halves (inline asm), so that it holds
+  the milder of the two reduced clock levels of those processors. `parse::wide_kind()`
+  chooses: VBMI2 instance where possible, else this one (`WIDE5_DEFAULT`), else the
+  base path; `SS_SIMD=0/1/2` force one. On EC2, forced: 20M 453 / 456 against 440 / 444
+  (VBMI2) and 562 / 566 (base); 60M 1433 / 1438, 1397 / 1400, 1768 / 1769. **It has
+  never run on a processor of the kind it is for**: v3's official score against v2's
+  is the measurement (a worse score does not replace the best one).
+* the links fast path and the long-stage list (above), the end-of-run memory release
+  handed out in pieces, compressed stores through a register (the store to memory is
+  very slow on AMD Zen 4, which would take the VBMI2 instance).
+* `scripts/remote/fullcheck.sh` and `image.sh gate` now run the third instance as well
+  (fuzz, seeds, scale, both self-checks, `mulcount.sh`: no 512-bit multiplication).
+* Diagnostic image of the same sources: `aaaef3824bef68859beff77645647d1b5e76afc3`
+  (`diag-v5b`): processor model and flags, and the practice data three times with each
+  instance.
+
+Tried since v2 without gain (all removed): a table of long IDs a quarter the size; a
+helper thread faulting the partition pool in ahead of the writers (by
+`MADV_POPULATE_WRITE`: system time halved, wall time 3% worse; by one write fault per
+huge page: nothing either way); my own versions of the links fast path and the list
+loop (the SIMD fork's are in).
+
 Known and open:
 
 * **The scorer's processor is unknown**, and it decides most of what is left: on a
